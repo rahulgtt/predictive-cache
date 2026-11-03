@@ -3,15 +3,22 @@
 Predict which files a team will read next, then fetch selected data before
 users wait for it to arrive from cloud storage.
 
-> **Status:** Synthetic data generation is implemented; the Controller, Warmer,
-> live data pipeline and real-workload performance claims remain design work.
-> Generated records model fictional activity and never read personal files.
-> Diagrams and examples below describe the intended system; they do not
-> establish that the required telemetry or cache controls already work.
+> **Status: design proposal, not an implemented service.** Synthetic data
+> generation and cleaning, the controlled collection harness, Chimera v2
+> importer, offline plan-file dispatcher, and experimental standalone manual
+> NFS range reader are implemented. The Controller, automated live Warmer
+> integration, representative data collection and real-workload performance
+> claims remain gated work. Generated records model fictional activity and
+> never read personal files. Diagrams and examples below describe the intended
+> system; they do not establish that the required telemetry or cache controls
+> already work.
 
 ## Run the datagen foundation
 
-Python 3.12 and `uv` are required. From the repository root:
+Python 3.12 and `uv` are required. For this project, run builds and tests on
+`nas-vm` in a designated CUFS or Chimera build container, not in a local
+checkout or on `strider-dev` / `strider-dev2`; initialize submodules first
+where applicable. From the repository root in that environment:
 
 ```bash
 uv sync --locked
@@ -21,6 +28,10 @@ uv run pcache-datagen describe /tmp/pcache-tiny
 uv run pytest
 uv run ruff check .
 ```
+
+The default development dependencies include the pinned GPL-2.0-only
+`pynfs` Git dependency for Warmer tests. `uv sync --locked --no-dev` omits
+development dependencies when only the datagen runtime is needed.
 
 Use a new output directory for each run. `--format jsonl` selects JSONL instead
 of Parquet. `--config scenario.yaml` selects a YAML config instead of `--preset`;
@@ -45,6 +56,89 @@ loading, filtering, gaps, history and dataset sharing. Generation is buffered
 in memory, and writes do not feed back into previously generated access
 choices. See
 [spec §20](docs/datagen/spec.md#20-combined-workloads-realization-and-faults-issues-1618).
+
+## Clean the synthetic access dataset
+
+Use `pcache-prep clean` to build versioned demand tables from a datagen output
+directory. The cleaner excludes warmer, synthetic and unknown-origin events,
+failures, invalid ranges and duplicate deliveries, then reconstructs opens and
+hourly coverage. Its production path never reads `truth/`.
+
+```bash
+uv sync --locked
+uv run pcache-datagen generate --preset tiny --out /tmp/pcache-tiny
+uv run pcache-prep clean --input /tmp/pcache-tiny --out /tmp/pcache-clean
+uv run pcache-prep describe /tmp/pcache-clean
+```
+
+`--format jsonl` writes inspectable fixture tables. Supply `--config FILE`
+with a `clean:` section to declare `read_mode: ranges` or `summary` and
+adjust coverage and completion settings. Use `summary` only with a source
+that emits close totals instead of individual reads. The output manifest
+records parent identity, source-manifest hash, resolved config hash, table
+hashes and observation coverage. Generated datasets belong outside Git.
+Synthetic cleaning results establish pipeline correctness, not model quality
+on real workloads. See [the data-prep spec](docs/data-prep/spec.md) for exact
+rules, schemas and time semantics.
+
+## Prepare a controlled collection dry run
+
+`pcache-collect` provides a controlled harness for a frozen five-hour,
+Warmer-disabled NFSv4.1 READ collection. It deterministically generates a
+write-ahead offered-operation ledger, validates 15-minute collector
+checkpoints, and reconciles observed events exactly. Dry-run performs no target
+I/O; the explicit mount executor only uses read-only `open`/`preadv` beneath an
+already-mounted read-only NFSv4.1 export. Live mode requires aligned
+`O_DIRECT` reads and supervised pre-read/full collector health barriers; it
+has no buffered fallback.
+
+Controlled output is `data_kind: synthetic` and must not be treated as
+representative demand, model-quality evidence, cache-residency evidence or
+performance evidence. See the
+[controlled collection runbook](docs/experiments/controlled-chimera-collection.md).
+The manifest hashes the exact canonical cluster-provenance and event-schema
+bytes documented in [`contracts/README.md`](contracts/README.md).
+
+## Import a controlled Chimera v2 run
+
+`pcache-chimera-import` converts authoritative `nfs4_read_v2` JSONL plus its
+trusted source envelope, durable observed-event index, immutable run manifest,
+offered ledger, fixture catalog and counter checkpoints into the source layout
+accepted by `pcache-prep clean`.
+
+```bash
+uv run pcache-chimera-import \
+  --event-sources event-sources.json \
+  --observed observed.jsonl \
+  --run-manifest run.json \
+  --offered-ledger offered.jsonl \
+  --fixture-catalog catalog.json \
+  --checkpoints checkpoints.jsonl \
+  --out /tmp/pcache-chimera-run
+uv run pcache-prep clean \
+  --input /tmp/pcache-chimera-run \
+  --out /tmp/pcache-chimera-clean
+```
+
+Controlled lab output remains `data_kind=synthetic`, and imported events remain
+`origin=synthetic`; client tags are correlation evidence, not trusted origin.
+The adapter validates exact pod/epoch, catalog identity, durability and loss
+reconciliation before atomic publication. It does not fabricate missing
+directories, catalog metadata or datagen truth artifacts. See the
+[Chimera v2 adapter contract](docs/data-prep/chimera-v2-adapter.md).
+
+## Manual NFS range reader
+
+The [manual Warmer guide](docs/manual-warmer.md) describes the standalone,
+bounded NFSv4.1 reader, its prerequisites, commands, output, and limitations.
+It is not a production-ready or Controller-integrated service, or evidence of
+cache residency, foreground safety, performance improvement, or model efficacy.
+Live reads require separate authorization. An experimental private task
+format can supply an opaque NFSv4 wire handle instead of a path. Its
+identity-to-handle binding is an attestation by a trusted dispatcher, not a
+check performed by the reader or server. Handle-mode live interoperability,
+handle lifetime, and the proposed structured tag bridge remain unverified;
+tags do not authenticate origin.
 
 ## What we are trying to prove
 
@@ -91,6 +185,7 @@ must be measured and controlled.
 | Chimera | Receive SMB/NFS file requests from clients and pass them to CUFS. |
 | CUFS and volume Kvrocks | Existing filesystem data/state and cache access. The project does not write predictive records into this store. |
 | Controller | Turn observed accesses into features, predictions and bounded plans; correlate results with later demand. |
+| Plan-file dispatcher | Securely claim schema-v2 plans, enforce execution controls, invoke one Warmer task at a time, and persist evidence. |
 | Warmer | Read approved file ranges through NFS, enforce limits and report what completed. |
 | Predictive state | Store events/features, plans and results separately from volume state. Session Kvrocks reuse is conditional on isolation and compatibility checks. |
 | OTel / Grafana | Observe and explain runs. Metrics are not automatically a complete file-access history. |
@@ -98,6 +193,10 @@ must be measured and controlled.
 We add **two deployables: Controller and Warmer**. Feature extraction,
 prediction and planning are modules inside the Controller. The Warmer is
 separate so it can be constrained and stopped independently.
+
+Except for the standalone manual reader described above, the following
+describes **proposed** interfaces and responsibilities, not functions or
+services already present in this repository.
 
 ### Basic terms
 
@@ -179,6 +278,11 @@ files can connect development fixtures before the live transport exists;
 they do not establish a production queue. Atomic claims, idempotency, leases,
 retry limits and stale-worker handling need validation before concurrent use.
 
+The implemented MVP file transport is documented in
+[the dispatcher contract](docs/dispatcher.md). It is deliberately
+single-dispatcher, preserves crash evidence, and never retries an ambiguous
+in-flight task automatically.
+
 ## Data flow and formats
 
 The Controller deals in **metadata records**, not file contents. Keep these
@@ -244,6 +348,10 @@ foreground-pressure pause. CPU/memory limits alone do not guarantee network or
 storage bandwidth limits. Enforce an explicit byte/cache-space budget, avoid
 already-resident work when residency can be established, and monitor eviction
 and unrelated workloads for pollution.
+
+The standalone manual reader does not yet enforce bandwidth, foreground
+pressure, global multi-process, or cache-headroom policies. It is an
+experimental read tool, not an implementation of these service safeguards.
 
 Mark and **exclude warmer-origin events** from demand features, labels, and
 evaluation so warming cannot recursively train or trigger itself. Validate
@@ -402,6 +510,18 @@ the team plan, to be checked against retrieval lead time.
 For this example, select the first 65,536 bytes of B. Actual range selection
 must be justified by the workload; an arbitrary prefix may not help an app.
 The following plan/result formats are **illustrative**, not frozen APIs.
+
+The experimental reader's private handle task is a provisional single-task
+input, not this proposed Controller–Warmer contract. A trusted dispatcher
+must bind the file, volume and export identities to the NFS wire handle. The
+reader does not implement handle resolution, dispatching, claiming,
+deduplication, retries, global budgets or authenticated origin. The implemented
+offline plan-file dispatcher supplies claiming, validation, bounded sequential
+execution and result persistence, but it does not establish a live Controller
+or authenticated handle-binding service. See the
+[dispatcher contract](docs/dispatcher.md) and
+[manual Warmer guide](docs/manual-warmer.md) for their separate
+responsibilities and validation limits.
 
 ```json
 {

@@ -175,6 +175,36 @@ Start with `tiny`; larger preset row and runtime targets are not verified.
 Check the task console, validation result, artifact, code revision and resolved
 scenario before treating a run as complete.
 
+### Training task
+
+`pcache-train` (ML spec §6.3) trains logistic regression and the baselines
+from a snapshot directory, chooses settings on validation data, and writes
+model packages. To try it without real data:
+
+```bash
+uv sync --locked --extra ml
+uv run pcache-model fake-snapshots --out /tmp/pcache-snaps     # data_kind: fixture
+uv run pcache-train --snapshots /tmp/pcache-snaps --out /tmp/pcache-train --no-track
+```
+
+**With ClearML:**
+- configure SDK credentials (§2). Tracking stays off unless a server is
+  explicitly configured;
+- upload the snapshot directory as a ClearML Dataset;
+- run on the `default` worker:
+
+  ```bash
+  uv sync --locked --extra ml --extra clearml
+  uv run --extra ml --extra clearml python src/predictive_cache/clearml/train.py \
+      --snapshots-dataset <dataset-id> --queue default
+  ```
+
+The task records `inputs.snapshots_dataset_id` and the `train` config. To
+retrain on another dataset, clone the task in the UI, edit the dataset ID
+and enqueue it. Each package is registered as an output model tagged
+`candidate`; its `package_id` is in the model metadata. Fixture and
+synthetic results are plumbing evidence only.
+
 ## 6. Not decided yet
 
 - **Pipelines** (datagen → clean → snapshots → train → eval → register):

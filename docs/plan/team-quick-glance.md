@@ -6,9 +6,11 @@ November 3-4, 2026 | Team 32 | 3-4 engineers | Python | Demo November 5
 
 ### What we are building
 
-Prepare likely project data before users wait for cloud retrieval. A trained model selects files; a bounded Warmer reads them through NFS.
+Prepare likely project data before users wait for cloud retrieval. A trained model scores files; the planner chooses which ones to warm within the limits. The Warmer reads the selected data through NFS.
 
-Two deployables: the Controller handles events, features, prediction, planning and feedback. The Warmer executes plans and can be stopped independently.
+Two deployables: the Controller receives read records, builds model inputs, scores files, chooses warming tasks and checks later demand. The Warmer performs the approved reads and can be stopped independently.
+
+Start with the [README glossary](../../README.md#basic-terms) and [file-B example](../../README.md#example-a-feature-row-and-a-label) for features, feature rows and labels.
 
 ### The demo must show
 

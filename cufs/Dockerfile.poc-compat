@@ -1,0 +1,55 @@
+ARG CHIMERA_BUILDER=localhost/pcw-verified-builder:48c7d8f9
+ARG CUFS_DEPENDENCY_BASE=localhost/cufs-base:read-correlation-20261103085812
+
+FROM ${CUFS_DEPENDENCY_BASE} AS cufs_dependencies
+
+FROM ${CUFS_DEPENDENCY_BASE} AS runtime_base
+COPY pcw-rpms/cufs-0.2.0-48.el10.x86_64.rpm /tmp/pcw-rpms/
+COPY pcw-rpms/cufs-devel-0.2.0-48.el10.x86_64.rpm /tmp/pcw-rpms/
+RUN rpm -Uvh --oldpackage --replacepkgs /tmp/pcw-rpms/*.rpm && \
+    rm -rf /tmp/pcw-rpms && \
+    ldconfig
+
+FROM ${CHIMERA_BUILDER} AS testenv
+COPY --from=cufs_dependencies /usr/lib64/ /usr/lib64/
+COPY --from=cufs_dependencies /usr/local/lib/ /usr/local/lib/
+COPY --from=cufs_dependencies /usr/local/lib64/ /usr/local/lib64/
+COPY pcw-rpms/cufs-0.2.0-48.el10.x86_64.rpm /tmp/pcw-rpms/
+COPY pcw-rpms/cufs-devel-0.2.0-48.el10.x86_64.rpm /tmp/pcw-rpms/
+RUN rpm -Uvh --nodeps --replacepkgs /tmp/pcw-rpms/*.rpm && \
+    rm -rf /tmp/pcw-rpms && \
+    ldconfig
+
+FROM testenv AS builder
+ARG BUILD_TYPE=Release
+COPY / /chimera
+RUN cmake -G Ninja \
+        -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+        -DCMAKE_C_FLAGS="-I/chimera/cufs-compat -Wno-stringop-truncation" \
+        -DCAIRN_ENABLED=OFF \
+        -DCUFS_ENABLED=ON \
+        -DDISABLE_TESTS=ON \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -S /chimera \
+        -B /build && \
+    cmake --build /build -j$(nproc) && \
+    cmake --install /build && \
+    find /build -name 'liboteltracing-c.so*' -o -name 'liboteltracing-sqlite.so*' \
+        -o -name 'libevpl_otel.so*' | xargs -r -I{} cp -a {} /usr/lib/ && \
+    ldconfig
+
+FROM runtime_base AS runtime
+COPY --from=builder /usr/lib64/ /usr/lib64/
+COPY --from=builder /usr/local/lib/ /usr/local/lib/
+COPY --from=builder /usr/local/lib64/ /usr/local/lib64/
+COPY --from=builder /usr/sbin/chimera /usr/sbin/
+COPY --from=builder /usr/lib/libchimera* /usr/lib/
+COPY --from=builder /usr/lib/libevpl* /usr/lib/
+COPY --from=builder /usr/lib/libprometheus-c.so /usr/lib/
+COPY --from=builder /usr/lib/liboteltracing* /usr/lib/
+COPY --from=builder /usr/etc/chimera.json /etc/chimera/chimera.json
+COPY entrypoint_cufs.sh /usr/bin/chimera-entrypoint.sh
+RUN chmod +x /usr/bin/chimera-entrypoint.sh && \
+    mkdir -p /etc/chimera /cufs-rpms && \
+    ldconfig
+ENTRYPOINT ["/usr/bin/chimera-entrypoint.sh"]
