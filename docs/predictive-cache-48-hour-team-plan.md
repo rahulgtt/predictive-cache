@@ -42,7 +42,7 @@ Remote: [github.com/rahulgtt/predictive-cache](https://github.com/rahulgtt/predi
 Local: /Users/rgattu/cdroot/predictive-cache
 Repository reviewed at 48c8efe. The codebase is documented as a design proposal.
 
-Planning note: this is the requested 48-hour schedule proposal. The README currently describes a longer cadence; its data, safety and evidence gates remain in force. vCenter follows the explicit team decision.
+Planning note: this is the requested 48-hour schedule proposal. The README explains the system and retains its data, safety and evidence gates. Earlier working-week estimates are historical context. vCenter follows the explicit team decision.
 
 ## Milestones and gates
 

@@ -1,14 +1,20 @@
-# Predictive cache warming
+# Predictive Cache
 
+<<<<<<< Updated upstream
 > **Status:** synthetic data generation is implemented; the Controller, Warmer
 > service and real-workload performance claims remain separate work.
 > Generated records model fictional activity and never read personal files.
+=======
+Predict which files a team will read next, then fetch selected data before
+users wait for it to arrive from cloud storage.
+>>>>>>> Stashed changes
 
-For agent-assisted development, start with [AGENTS.md](AGENTS.md), invoke
-`$pc-milestone`, and follow the [execution and review workflow](docs/ai/workflow.md).
-The [milestone map](docs/plan/milestones.md) connects agent tasks to the design
-gates below. These development tools do not add an agent runtime to the product.
+> **Status: design proposal.** The repository contains plans and specifications,
+> not an implemented Controller, Warmer, data pipeline or benchmark. Diagrams
+> and examples below describe the intended system; they do not establish that
+> the required telemetry or cache controls already work.
 
+<<<<<<< Updated upstream
 ## Run the datagen foundation
 
 Python 3.12 and `uv` are required. From the repository root:
@@ -43,137 +49,160 @@ remain #19. Generation is buffered in memory, and writes do not feed back
 into previously generated access choices. See [spec §20](docs/datagen/spec.md#20-combined-workloads-realization-and-faults-issues-1618).
 
 ## What we are trying to prove
+=======
+## System diagram
+>>>>>>> Stashed changes
 
-Cold first opens can wait on data fetched over the WAN. The idea is to predict
-which files or ranges a workload will need and warm them during an appropriate
-window, before foreground clients ask for them. The primary outcome is lower
-first-open latency **without harming foreground I/O or wasting cache capacity**.
-The demonstration must establish that prediction and warming caused the
-improvement, rather than merely showing a faster second read.
+There are two paths. The **normal read path** serves users. The **background
+warming path** observes activity and makes extra, bounded reads ahead of demand.
 
-The original hackathon brief proposes learning from access events, a
-time-of-week model and a co-access graph, a budgeted planner, read-through
-warming, and feedback ([source PDF, project 1, pp. 3–5](#sources)). Its
-48-hour schedule and pitch numbers are not the current delivery commitment or
-measured results. The current plan spreads preparation over roughly one
-working week, with all engineers starting simultaneously and spillover if
-validation requires it.
+```mermaid
+flowchart TB
+    subgraph existing["Existing Strider read path"]
+        Client["User / application"] -->|"SMB or NFS read"| Chimera["Chimera: handles SMB/NFS requests"]
+        Chimera --> CUFS["CUFS: filesystem and cache access"]
+        CUFS <-->|"local filesystem data / state"| VolumeKV[("Volume Kvrocks")]
+        CUFS <-->|"fetch missing cloud-backed data"| Cloud[("Cloud objects")]
+    end
 
-### A mental model
+    subgraph proposed["Proposed Predictive Cache additions"]
+        Events["Validated access events"] --> Controller["Python Controller\ningest / features / model / planner / feedback"]
+        Controller -->|"bounded plan"| Warmer["Python Cache Warmer"]
+        Warmer -->|"execution results"| Controller
+        Controller <-->|"predictive state"| State[("Isolated session Kvrocks\nreuse must be validated")]
+    end
 
-Think of the system as a **speculative, budgeted reader**, not a faster
-replacement for a normal read. It observes prior demand, makes a forecast,
-then spends a limited amount of I/O and cache space on candidates. A correct
-forecast can move work earlier; an incorrect forecast can consume bandwidth
-and evict useful data without benefiting anyone. Consequently, the model,
-the cache mechanism, and the experiment each need independent evidence:
-
-| Question | What a positive answer would establish | What it would not establish |
-| --- | --- | --- |
-| Can we forecast future demand? | Held-out real accesses are ranked better than simple baselines at a comparable byte budget. | That warming actually populates the right cache or improves latency. |
-| Can we warm the relevant data? | A bounded read changes the verified cache/fault state and benefits a later read. | That the model chose the right data or that warming is safe under load. |
-| Is the end-to-end tradeoff worthwhile? | Controlled trials show an improvement while foreground and pollution guardrails hold. | That every workload, volume, or production environment will see the same improvement. |
-
-For example, suppose a design team repeatedly opens a model and then related
-drawings on Monday mornings. A predictor might rank the drawings after
-observing the model's access, or rank the model itself ahead of the usual
-time. The planner still needs to decide **which ranges** to read, **when**,
-and **how much** to spend. If the team does not open the drawings, those
-reads may be wasted; if they do, the system must establish whether the warmed
-bytes were still resident and actually saved a cold fault. This example
-illustrates the hypothesis, not a measured workload.
-
-### Glossary
-
-| Term | Meaning in this document |
-| --- | --- |
-| Foreground | A client/workload operation serving actual demand, rather than a read generated by the Warmer. |
-| Cold / warm | A cold range needs data that is not available in the relevant cache; a warm range is already available there. The exact cache layer and residency test must be defined for the experiment. |
-| Fault / stub | A fault fetches data that is represented locally as not yet materialized; the precise CUFS signals and persistence semantics require verification. |
-| Candidate / plan / task | A candidate is a predicted file/range; a plan is the bounded collection chosen by the Controller; a task is an independently tracked unit of execution. |
-| Useful warmed bytes | Distinct bytes successfully warmed and later consumed by foreground demand within a defined window, subject to a documented attribution rule. |
-| Cache pollution | Warmed data displaces or competes with other useful data, harming unrelated work or consuming capacity with little benefit. |
-| Temporal leakage | Features or tuning use information that would not have been available at the time of a prediction. |
-
-## System model
-
-Chimera is the existing SMB/NFS protocol gateway; **CUFS is its primary
-production backend**. CUFS uses volume-specific Kvrocks for filesystem state.
-`memfs`, `diskfs`, and other alternative backends are for testing Chimera as a
-protocol server, not the production target for this project.
-
-The proposed prototype adds **two deployables**, not one service per box in
-the original sketch:
-
-1. **Predictive Cache Controller:** ingest and validate observations, extract
-   features, score candidates, make bounded plans, and correlate feedback.
-2. **Cache Warmer:** independently constrained execution of those plans, with
-   its own I/O, concurrency, and resource limits.
-
-```text
-Foreground SMB/NFS client
-          |
-          v
-  Chimera protocol gateway --> CUFS --> volume Kvrocks / cache
-          |                     |
-          |  access observations (source and fields to be validated)
-          +---------------------+
-                    |
-                    v
-        Predictive Cache Controller
-  ingest -> features -> model -> planner -> feedback
-                  |              |
-      predictive state           | bounded, versioned plan
-                  v              v
-       isolated Kvrocks     Cache Warmer
-                                  |
-                      MVP: bounded NFS reads
-                                  v
-                       Chimera --> CUFS / cache
-
- Controller + Warmer + foreground measurements --> OTel / Grafana
+    Chimera -.->|"proposed: record completed reads"| Events
+    Warmer -->|"read-only NFS reads"| Chimera
 ```
 
-In the intended flow, foreground access observations become features and
-predictions; the planner applies budgets before sending work to the Warmer.
-The Warmer reports what actually happened, and the Controller compares that
-with later **foreground** demand. Observability correlates the entire run. The
-event path, feedback, and state store are proposals, not evidence that the
-corresponding integrations already exist.
+Solid arrows show intended requests and record transfers. The dashed arrow
+marks an observation integration that still needs validation. File bytes
+return through the read path; they do not pass through the Controller.
+Observations could instead come from an instrumented client for a scoped lab
+experiment. That would cover that client's workload, not all appliance traffic.
 
-### Responsibilities and the end-to-end lifecycle
+**Normal reads never wait for the Controller, event collection or predictive
+state.** Those components are not in the foreground response path. The Warmer
+still shares cache, network and storage resources with users, so contention
+must be measured and controlled.
 
-The following describes the **proposed** interfaces and responsibilities,
-not functions or services already present in this repository.
+### What each component does
 
-| Layer | Input and responsibility | Output / dependency |
+| Component | Responsibility |
+| --- | --- |
+| Chimera | Receive SMB/NFS file requests from clients and pass them to CUFS. |
+| CUFS and volume Kvrocks | Existing filesystem data/state and cache access. The project does not write predictive records into this store. |
+| Controller | Turn observed accesses into features, predictions and bounded plans; correlate results with later demand. |
+| Warmer | Read approved file ranges through NFS, enforce limits and report what completed. |
+| Predictive state | Store events/features, plans and results separately from volume state. Session Kvrocks reuse is conditional on isolation and compatibility checks. |
+| OTel / Grafana | Observe and explain runs. Metrics are not automatically a complete file-access history. |
+
+We add **two deployables: Controller and Warmer**. Feature extraction,
+prediction and planning are modules inside the Controller. The Warmer is
+separate so it can be constrained and stopped independently.
+
+### Basic terms
+
+| Term | Meaning here |
+| --- | --- |
+| Foreground demand | A user's or application's actual work, including batch work. Warming is extra work performed ahead of that demand. |
+| Cold / warm | A cold range needs missing data fetched; a warm range is already available in the cache being tested. Judge the requested range, not just the whole file. |
+| Byte range | A portion of a file identified by an offset and length. Offset 0 and length 65,536 mean the first 65,536 bytes. |
+| Fault | Fetching missing cloud-backed data so a filesystem operation can proceed. |
+| Co-access | Files read close together within a validated session. The model tests whether that association helps predict later demand. |
+| Feature | One input value used to make a prediction. For example: how many times was this file read in the last 10 minutes? |
+| Feature row | All the input values for one file at one prediction time. For example: its recent read count, time since last read and size. |
+| Label | The answer learned later: was the file actually read within the prediction window? It is used for training or evaluation. |
+| Cache pollution | Speculative data displaces useful data or competes for resources, harming other work. |
+
+### Example: a feature row and a label
+
+These numbers are fictional. At 09:00:01, we want to predict whether file B
+will be read in the next five minutes. We build this feature row from what
+we know at 09:00:01:
+
+| File | Prediction time | Reads in the last 10 minutes | Seconds since last read | File size in bytes |
+| --- | --- | --- | --- | --- |
+| B | 09:00:01 | 0 | 1200 | 1048576 |
+
+The file and prediction time identify the row. The three values after them
+are features: 0 recent reads, 1200 seconds since the last read, and a size
+of 1048576 bytes. This is a small example, not the final feature list.
+
+At 09:03, the user successfully reads B. We can now attach the label
+"yes, B was read within the five-minute window" to that earlier row.
+We did not know this answer at 09:00:01.
+
+Training uses past feature rows and their later labels. When making a new
+prediction, the model receives the features without the future label.
+If no read is observed, we can label the row "no" only after the full
+window ends and we know that collection was sufficiently complete.
+
+## Follow one read through the system
+
+Consider a project where reading file A is often followed by reading file B.
+This is a fictional example, not a measured workload.
+
+1. **The user reads file A.** Chimera receives the request and passes it to
+   CUFS. CUFS reads the requested data. If that data is missing locally,
+   CUFS fetches it from cloud storage.
+2. **Record what happened.** The proposed collector sends the Controller a
+   small record: which file and bytes were read, when, whether the read
+   succeeded, and whether it came from a user or the Warmer. Missing or
+   uncertain information stays marked as unknown.
+3. **Estimate whether B will be needed.** The Controller builds a feature row
+   using information it already has. The model gives each eligible file a
+   score. B is one file being considered for warming; a score does not
+   instruct the Warmer to read it. Using a model to make this estimate is
+   called inference; it does not require training the model again.
+4. **Decide whether to read B now.** The planner checks that B is allowed, the
+   file identity is still correct, and the work fits the deadline and resource
+   limits. It may skip B even with a high score: B could cost too much to
+   fetch or the information could be stale. It may also skip data already
+   cached, when we have a reliable way to check.
+5. **The Warmer reads the chosen part of B.** It makes an ordinary NFS read
+   through Chimera and CUFS. It reads only the approved byte range.
+6. **The Warmer reports the result.** It tells the Controller how many bytes
+   came back, when the read ran, and what failed. A completed read does not
+   prove the data stayed in the cache.
+7. **Check whether the user later reads B.** If that happens, compare the
+   bytes the user read with the bytes the Warmer read. To show that warming
+   actually saved waiting time, we still need a comparable run without it.
+   The data might have been cached already.
+
+### Where is the queue?
+
+SMB/NFS clients still issue ordinary reads. Our proposed work queue contains
+**background warming tasks**, created by the Controller. User reads are never
+placed in that queue or rescheduled by this project.
+
+The queue transport and claim/retry protocol are not frozen. Plan/result
+files can connect development fixtures before the live transport exists;
+they do not establish a production queue. Atomic claims, idempotency, leases,
+retry limits and stale-worker handling need validation before concurrent use.
+
+## Data flow and formats
+
+The Controller deals in **metadata records**, not file contents. Keep these
+records distinct:
+
+| Record | Question it answers | Producer -> consumer |
 | --- | --- | --- |
-| Foreground data path | An SMB/NFS client asks Chimera for an operation; Chimera delegates to CUFS. | A normal read result; correctness must not depend on the predictive system. |
-| Observation | A validated source captures enough context to describe real demand without blocking it. | Versioned, origin-marked events; source, coverage, and delivery are unverified. |
-| Controller ingestion and features | Validate/deduplicate events, preserve their event time, group demand into sessions where supported, and build historical features. | A quality-controlled feature view and a data-quality record. |
-| Controller prediction | Apply a frozen model or baseline to features available at the prediction time. | Ranked candidates and explainable reasons, tied to a model version. |
-| Controller planning | Resolve current identity/path and select candidates under policy, time, cache and byte budgets. | An immutable, versioned plan, including explicit rejection reasons. |
-| Warmer execution | Check authorization and policy again; claim, rate-limit and perform permitted read-only range requests. | Per-task completion, partial progress or failure, with actual bytes and timing. |
-| Feedback and analysis | Correlate actual warming with later independent foreground demand and benchmark controls. | Useful/wasted-byte estimates, safety observations and reproducible evidence. |
+| Access event | What operation happened? | Validated source -> ingestion |
+| Feature row | What did we know about a candidate at prediction time? | Feature builder -> model |
+| Prediction | What might be needed soon? | Model -> planner |
+| Plan / task | What are we allowed to read now? | Planner -> Warmer |
+| Warm result | What did the Warmer actually read? | Warmer -> feedback / evaluation |
+| Dataset / run manifest | Where did these records come from, and how was the experiment configured? | Data / evaluation owner -> all stages |
 
-A representative request illustrates the boundaries:
+Use UTC timestamps and byte units. Keep `volume_id` and opaque `file_id`
+separate from a mutable path. A rename or replacement must not cause the
+Warmer to read a different object accidentally.
 
-1. A foreground read reaches Chimera and CUFS. The foreground response is
-   returned normally whether or not telemetry, prediction, or Kvrocks for
-   predictive state is available.
-2. An authorized event source records the access as foreground, with the
-   available file identity, time, range, and outcome. Ingestion validates it
-   and exposes loss or ambiguity instead of silently turning it into demand.
-3. On a subsequent planning cycle, the Controller scores future candidate
-   ranges using **only prior** observations. The planner rejects stale or
-   over-budget work and issues a plan with a deadline and reason.
-4. The Warmer verifies the plan and the current target, then issues bounded
-   NFS reads. It reports actual bytes and failures; an accepted plan is not
-   equivalent to a successfully warmed range.
-5. Later foreground demand is correlated with the completed ranges. Only
-   foreground bytes within the specified window can count toward usefulness.
-   The evaluation also asks whether unrelated foreground work suffered.
+### 1. Access event: an observed read
 
+<<<<<<< Updated upstream
 In the earlier source investigation, a representative CUFS code path traced
 `cufs_op_read` through `cufs_ll_read` and `File::read` to `Dkv::readData`,
 with stubbed chunks leading to faulting and a retry. The report cites
@@ -312,328 +341,269 @@ future demand.
 This example shows a possible shape, **not an existing schema or a statement
 that these fields are currently available**. IDs and paths are placeholders;
 an implementation must apply its approved privacy policy.
+=======
+The field names below follow the [datagen planning schema](docs/datagen/spec.md#51-access-event-events-truthdropped_events).
+This is a **readable subset**, not a complete validated production event.
+Optional context is omitted. Real-source field availability remains open.
+>>>>>>> Stashed changes
 
 ```json
 {
   "schema_version": 1,
-  "event_id": "event-001",
-  "event_time": "2026-01-05T09:00:00Z",
-  "volume_id": "opaque-volume",
-  "file_id": "opaque-file",
+  "event_id": "ev-001",
+  "event_time": "2026-11-03T09:00:00.000000Z",
+  "ingest_time": "2026-11-03T09:00:00.010000Z",
+  "volume_id": "vol-001",
+  "file_id": "file-a",
+  "dir_id": "dir-project",
   "operation": "read",
   "offset": 0,
-  "bytes_requested": 1048576,
-  "bytes_read": 1048576,
-  "result": "success",
-  "origin": "foreground"
+  "bytes_requested": 65536,
+  "bytes_read": 65536,
+  "file_size": 1048576,
+  "result": "ok",
+  "origin": "foreground",
+  "cache_outcome": null,
+  "latency_ms": null
 }
 ```
 
-For a prediction made at 08:00 with a two-hour horizon, a successful
-foreground read at 09:00 could provide a positive label for the overlapping
-range. A Warmer read at 08:30 cannot do so. A missing read is a negative only
-if the collection is sufficiently complete for that interval and scope;
-otherwise it is unknown. A partial overlap should contribute only the
-overlapping bytes, and repeated accesses must not count the same warmed byte
-multiple times. These rules require a clear range representation and
-attribution policy before implementation.
+`event_time` is when the read happened; `ingest_time` is when it became
+available to the collector. A late event cannot become a feature for a
+prediction that happened before its arrival. Requested bytes and returned
+bytes differ on short reads or errors. `null` cache or latency fields mean
+unknown, not a hit, a miss or zero latency.
 
-Reliable collection needs more than a schema: check offered versus emitted
-events, sampling, duplicate rates, ordering, clock skew, invalid ranges,
-unknown origins, dropped data, path churn, and cohort coverage. Record and
-review gaps by volume and time window. Preserve a deterministic replay order
-and a manifest of transforms so another engineer can reproduce a dataset.
-When using a best-effort telemetry hook, quantify its losses; nonblocking
-delivery protects foreground traffic but makes unqualified negatives unsafe.
+Datagen v1 writes partitioned **Parquet** by default, with **JSONL** available
+for small fixtures. JSONL is one JSON record per line. The generator's
+[output layout](docs/datagen/spec.md#3-output-layout) also contains a catalog,
+loss counters and a manifest. It does not simulate cache state or latency.
+These are proposed generator outputs, not proof of a live Strider exporter.
 
-### Controller–Warmer contract
+### 2. Feature row and prediction: an estimate
 
-Design a versioned, idempotent plan containing run and plan IDs, model
-version, volume and validated file identity/current path, ranges, score or
-reason, deadline, and maximum bytes. The Warmer validates scope and budget,
-deduplicates tasks, and returns per-task status, actual bytes, timing, and
-errors. Handle expired, stale, duplicate, cancelled, and partially completed
-work explicitly. Exact transport and field names are proposed interfaces, not
-existing APIs; the two owners should publish a shared contract before coding.
+For B at 09:00:01, features might include its earlier read count, time since
+last read, size and prior co-access with A. These are derived values, not
+fields that a filesystem necessarily emits.
 
-An illustrative plan item could contain the following fields; it is a
-discussion aid rather than a required wire format:
+An illustrative prediction is:
+
+```json
+{
+  "model_version": "demo-model-001",
+  "prediction_time": "2026-11-03T09:00:01.000000Z",
+  "volume_id": "vol-001",
+  "file_id": "file-b",
+  "horizon_seconds": 300,
+  "score": 0.82
+}
+```
+
+The score ranks a candidate; it is not an 82% probability unless calibration
+establishes that meaning. A five-minute horizon is a starting proposal from
+the team plan, to be checked against retrieval lead time.
+
+### 3. Warm plan: a bounded instruction
+
+For this example, select the first 65,536 bytes of B. Actual range selection
+must be justified by the workload; an arbitrary prefix may not help an app.
+The following plan/result formats are **illustrative**, not frozen APIs.
 
 ```json
 {
   "schema_version": 1,
-  "run_id": "run-example",
-  "plan_id": "plan-example",
-  "model_version": "baseline-example",
-  "deadline": "2026-01-05T09:00:00Z",
-  "max_bytes": 1048576,
+  "run_id": "demo-run-001",
+  "plan_id": "plan-001",
+  "model_version": "demo-model-001",
+  "deadline": "2026-11-03T09:05:01.000000Z",
+  "max_bytes": 65536,
   "items": [{
-    "task_id": "task-example",
-    "volume_id": "opaque-volume",
-    "file_id": "opaque-file",
-    "path": "/approved/example",
+    "task_id": "task-001",
+    "volume_id": "vol-001",
+    "file_id": "file-b",
+    "path": "/approved/project/file-b",
     "offset": 0,
-    "length": 1048576,
-    "reason": "recent_access"
+    "length": 65536
   }]
 }
 ```
 
-The example path is fictional. A real plan must validate volume, identity,
-permissions, path and range; the path alone is not proof of identity.
-Define whether the plan's byte cap is a maximum requested, read, or reserved
-amount, including concurrent tasks and retries. The result should distinguish
-accepted, completed, partial, skipped, failed, and cancelled work, with
-requested and actual bytes and an actionable reason. Completion means the
-read completed, not that data remained resident or helped a foreground read.
+Here `max_bytes` means total **requested read bytes across all attempts**,
+including retries. This plan has no spare allowance for a retry after a full
+65,536-byte request. It does not cap cloud bytes or cache occupancy: existing
+fetch granularity and prefetch can amplify traffic. Revalidate identity,
+permissions and range bounds before execution; a path alone is insufficient.
 
-## Modeling and measurement
+### 4. Warm result: execution, not effectiveness
 
-Start with interpretable baselines: most-recently-used, global or decayed
-frequency, and a static hot set. Compare them with the proposed hour-of-week
-frequency and session-based co-access models, individually and as a blend.
-Candidate features include recency, frequency, time bucket, prior session
-neighbors, and range/size or cohort context **only when available and
-validated**. Choose prediction horizon, byte budget, and primary offline
-metric before inspecting the final test partition.
+```json
+{
+  "schema_version": 1,
+  "run_id": "demo-run-001",
+  "plan_id": "plan-001",
+  "task_id": "task-001",
+  "status": "completed",
+  "bytes_requested": 65536,
+  "bytes_read": 65536,
+  "started_at": "2026-11-03T09:00:02.000000Z",
+  "finished_at": "2026-11-03T09:00:03.000000Z"
+}
+```
 
-Split chronologically: train on earlier periods, tune on a later validation
-period, freeze model and thresholds, and evaluate on an untouched subsequent
-test period. Report time boundaries, data quality and coverage, class
-balance, feature availability, and model versions. Compare at the same byte
-budget using precision/recall, byte-weighted precision, useful bytes, and
-ablation of each component. An offline win is not proof of a live latency
-win; nor should synthetic data be presented as representative history.
+Record partial, skipped, failed and cancelled tasks separately. If a later
+foreground read at 09:03 consumes the same range, that supplies usefulness
+evidence. It does not, by itself, establish a saved cloud fault or latency gain.
 
-### What the simple models learn
+The example `run_id` links plans, results and experiment configuration.
+Datagen v1 access rows do **not** contain `run_id`; associate their dataset or
+source with a run in experiment metadata rather than silently adding a field.
 
-| Approach | How it ranks | Why compare it |
-| --- | --- | --- |
-| Most recently used | Prefer files/ranges accessed most recently. | A cheap baseline for temporal locality; a predictive model should justify its extra complexity. |
-| Frequency / static hot set | Prefer historically popular candidates, optionally decaying older events. | Tests whether overall popularity alone explains the benefit. |
-| Time of week | Prefer candidates with past demand in the relevant hour-of-week bucket, optionally weighting recent weeks more heavily. | Tests recurring schedules; sparse data or timezone changes can make the signal misleading. |
-| Co-access graph | Link candidates accessed close together within an established session and rank neighbors of recent demand. | Tests whether a current access predicts related subsequent files; depends on reliable sessionization. |
-| Blend | Combine the time and co-access scores, using weights chosen on validation data. | Tests whether signals add value beyond either component alone. |
+### Origin and dataset provenance are different
 
-For each approach, calculate ranking and byte-budget curves, not just a
-single accuracy number. A model that predicts many small files correctly can
-still waste most of its bytes on a large false positive. Precision asks how
-much of what was warmed was subsequently useful; recall asks how much of
-the relevant demand was covered. Define the unit and denominator, evaluate
-file- and byte-level views separately, and do not call a score a probability
-unless calibration is validated. Compare time-only, graph-only and blended
-models with the same held-out workload and budget. If the simple baseline
-wins, report that finding rather than adding complexity to force a win.
+`origin` identifies traffic within an observed system: `foreground`,
+`warmer`, `synthetic` probe traffic or `unknown`. Only trusted foreground
+events can become real-demand features and labels; missing origin is unknown.
 
-### Causal cold/warm benchmark
+A generated dataset can contain rows with `origin: "foreground"` to simulate
+user demand. Its manifest still has `data_kind: "synthetic"`. Those rows
+remain fixtures for plumbing or pattern-recovery checks. They are not real
+history or evidence of real-workload model quality or performance.
 
-The performance owner should publish a runbook and raw, run-correlated
-evidence. Compare a verified **cold control** with an equivalent cold state
-followed by predictive warming and the same foreground workload. Include a
-simple static/MRU warm baseline and, if useful, an oracle upper bound clearly
-labeled as non-deployable. Use matched files/ranges, comparable cache state,
-fixed workload and topology, randomized or balanced trial order, and
-predeclared exclusions. Account for client/OS caching and natural cache
-warming; the probe itself must not materially warm the measured range.
+Keep datagen's `truth/` outputs out of features, models, planners and the
+Controller. Tests can use them to check planted patterns and faults. Catalog
+metadata also needs an as-of-time view; future deletions or replacements must
+not leak into a prediction. Collect no file contents, raw usernames,
+credentials or unnecessary identifying paths; never commit real access data.
 
-Collect enough independent valid trials to characterize variance and report
-the distribution, median and tail latency, effect size, confidence intervals,
-exclusions, and safety results. The draft's 30 trials, 30% gain, 60% useful
-bytes, and foreground-regression limits are **proposed thresholds**, not
-observations or proven outcomes. Agree on and freeze appropriate thresholds
-and stopping rules before the final evaluation. If cold reset or cache
-residency cannot be validated, report that limitation rather than making a
-causal claim.
+## Training, prediction and feedback
 
-The dashboard should correlate a run ID across predictions, accepted/rejected
-plan bytes, queue age, warm throughput/errors/latency, bytes read, subsequent
-foreground useful versus unused bytes, first-open latency and fault/remote
-bytes where observable, foreground p95/p99 and errors, evictions, and resource
-use. Define the denominator and usefulness window for each efficiency metric.
-Monitor unrelated foreground traffic too: a faster selected file does not
-justify cache pollution or resource contention elsewhere. Pause or stop
-warming when agreed guardrails are breached.
+Training learns a model from historical examples. Inference applies that
+model to current features. Planning decides how much work is worth issuing.
 
-#### Trial procedure and interpretation
+```mermaid
+flowchart LR
+    History["Validated historical events"] --> Rows["Past-only features\nplus later demand labels"]
+    Rows --> Train["Train / validate / freeze"]
+    Train --> Artifact["Versioned model artifact"]
+    Current["Events available now"] --> Features["Current features"]
+    Features --> Infer["Inference"]
+    Artifact --> Infer
+    Infer --> Candidates["Ranked candidates"]
+    Candidates --> Policy["Planner: eligibility / limits / deadline"]
+    Policy --> Plan["Warm plan"]
+```
 
-1. Freeze workload, source/dataset, model, budgets, component versions,
-   topology, outcome definitions, trial order, exclusions, and safety
-   thresholds before final trials. Establish a no-warmer noise floor first.
-2. Prepare equivalent cold state for the selected file/range and verify it
-   without warming the measured data. Record the evidence and any uncertainty
-   about the client cache, CUFS cache, and upstream data state.
-3. Run the assigned treatment: no warming, simple baseline, or predictive
-   plan. For warm treatments, capture the completed ranges and the interval
-   between warm completion and the foreground request.
-4. Execute the same foreground workload, including unrelated competing
-   traffic. Capture client timings, errors, fault/remote-byte proxies, warmer
-   work, cache pressure and node/resource conditions using a common run ID.
-5. Repeat with balanced or randomized order, retaining the raw observations,
-   all exclusions and their predeclared reasons. Analyze paired results only
-   when equivalent reset and pairing are actually established.
-6. Report the treatment effect and uncertainty alongside guardrail results.
-   Separate a statistically detectable effect from one large enough to
-   justify the cost. Have another engineer reproduce the run from the
-   recorded state and instructions.
+For a training row at 09:00:01, only information available by that time is
+eligible as a feature. A successful read of B at 09:03 can later supply a
+positive label for the five-minute horizon. It cannot appear in that row's
+features. An absent read is a negative only when observation of the whole
+window is sufficiently complete; otherwise the label is unknown.
 
-Compare first-usable-byte and initial-range completion time as distinct
-measurements; an NFS `open` alone may not cause the data read being studied.
-An oracle treatment that warms exactly the future demand is an upper bound,
-not a deployable forecast. If a treatment warms the entire dataset, the
-result says little about predictive selection. If only selected files get
-faster while unrelated reads regress, the system has not met its safety goal.
+Start with most-recently-used, frequency and static hot-set baselines.
+The 48-hour plan proposes one lightweight trained classifier, with recency,
+frequency, size and validated co-access features. The original time-of-week
+and graph/blend ideas are candidates for comparison, not mandatory separate
+services. Weekly claims need adequate real history. Algorithm, horizon and
+planner objective remain design choices to validate.
 
-#### Metrics and evidence boundaries
+Split chronologically into training, validation and untouched test periods.
+Fit transformations and tune thresholds on the appropriate earlier data;
+freeze them before test evaluation. A new event can change a prediction
+without retraining. Warm results inform accounting and safety; only later
+independent demand can supply demand labels. Retraining is a separate step.
 
-| Metric | Definition / interpretation |
+## State and failure boundaries
+
+| Information | Intended home / boundary |
 | --- | --- |
-| First-open/read latency | Client-observed duration from a precisely defined start to first usable data or range completion; report median and tail separately. |
-| Useful-byte ratio | Distinct warmed bytes later read by foreground demand within the declared window divided by the chosen denominator, such as distinct successfully warmed bytes. State the denominator and attribution rules explicitly. |
-| Prediction precision and recall | Correctly predicted demand relative to planned candidates and to eligible future demand, respectively; define file/range/byte units and eligibility. |
-| Remote bytes or fault count | A possible coldness proxy if the source's semantics are validated; a lower count alone is not proof of better user latency. |
-| Foreground latency/errors | Compare matched concurrent foreground workloads with and without warming; include unrelated data to expose contention or eviction. |
-| Wasted work and cache pressure | Bytes not used before the usefulness deadline, rejected work, evictions, occupancy and relevant resource use; missing signals must be called out. |
+| Customer file data and CUFS state | Existing volume Kvrocks / cloud path. No predictive writes to its private schema. |
+| Events, features, scores, plans and task results | Isolated, versioned prefixes and TTLs in session Kvrocks, only after validating compatibility, access and contention. |
+| Model artifact | Versioned file, image or artifact store; not assumed to be a Kvrocks model-binary store. |
+| Run evidence | Approved private storage for raw data; sanitized manifests and reports in shared docs. |
 
-Keep the raw trial data, workload and dataset manifests, model version, plan,
-actual task results, telemetry export, analysis, exclusions and conclusion
-together. A dashboard is useful for explaining a run, but it does not replace
-the raw evidence or independent reproduction.
+Namespacing is not resource isolation. If session-store reuse fails its
+checks, obtain approval for a dedicated store; never fall back to volume
+Kvrocks. JSON/Parquet records are metadata; NFS reads carry file bytes;
+OTel carries measurements. They serve different purposes.
 
-## Four engineers, concurrent from Day 1
+Stop or reduce speculative work on pressure, deadline expiry or uncertain
+control state. Bound concurrency, bytes in flight, issued bytes, retries and
+duration. Missing collection, stale identities and partial results must be
+visible. Prediction or telemetry failure must not block normal reads.
+Stopping the Warmer does not undo data already fetched into cache.
 
-Data gathering is shared across these lanes; it is not deferred until another
-engineer finishes. Interfaces and fixtures enable parallel work, but fixture
-results are not final evidence. A fifth integration/data engineer can own
-replay, deployment, and cross-service integration if available.
+## Hackathon scope and parallel work
 
-For the concise assignment handout, see
-[Day 1: Four parallel assignments](artifacts/pdf/day-one-assignments.pdf).
+The active team plan targets **48 hours, 3-4 engineers and Python**, using one
+vCenter cluster, one volume, NFS and a bounded candidate set. vCenter is the
+explicit team choice; generic Kind instructions elsewhere are not a request
+to redeploy this environment. Go needs a concrete reason and user approval.
 
-For a quick team briefing, use the
-[three-page PDF](artifacts/pdf/predictive-cache-48-hour-team-plan.pdf)
-or its [Markdown source](docs/plan/team-quick-glance.md). The
-[detailed 48-hour plan](docs/predictive-cache-48-hour-team-plan.md)
-covers setup, contracts, ML, testing and fallback decisions.
+| Workstream | First shared output |
+| --- | --- |
+| A: Data and evaluation | Event contract, quality checks, replay and baseline output. |
+| B: ML and planning | Features, trained model, ranked candidates and versioned plans. |
+| C: Strider and Warmer | Authorized test volume/mount, cache probe and bounded NFS execution. |
+| D: Optional fourth engineer | Independent trials, pressure tests, results display and demo packaging. |
 
-| Owner | Day 1 | Handoff and next work |
-| --- | --- | --- |
-| **Protocol / filesystem** | Trace the deployed Chimera → CUFS read/fault path; identify event and file-identity owners; define a cold fixture and safe origin marker. | Publish access semantics and the cache probe contract; test NFS warm persistence, authentication, cancellation, and foreground isolation with Performance. |
-| **ML / AI** | Define prediction unit, feature/label windows, baselines, temporal split, and a fixture contract. | Publish model and planner requirements to Data/Controller; implement and compare time-of-week and co-access models against baselines using validated observations. |
-| **Telemetry / visualization** | Identify event and OTel sources, gaps, data permissions, run correlation, and collection/privacy requirements; sketch metrics and dashboard. | Deliver versioned event and metric contracts, quality checks, collection/replay coordination, and correlated dashboards to all lanes. |
-| **Performance analysis** | Define workload, trial manifest, cold-state probe, safety metrics, and benchmark skeleton in parallel. | Validate reset equivalence and noise floor with Protocol; run controlled treatments, analyze foreground impact and pollution, and deliver reproducible evidence. |
+Agree on contracts by H1; target an integrated run by H16, first comparison
+by H24, integration freeze by H32 and backup recording by H40. These are
+schedule targets, not evidence-gate passes. With three engineers, A also owns
+trial validity/display and C owns integration.
 
-The Controller's ingestion, planning, and feedback implementation is shared
-between the ML and integration/data owners; the protocol owner leads the
-Warmer. Agree on versioned event, plan, result, and metric contracts early;
-integrate daily and surface incompatibilities immediately.
+Use the [quick glance](docs/plan/team-quick-glance.md),
+[three-page PDF](artifacts/pdf/predictive-cache-48-hour-team-plan.pdf) or
+[detailed plan](docs/predictive-cache-48-hour-team-plan.md) for the schedule.
+The earlier working-week estimates are historical planning context, not the
+current hackathon timetable. Reinspect the target environment before tests;
+a deployed cluster alone does not prove registration, volume readiness,
+event capture or warming behavior.
 
-### Proposed working-week cadence
+## Milestones and go/no-go gates
 
-All columns begin together; the table is a coordination aid, not a claim that
-the gates will close on a particular date. Where a dependency is unavailable,
-use a versioned stub to continue interface work but do not use it as final
-evidence.
+The named gates below define what the team can claim. They are separate
+from the schedule's M0-M7 checkpoints.
 
-| When | Protocol / filesystem | ML / AI | Telemetry / data | Performance |
-| --- | --- | --- | --- | --- |
-| Day 1 | Map read/fault path, identity, origin tagging and a cold fixture. | Agree on candidates, label horizon, temporal split and baseline fixture. | Inventory sources and permissions; draft event/metric contracts and run IDs. | Define workload, trial manifest, reset/probe requirements and safety metrics. |
-| Day 2 | Test read-through feasibility and authentication with Performance. | Implement initial baselines and feature transformations against fixtures. | Test collection, quality checks and correlation using fixtures. | Build workload driver and test cold-state verification. |
-| Day 3 | Investigate origin suppression and bounded execution. | Develop time/co-access scoring and byte-budget simulation. | Connect available real observations and instrument the proposed flow. | Measure control-run variability and develop balanced scheduling. |
-| Day 4 | Exercise failure isolation and Warmer controls. | Compare models, tune on validation only and freeze the evaluation plan. | Build dashboard and export correlated evidence. | Pilot treatments and inspect foreground impact. |
-| Day 5 / spillover | Resolve feasibility and integration issues. | Finalize held-out evaluation and model manifest. | Close data-quality and observability gaps. | Complete valid trials, analysis and independent reproduction. |
+1. **Feasibility:** demonstrate persistent NFS read-through benefit; validate
+   origin/events, session-store isolation, authorized representative data
+   access and equivalent cold reset. Stop or redesign if these fail.
+2. **Data baseline:** publish an authorized versioned dataset, quality report,
+   deterministic replay, simple baselines and a no-warmer noise floor.
+3. **Offline model:** freeze models and thresholds, then compare against
+   MRU/frequency/static baselines on held-out real data at equal byte budgets.
+4. **End-to-end prototype:** exercise Controller plans, correlated feedback,
+   bounded Warmer execution, origin exclusion, recovery and foreground safety.
+5. **Proof and readout:** run matched trials; report uncertainty, foreground
+   impact and cache pollution; obtain a second engineer's reproduction before
+   claiming success.
 
-Hold a short daily integration point: publish contract changes early, run an
-integrated check when dependencies are available, and record the gate owner,
-evidence, and next action. Protocol owns filesystem semantics; telemetry owns
-collection and correlation; ML owns feature and label transformations; and
-Performance owns benchmark validity. The technical lead adjudicates scope or
-go/no-go changes.
+A faster selected read is insufficient if other foreground work regresses.
+Without verified cold-state equivalence, limit the result to an observational
+study. Without suitable real data, real-workload model-quality evaluation
+stays blocked. Synthetic fixtures cannot close either gap.
 
-### Milestones and go/no-go gates
+## What to read next
 
-1. **Feasibility:** demonstrate persistent NFS read-through benefit, validate
-   event/origin semantics, session Kvrocks isolation, representative data
-   access, and an equivalent cold reset. Stop or redesign if these fail.
-2. **Data baseline:** publish an authorized, versioned dataset and quality
-   report, deterministic replay, and the initial baseline/noise-floor report.
-3. **Offline model:** freeze baselines and thresholds; compare models on
-   held-out real data under a fixed byte budget.
-4. **End-to-end prototype:** Controller plans, Warmer executes bounded reads,
-   feedback correlates, synthetic-origin suppression and failure isolation
-   work, and the safety controls are exercised.
-5. **Proof and readout:** run matched trials, report confidence and
-   foreground/pollution impact, reproduce the result with a second engineer,
-   and review the evidence and limitations before claiming success.
+| Need | Document |
+| --- | --- |
+| Day-to-day schedule and ownership | [Quick glance](docs/plan/team-quick-glance.md) and [detailed team plan](docs/predictive-cache-48-hour-team-plan.md) |
+| Full generation schema, dataset layout and synthetic patterns | [Datagen spec](docs/datagen/spec.md) |
+| Collection, state, failure and benchmark procedures | [Validation and operations](docs/architecture/validation-and-operations.md) |
+| Gate owners and required evidence | [Checkpoint map](docs/plan/milestones.md) |
+| Contributor and agent procedures | [AGENTS.md](AGENTS.md), [handbook](docs/ai/contributor-handbook.md) and [workflow](docs/ai/workflow.md) |
 
-The draft allocates about five working days to protocol and model work and
-three to four to telemetry and performance; these are estimates, not
-deadlines. Do not remove the data, cold-state, safety, or reproducibility gates
-to preserve the schedule.
-
-### Validation and test map
-
-These are recommended future checks, **not tests that already exist in this
-repository**. Each level answers a different question:
-
-| Level | Examples | What it proves / does not prove |
-| --- | --- | --- |
-| Contract and unit | Event validation, unknown origins, temporal windows, deduplication, model ranking, plan budgets, overlapping ranges, stale identity and task-state transitions. | Local rules behave as specified; it does not prove NFS warms CUFS. |
-| Integration / fault injection | Duplicate delivery and lease expiry, partial reads, cancellation, unavailable Kvrocks/NFS/telemetry, full event queue, and foreground reads while warming is paused or saturated. | Components handle boundaries and failures; fixture behavior alone does not establish real-world model quality. |
-| Filesystem feasibility | Verify cold state, issue a bounded warm, and compare the subsequent read and fault/residency evidence through the deployed gateway. Include rename/replacement and access-permission cases. | The chosen mechanism can work in the tested environment; it does not establish broader performance impact. |
-| Offline real-data replay | Chronological split, frozen models, simple baselines, quality reports and byte-budget curves on authorized representative data. | Ranking quality under the recorded workload; not live latency or safety. |
-| Live controlled benchmark | Matched cold and warm treatments, foreground pressure and pollution checks, raw evidence and independent reproduction. | The measured end-to-end effect and its limits for that workload and environment. |
-
-### Gate owners and fallback decisions
-
-| Gate | Owner(s) | If the gate fails |
-| --- | --- | --- |
-| Read-through has a persistent, observable CUFS benefit | Protocol + Performance | Stop the NFS approach and investigate cache semantics or propose a direct API; do not claim warming worked. |
-| Structured demand and warmer-origin attribution are trustworthy | Protocol + Telemetry/Data | Investigate an approved, bounded nonblocking hook; do not train on contaminated or unknown-origin demand. |
-| Predictive state is compatible and isolated | Integration/Data + platform owner | Use a separately approved store if needed; never use the CUFS volume schema as fallback. |
-| Cold reset and foreground control are reproducible | Performance + Protocol | Repair the fixture/probe or limit the result to an observational study. |
-| Real data and workloads are authorized and representative | Data owner + ML | Collect appropriate evidence or report a blocked evaluation; synthetic fixtures cannot replace it. |
-| Foreground safety and cache pollution are acceptable | Performance + technical lead | Pause/stop the warmer, reduce budgets or redesign; a fast selected read is not a pass. |
-
-## Environment and historical observations
-
-The following are scoped historical observations from the supplied
-conversation, **not current cluster health**:
-
-- On **2026-10-09**, `cluster-manager` reported Kind cluster
-  `ash-strider-test2` healthy on `strider-dev`. The inventory observed three
-  ready nodes, a Chimera/CUFS deployment, separate volume and session Kvrocks
-  deployments, and an OTel/LGTM/Grafana stack. It did not establish the
-  required event fields, NFS warming behavior, or predictive-state isolation.
-- On **2026-11-03**, SSH to `nas-vm` worked, but a check found no Kind clusters
-  on that host. This does not place `ash-strider-test2` on `nas-vm` or prove
-  its current status elsewhere.
-
-Use `cluster-manager` to locate and inspect the intended Strider cluster
-before work; use the **Kind** backend for provisioning unless explicitly
-directed otherwise. Confirm the current topology, permissions, capacity, and
-observability with the owners. Do not assume that historical inventory,
-endpoints, or service configurations are unchanged.
-
-Do not build or run tests in local checkouts. Use `strider-dev` or
-`strider-dev2` and the designated CUFS and Chimera build containers; initialize
-submodules before testing where applicable. Use existing CI-integrated
-harnesses for SMB regression and unit tests rather than external-fixture-only
-tests that normally skip in PR CI.
+The README owns the architecture, concepts, illustrative interfaces and
+evidence gates. Linked documents supply procedures, planning detail and the
+generator's planning schema. Shared live contracts still need to be agreed.
+GitHub issues and the [project board](https://github.com/users/rahulgtt/projects/3)
+hold the backlog. `$pc-milestone` coordinates agent work; it is not part of
+the product runtime.
 
 ## Sources
 
-- [Day 1: Four parallel assignments](artifacts/pdf/day-one-assignments.pdf): the
-  supplied one-page ownership, tasks, and handoff summary.
-- [Private design conversation export](https://gist.github.com/arawat-nasuni/e028801f06bc780a80e04a316532e909):
-  user decisions and the 2026-10-09 Kind inventory; earlier five-service and
-  direct-API suggestions were superseded by the two-deployable MVP.
-- `Predictive_Cache_Warming_Implementation_Plan.md`, dated 2026-10-09:
-  §§2–4 architecture and validation gates; §7 staffing, workstreams, and
-  benchmark protocol; §8 proposed service and state contracts. This source
-  plan is not checked into this repository.
-- `Nasuni_Hackathon_Deep_Dive_Projects_1-5.pdf`, project 1, pp. 3–5:
-  original motivation, component sketch, demo, and risks. The PDF is not
-  checked into this repository; its internal assumptions and pitch targets
-  require validation.
-- The 2026-11-03 `nas-vm` observation and build/test constraints were supplied
-  in the task briefing. Neither is evidence of current cluster health.
+This revision reconciles the [48-hour plan](docs/predictive-cache-48-hour-team-plan.md),
+[quick glance](docs/plan/team-quick-glance.md) and
+[datagen specification](docs/datagen/spec.md). Earlier investigations,
+environment observations and source limitations are retained in
+[the reference notes](docs/architecture/validation-and-operations.md#sources).
+No benchmark or deployed-source capability is established by this README.
