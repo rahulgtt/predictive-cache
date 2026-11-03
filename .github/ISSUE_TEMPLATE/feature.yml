@@ -1,0 +1,34 @@
+name: Improvement / Feature
+description: An improvement or new feature.
+title: "[feature/<area>] "
+labels: ["type/feature"]
+projects: ["rahulgtt/3"]
+body:
+  - type: input
+    id: parent
+    attributes:
+      label: Parent story or epic
+      placeholder: "Part of #"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      value: |
+        - [ ]
+  - type: markdown
+    attributes:
+      value: "Replace `<area>` in the title with the primary area (ml, controller, warmer, protocol-cufs, telemetry-data, performance, infra, docs) and add the matching `area/*` label(s)."

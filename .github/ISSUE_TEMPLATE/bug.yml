@@ -1,0 +1,38 @@
+name: Bug
+description: Something is broken or behaves incorrectly.
+title: "[bug/<area>] "
+labels: ["type/bug"]
+projects: ["rahulgtt/3"]
+body:
+  - type: input
+    id: parent
+    attributes:
+      label: Related story or epic
+      placeholder: "Part of #"
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Include versions, environment/cluster, run IDs and logs where relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Note any foreground-read, data-quality or cache-pollution impact.
+  - type: markdown
+    attributes:
+      value: "Replace `<area>` in the title with the primary area (ml, controller, warmer, protocol-cufs, telemetry-data, performance, infra, docs) and add the matching `area/*` label(s)."
