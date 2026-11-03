@@ -1,0 +1,38 @@
+name: Story
+description: A deliverable slice of work under the Predictive Cache epic.
+title: "[Story]: "
+labels: ["type/story"]
+projects: ["rahulgtt/3"]
+body:
+  - type: input
+    id: epic
+    attributes:
+      label: Parent epic
+      description: "Story bodies start with `Part of #<epic>`. Also add this story to the epic's task list."
+      placeholder: "Part of #"
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What this story delivers and why.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Verifiable outcomes, including the evidence required.
+      value: |
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes / dependencies
+      description: Contracts, owners, gates, or links to docs/.
+  - type: markdown
+    attributes:
+      value: "Add at least one `area/*` label after creating the issue."

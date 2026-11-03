@@ -1,0 +1,34 @@
+name: Improvement / Feature
+description: An improvement or new feature.
+title: "[Feature]: "
+labels: ["type/feature"]
+projects: ["rahulgtt/3"]
+body:
+  - type: input
+    id: parent
+    attributes:
+      label: Parent story or epic
+      placeholder: "Part of #"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      value: |
+        - [ ]
+  - type: markdown
+    attributes:
+      value: "Add at least one `area/*` label after creating the issue."
