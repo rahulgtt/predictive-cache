@@ -94,7 +94,7 @@ def _raw_event(index: int, operation_id: str, *, sequence: int | None = None) ->
         "volume_id": VOLUME_ID,
         "file_id": FILE_ID,
         "identity_valid": True,
-        "export_name_b64": _b64(EXPORT_NAME.encode()),
+        "export_name_b64": _b64(f"/{EXPORT_NAME}".encode()),
         "export_id": EXPORT_ID,
         "target_fh": _b64(b"opaque-handle"),
         "operation_id": hashlib.sha256(f"nfs-{index}".encode()).hexdigest(),
@@ -316,7 +316,7 @@ def _fixture(tmp_path: Path) -> dict[str, Path]:
                 "checkpoint_version": 1,
                 "run_id": RUN_ID,
                 "scheduled_at": captured,
-                "captured_at": captured + timedelta(seconds=5),
+                "captured_at": captured,
                 "pod_name": "collector-0",
                 "pod_uid": POD_UID,
                 "node_name": "node-1",
@@ -369,6 +369,24 @@ def _reseal_raw(paths: dict[str, Path]) -> None:
         row["active_jsonl"]["sha256"] = raw_hash
         row["active_jsonl"]["size_bytes"] = paths["raw"].stat().st_size
     _jsonl(paths["checkpoints"], checkpoints)
+
+
+def _apply_sequence_baseline(paths: dict[str, Path], baseline: int) -> None:
+    raw = [json.loads(line) for line in paths["raw"].read_text().splitlines()]
+    for row in raw:
+        row["producer_sequence"] = str(int(row["producer_sequence"]) + baseline)
+    _jsonl(paths["raw"], raw)
+    observed = [json.loads(line) for line in paths["observed"].read_text().splitlines()]
+    for row in observed:
+        row["producer_sequence"] += baseline
+    _jsonl(paths["observed"], observed)
+    checkpoints = [json.loads(line) for line in paths["checkpoints"].read_text().splitlines()]
+    for row in checkpoints:
+        row["last_enqueued_sequence"] += baseline
+        row["last_synced_sequence"] += baseline
+        row["synced_count"] += baseline
+    _jsonl(paths["checkpoints"], checkpoints)
+    _reseal_raw(paths)
 
 
 def _import(paths: dict[str, Path], out: Path, **changes):
@@ -486,7 +504,7 @@ def test_raw_schema_and_sequence_are_strict(tmp_path: Path):
     rows[1]["producer_sequence"] = "3"
     _jsonl(paths["raw"], rows)
     _reseal_raw(paths)
-    with pytest.raises(ValueError, match="contiguous from one"):
+    with pytest.raises(ValueError, match="start checkpoint baseline"):
         _import(paths, tmp_path / "sequence-out")
 
 
@@ -590,7 +608,7 @@ def test_tag_checkpoint_hash_and_permissions_are_enforced(tmp_path: Path):
         checkpoints[0]["captured_at"]
     ) + timedelta(seconds=31)
     _jsonl(paths["checkpoints"], checkpoints)
-    with pytest.raises(ValueError, match="30-second tolerance"):
+    with pytest.raises(ValueError, match="start checkpoint baseline|30-second tolerance"):
         _import(paths, tmp_path / "late-checkpoint-out")
 
     paths = _fixture(tmp_path / "permissions")
@@ -606,6 +624,45 @@ def test_existing_output_is_never_replaced(tmp_path: Path):
     assert oct(os.stat(out).st_mode & 0o777) == "0o700"
     with pytest.raises(ValueError, match="atomic replacement"):
         _import(paths, out)
+
+
+def test_nonzero_start_checkpoint_sequence_baseline_is_preserved(tmp_path: Path):
+    paths = _fixture(tmp_path)
+    _apply_sequence_baseline(paths, 63)
+    out = tmp_path / "out"
+    manifest = _import(paths, out)
+    report = json.loads((out / "report/import.json").read_text())
+    assert manifest.data_kind == "synthetic"
+    assert report["event_quality"]["raw_events"][0]["producer_sequence"] == 64
+
+
+@pytest.mark.parametrize("first_sequence", [63, 65])
+def test_start_checkpoint_baseline_rejects_first_sequence_gap(
+    tmp_path: Path,
+    first_sequence: int,
+):
+    paths = _fixture(tmp_path)
+    _apply_sequence_baseline(paths, 63)
+    raw = [json.loads(line) for line in paths["raw"].read_text().splitlines()]
+    raw[0]["producer_sequence"] = str(first_sequence)
+    _jsonl(paths["raw"], raw)
+    observed = [json.loads(line) for line in paths["observed"].read_text().splitlines()]
+    observed[0]["producer_sequence"] = first_sequence
+    _jsonl(paths["observed"], observed)
+    _reseal_raw(paths)
+    with pytest.raises(ValueError, match="start checkpoint baseline"):
+        _import(paths, tmp_path / "bad")
+
+
+def test_final_checkpoint_must_equal_baseline_plus_run_rows(tmp_path: Path):
+    paths = _fixture(tmp_path)
+    _apply_sequence_baseline(paths, 63)
+    checkpoints = [json.loads(line) for line in paths["checkpoints"].read_text().splitlines()]
+    for field in ("last_enqueued_sequence", "last_synced_sequence", "synced_count"):
+        checkpoints[-1][field] += 1
+    _jsonl(paths["checkpoints"], checkpoints)
+    with pytest.raises(ValueError, match="final checkpoint"):
+        _import(paths, tmp_path / "bad-final")
 
 
 def _full_validation_contract(tmp_path: Path):

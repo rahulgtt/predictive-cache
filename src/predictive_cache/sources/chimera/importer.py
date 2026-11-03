@@ -273,7 +273,9 @@ def _resolve_source(root: Path, relative: str) -> Path:
 
 
 def _load_raw_events(
-    source_manifest_path: Path, sources: CollectorFileManifest
+    source_manifest_path: Path,
+    sources: CollectorFileManifest,
+    start_baselines: dict[tuple[str, str, str, str], int],
 ) -> tuple[dict[tuple[str, str], list[ChimeraEvent]], dict[str, str], dict[str, int]]:
     root = source_manifest_path.parent
     streams = {}
@@ -291,14 +293,44 @@ def _load_raw_events(
                 f"{source.raw_jsonl_path}: producer epoch differs from its trusted envelope"
             )
         sequences = [event.sequence for event in events]
-        if sequences != list(range(1, len(events) + 1)):
+        identity = (
+            source.pod_name,
+            source.pod_uid,
+            source.node_name,
+            source.producer_epoch,
+        )
+        stream = (source.pod_uid, source.producer_epoch)
+        if identity not in start_baselines:
             raise ValueError(
-                f"{source.raw_jsonl_path}: producer sequences must be contiguous from one"
+                f"{source.raw_jsonl_path}: source stream lacks a start checkpoint baseline"
             )
-        streams[(source.pod_uid, source.producer_epoch)] = events
+        baseline = start_baselines[identity]
+        if sequences != list(range(baseline + 1, baseline + len(events) + 1)):
+            raise ValueError(
+                f"{source.raw_jsonl_path}: producer sequences must be contiguous "
+                "from the start checkpoint baseline"
+            )
+        streams[stream] = events
         hashes[source.raw_jsonl_path] = digest
         sizes[source.raw_jsonl_path] = len(data)
     return streams, hashes, sizes
+
+
+def _start_baselines(
+    checkpoints: list[Checkpoint],
+    manifest: CollectionManifest,
+) -> dict[tuple[str, str, str, str], int]:
+    baselines = {}
+    for row in checkpoints:
+        if row.scheduled_at != manifest.start_time:
+            continue
+        key = (row.pod_name, row.pod_uid, row.node_name, row.producer_epoch)
+        if key in baselines:
+            raise ValueError(f"{key}: duplicate start checkpoint baseline")
+        baselines[key] = row.last_synced_sequence
+    if not baselines:
+        raise ValueError("collection lacks start checkpoint baselines")
+    return baselines
 
 
 def _validate_checkpoints(
@@ -308,6 +340,7 @@ def _validate_checkpoints(
     streams: dict[tuple[str, str], list[ChimeraEvent]],
     source_hashes: dict[str, str],
     source_sizes: dict[str, int],
+    start_baselines: dict[tuple[str, str, str, str], int],
     validation_permit: AdapterValidationPermit | None = None,
 ) -> None:
     source_by_stream = {
@@ -364,8 +397,11 @@ def _validate_checkpoints(
         ):
             raise ValueError(f"{stream}: checkpoint captured outside the 30-second tolerance")
         source = source_by_stream[stream]
-        if any(row.pod_name != source.pod_name for row in rows):
-            raise ValueError(f"{stream}: checkpoint pod name differs from source envelope")
+        if any(
+            row.pod_name != source.pod_name or row.node_name != source.node_name
+            for row in rows
+        ):
+            raise ValueError(f"{stream}: checkpoint identity differs from source envelope")
         if rows[0].restart_count and not rows[0].restart_explained:
             raise ValueError(f"{stream}: unexplained restart before first checkpoint")
         for previous, current in zip(rows, rows[1:], strict=False):
@@ -380,7 +416,14 @@ def _validate_checkpoints(
                 raise ValueError(f"{stream}: producer sequence reset")
         if validation_permit is None:
             final = rows[-1]
-            expected_count = len(streams[stream])
+            source = source_by_stream[stream]
+            identity = (
+                source.pod_name,
+                source.pod_uid,
+                source.node_name,
+                source.producer_epoch,
+            )
+            expected_count = start_baselines[identity] + len(streams[stream])
             if any(
                 (
                     final.last_enqueued_sequence != expected_count,
@@ -437,7 +480,7 @@ def _validate_and_build_events(
                     operation.volume_id != event.volume_id,
                     operation.file_id != event.file_id,
                     event.export_id != fixture.export_id,
-                    event.export_name != fixture.export_name,
+                    event.export_name != fixture.export_path,
                 )
             ):
                 raise ValueError(f"{event.local_id}: raw event identity conflicts with fixture evidence")
@@ -570,7 +613,7 @@ def _build_counters(
             reasons_by_hour[hour][disposition.exclusion_reason or "excluded"] += 1
     counters = []
     known_gaps = []
-    hour = manifest.start_time
+    hour = _hour_start(manifest.start_time)
     while hour < manifest.end_time:
         offered_count = offered_by_hour[hour]
         emitted_count = emitted_by_hour[hour]
@@ -679,7 +722,12 @@ def import_dataset(
         ),
     )
     observed = _validate_observed(observed_rows, manifest, offered)
-    streams, source_hashes, source_sizes = _load_raw_events(inputs["event_sources"], sources)
+    start_baselines = _start_baselines(checkpoints, manifest)
+    streams, source_hashes, source_sizes = _load_raw_events(
+        inputs["event_sources"],
+        sources,
+        start_baselines,
+    )
     _validate_checkpoints(
         checkpoints,
         manifest,
@@ -687,6 +735,7 @@ def import_dataset(
         streams,
         source_hashes,
         source_sizes,
+        start_baselines,
         permit,
     )
     output_events, exclusions, event_report = _validate_and_build_events(
