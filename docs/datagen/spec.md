@@ -7,6 +7,9 @@
 
 ## 1. Purpose
 
+The [decisions and handoff note](decisions-and-handoff.md) preserves the
+conversation context, workload rationale and deferred integration questions.
+
 There is no confirmed real access history yet (see [README](../../README.md)).
 The ML lane still needs data now to build cleaning, features, snapshots,
 models and the replay evaluator. `pcache-datagen` produces that data:
@@ -58,6 +61,21 @@ a cold huge file costs far more wall-clock time than a small one. The
 generator therefore always emits `file_size`, per-read byte ranges and
 per-handle totals. It also includes large files that are read in full, so
 any of these objectives can be evaluated later on the same data.
+
+### 1.4 Generation boundary
+
+This story implements **event emission in Python**: it creates a fictional
+world, schedules access intentions, and writes synthetic operation records.
+It does not create the modeled files, execute their reads, watch local user
+activity, or connect to CUFS. A 50 GiB catalog entry consumes metadata space,
+not 50 GiB of disk. Only dataset output files are written.
+
+An optional future workload executor could perform those intentions against
+dedicated lab files and capture actual outcomes. That is outside #11–#19;
+it must use distinct provenance and must not present local timing as CUFS
+timing. All outputs here have `manifest.data_kind=synthetic`, including
+events whose simulated `origin` is `foreground`. Origin describes the actor
+inside the scenario, not whether the dataset is real.
 
 ## 2. Pipeline overview
 
@@ -125,7 +143,7 @@ large presets.
 | Enums | Lowercase snake_case strings. |
 | Nullability | Every field is listed as required or nullable. Nullable means the value may be absent in **real** data too; consumers must handle `null`. |
 | Versioning | `schema_version` on every event and `manifest_version` on the manifest. Breaking changes bump the version and update this spec. |
-| Determinism | Same resolved config and seed give byte-identical files under `catalog/`, `events/`, `loss/` and `truth/`. Only `manifest.created_at` and `manifest.generator.git_sha` may differ. Use `numpy.random.SeedSequence` to spawn independent per-volume / per-pattern streams. |
+| Determinism | Same resolved config, seed, generator revision and locked dependencies give byte-identical files under `catalog/`, `events/`, `loss/` and `truth/`. Record runtime/dependency versions in the manifest. Use `numpy.random.SeedSequence` with fixed component/volume IDs, not enabled-component enumeration, so disabling a fault does not resample the world. Never use Python's process-randomized `hash()`. Cross-version binary identity is not promised. |
 | Privacy | All names and paths are synthetic, built from a fixed word list. No real usernames, paths or contents. |
 
 ## 5. Schemas
@@ -139,7 +157,7 @@ One row per filesystem operation as observed by the event source.
 | `schema_version` | int16 | yes | `1`. |
 | `event_id` | string | yes | Unique per original event. A **duplicate** reuses the same `event_id`. |
 | `event_time` | timestamp | yes | When the operation happened, by the client/node clock. May be skewed (§9). |
-| `ingest_time` | timestamp | yes | When the collector received the event. Normally ≥ `event_time`; can be much later for late events. |
+| `ingest_time` | timestamp | yes | Collector time: true operation time plus nonnegative delivery delay. Can precede the skewed `event_time`; clock skew does not move collector time. |
 | `volume_id` | string | yes | Volume. |
 | `file_id` | string | yes | Opaque file identity. Stable across rename (unless the identity-break fault is on). Replace (delete + create) yields a new `file_id`. |
 | `dir_id` | string | yes | Parent directory at `event_time` (destination dir for `rename`). |
@@ -162,9 +180,12 @@ One row per filesystem operation as observed by the event source.
 
 Invariants for clean (pre-fault) data:
 
-- Each `open` has exactly one `close` with the same `handle_id`, later in
-  `event_time`.
-- A handle's `close.handle_bytes_read` equals the sum of its `read.bytes_read`.
+- Each successful `open` has exactly one `close` with the same `handle_id`,
+  later in true time. Failed opens (`enoent`/`eacces`) have no reads or close.
+- With `read_events: ranges`, a handle's `close.handle_bytes_read` equals the
+  sum of its `read.bytes_read`. With `none`, totals come from the same
+  internal read plan, but individual reads are deliberately not emitted;
+  validate totals against that plan in realizer tests, not an empty read sum.
 - `0 ≤ offset` and `offset + bytes_read ≤ file_size`.
 - No operations on a `file_id` after its `delete` except failed `open`
   (`enoent`).
@@ -173,6 +194,13 @@ Invariants for clean (pre-fault) data:
 
 The world as built (§6). This is ground-truth metadata that a real system
 could also provide, so consumers may read it.
+
+Catalogs include future history for replay. At a feature cutoff `t`, consumers
+must exclude files/directories created after `t`, ignore future deletion and
+replacement fields, and resolve paths using `valid_from <= t < valid_to`
+(null end means unbounded). Future interval endpoints are not features.
+These catalogs assume metadata is observable at its effective time; real
+sources need an availability-time policy before using this assumption.
 
 **`volumes`**: `volume_id`, `timezone` (IANA), `work_days` (list of ISO
 weekday ints), `work_start_local` / `work_end_local` (`HH:MM`), `holidays`
@@ -202,15 +230,21 @@ per volume per UTC hour.
 | Field | Type | Description |
 | --- | --- | --- |
 | `volume_id` | string | |
-| `hour_start` | timestamp | UTC hour bucket (by `event_time` of the original event). |
+| `hour_start` | timestamp | UTC hour bucket by original **true** operation time, before clock skew. |
 | `offered` | int64 | Events produced by the source, before loss/sampling, excluding duplicates. |
 | `emitted` | int64 | Events delivered (unique `event_id`s). |
 | `dropped` | int64 | Lost events (loss windows). |
 | `sampled_out` | int64 | Removed by sampling. |
 | `duplicates` | int64 | Extra duplicate deliveries. |
-| `late` | int64 | Delivered more than `faults.late.threshold_s` after `event_time`. |
+| `late` | int64 | Unique delivered events whose first delivery is more than `faults.late.threshold_s` after true operation time. |
 
 Invariant: `offered = emitted + dropped + sampled_out`.
+
+Loss windows take precedence over sampling: an event gets exactly one of
+`emitted`, `dropped`, `sampled_out`. Duplicates are extra deliveries of emitted
+events only. Both removed categories are retained in `truth/dropped_events/`
+with their respective truth tags. Observed row count equals `emitted +
+duplicates`. Known gaps include nonzero loss windows and sampling intervals.
 
 ### 5.4 Ground truth (`truth/`), tests and eval only
 
@@ -237,12 +271,19 @@ The `params` per kind are listed in §7. Workflow chains add
 
 | Field | Description |
 | --- | --- |
-| `event_id` | Joins to events. Duplicates share the row and set `fault`. |
+| `event_id` | Joins to events. Duplicates share the row and add `duplicate` to `faults`. |
 | `intent_id` | The intent that produced the event (null for metadata churn). |
 | `cause` | `pattern_id` of the generating pattern, or `background`, `noise`, `churn`, `warmer_sim`, `probe_sim`. |
 | `faults` | List of applied faults: `duplicate`, `late`, `skew`, `dropped`, `sampled_out`, `origin_unknown`, `failed_result`, `invalid_range`, `identity_break`. Empty when clean. |
 | `true_event_time` | Event time before clock skew. |
 | `true_file_id` | `file_id` before identity break. |
+| `original_fields_json` | Canonical JSON object of original values for fields mutated by faults, including nulls; `{}` when none. Capture each original value once, before the first mutation. Tests use it to restore results, ranges, origin and timestamps; never expose it to consumers. |
+
+There is one truth row per **unique** event ID, not per duplicate delivery.
+For duplicate deliveries, restoration uses the first delivery, then applies
+`original_fields_json`. Added warmer/probe events have their own event IDs
+and causes. Store aggregate rates and denominators in the quality report;
+truth tags alone must not be used as production demand labels.
 
 ### 5.5 Manifest (`manifest.json`)
 
@@ -341,7 +382,7 @@ randomness flows from its own seeded stream. The global
 | P2 | `weekly_schedule` | Recurring meetings and reviews: a set of 1–20 files opened at a fixed local weekday/time by 1–N team members, e.g. "Monday 09:00 model + drawings". Includes daily variants (every workday 09:15). Schedules can start or stop mid-period. | `instances_per_team: 2`, `jitter_min: 10`, `attendance: 0.85`, `files_per_set: [1,20]` | Time-of-week |
 | P3 | `workflow_chain` | Co-access workflows: after opening entry file A, the actor continues along a Markov chain (A→B→C, with branching) with log-normal delays. Some edges **drift** (change target) mid-period. | `chains_per_project: 3`, `length_geom_p: 0.35`, `delay_median_s: 120`, `delay_sigma: 1.0`, `continue_p: 0.7`, `drift_share: 0.2` | Co-access graph |
 | P4 | `project_lifecycle` | Scales P1/P2/P3 intensity per project over weeks (§6.2). Emits truth only, no direct intents. | see §6.2 | Decayed frequency, drift handling |
-| P5 | `burst` | One-off, non-recurring events: a **review day** (team opens most of a directory within 1–3 h) or a **directory scan** (one actor reads heads of every file in a subtree). Randomly placed. | `bursts_per_volume_month: 3`, `scan_share: 0.3` | Nothing (false-positive bait) |
+| P5 | `burst` | One-off, non-recurring events: a **review day** (team opens most of a directory within 1–3 h) or a **directory scan** (one actor reads heads of every file in a subtree). Randomly placed. | `bursts_per_volume_month: 3`, `scan_share: 0.3` | Unscheduled onset; shared demand after onset |
 | P6 | `batch_job` | Nightly/weekly service jobs (indexer, backup verify) reading file heads over a subtree at a local time. `origin=foreground` (real demand), `app=batch-indexer`/`backup`. | `jobs_per_volume: 2`, `local_time: "02:00"`, `head_bytes: 1 MiB` | Time-of-week (and app filter) |
 | P7 | `new_file` | Files created during the period: `create` + `write`s, then a burst of opens by the team decaying over days. This is the cold-start case. | `new_files_per_project_week: 5`, `open_decay_half_life_days: 2` | Directory activity priors |
 | P8 | `noise` | Uniformly random opens of any file, including archived projects; the unpredictable long tail. | share of all foreground opens: `randomness.noise_share: 0.05` | Nothing |
@@ -356,14 +397,52 @@ Interactions:
 - All patterns skip files that are deleted at the intended time, except an
   `enoent` rate controlled by §8.3 (stale opens).
 
+### 7.1 Workload controls and acceptance mapping
+
+These controls extend existing patterns. Values are scenario assumptions,
+not calibrated human statistics. Include them in resolved config and pattern
+truth. Probabilities are in [0, 1]; counts are positive; time spans are bounded.
+
+| Configuration key (default) | Behavior | Owner / deterministic check |
+| --- | --- | --- |
+| `patterns.popularity.working_set_size: 20`, `working_set_share: 0.7`, `revisit_share: 0.2`, `revisit_history: 10` | Each actor has a stable subset of live files in assigned projects. For each P1 selection, first choose a prior file with revisit probability; otherwise choose the personal subset with working-set probability, else the project population. Use Zipf weights within the selected pool. Empty pools fall back to live project files; empty projects emit no intent. | #14 assigns sets, #15 selects reads. Controlled fixtures verify that share=1 stays within the set and revisit=1 selects from available history. |
+| `patterns.workflow_chain.context_order: 1` (1 or 2), `max_steps: 20` | Order 1 uses current file; order 2 uses (previous, current) within the same workflow run. Missing order-2 transitions fall back to order 1. `continue_p` controls continuation; stopping represents task abandonment. Bound loops by max_steps. | #16: A→B→C and D→B→E remain distinguishable with interleaved actors. |
+| `patterns.workflow_chain.interruption_p: 0.05` | Before each continuation, optionally insert one unrelated live project-file open, then resume saved chain context. If no unrelated file exists, skip the interruption. Inserted opens do not trigger another chain. | #16: probability 0 inserts nothing; probability 1 inserts one interruption per continuation when possible. |
+| `patterns.burst.participation: 0.7`, `shared_file_share: 0.6`, `arrival_spread_s: 3600`, `duration_s: 10800` | Review burst: independently select team participants. Partition the selected directory's live files into a common subset and a remainder. Each participant reads the common subset plus an independently sampled half of the remainder. Starts are uniform within arrival_spread_s; reads are uniform over the remaining time to the burst's duration_s deadline, then sorted. Scans retain their single-actor behavior. | #16: controlled fixtures force multiple participants and verify shared and actor-specific reads; zero participation emits none. |
+| `realize.interactive_think_time_max_s: 300`, `service_think_time_max_s: 0`, `read_mbps_sigma: 0.5` | Per-handle lognormal throughput and bounded think time provide different speeds. Profiles still determine full/head/range reads. Throughput only schedules synthetic times. | #17: profile bounds and handle totals hold at timing extremes. |
+
+Cap working-set and burst subset sizes to available files. Round subset
+counts down; share=1 selects all. Empty burst subsets are valid and reported.
+Require arrival_spread_s <= duration_s. Order-2 transition truth includes
+`previous` alongside `from`, `to`, `p`; order-1 edges use null `previous`.
+Private working sets and transition tables never enter model-input events.
+
+P5 onset is not predictable from a weekly schedule. Once it begins, growing
+demand across independent sessions **can** predict continued demand. Separate
+unexpected onset from within-burst sharing in recovery reports.
+
+Controls support neutral values: working_set_share=0, revisit_share=0,
+context_order=1, interruption_p=0, shared_file_share=0. The isolated P1 Zipf
+check disables working-set/revisit and recency boosts so it tests the specified
+distribution. Mixed-workload reports describe the resulting distribution
+without requiring the original exponent to survive these transformations.
+Holdout scenarios may vary seeds, overlap, noise and drift; downstream training
+still uses chronological splits and excludes truth and future catalog history.
+
 ## 8. From intents to events
 
 ### 8.1 Sessions
 
-Intents of one actor are grouped into sessions: a new `session_id` starts
+Intents of one actor within one volume are grouped into sessions: a new `session_id` starts
 after an inactivity gap > `sessions.gap_min` (default 10). Service actors
 get one session per job run. Session IDs are emitted only if
 `emit.session_id` is true.
+
+Sessionization uses true intent time before skew/delivery faults. A cohort
+is a team, not a session. Globally adjacent events from different actors do
+not form workflow edges. Session/handle state persists across weekly windows.
+Private workflow/job run IDs distinguish concurrent runs; they are internal
+context, not additional event-schema columns.
 
 ### 8.2 Read profiles
 
@@ -380,7 +459,8 @@ get one session per job run. Session IDs are emitted only if
   `realize.read_mbps_median`, default 200 MB/s). It only spaces event times
   and implies nothing about cold/warm latency.
 - `close` follows the last read after `U(0, think_time_max_s)`, default up
-  to 300 s for interactive apps, 0 for service actors.
+  to `realize.interactive_think_time_max_s` for interactive apps and
+  `realize.service_think_time_max_s` for service actors.
 - `realize.read_events: none` emits only `open` + `close` (with handle
   totals). This lets us test whether per-range events are needed.
 
@@ -394,11 +474,24 @@ get one session per job run. Session IDs are emitted only if
   `file_size` for later events and updates "recently written" for P1's
   recency boost. `rename` updates `file_paths` and `dir_id`.
 
+For v1, defer writes, deletes and replacements until active handles on that
+file close. Record the effective time in catalog history. This keeps range
+and size invariants deterministic without modeling filesystem concurrency;
+it is a simplification, not a claim about CUFS behavior.
+
 ## 9. Data-quality fault injection
 
 Faults are applied **after** realization, in the order below. Each one is
 independently configurable and recorded in `truth/event_truth.faults`. With
 all faults disabled, `events/` equals the clean stream.
+
+Origin-generated warmer/probe traffic is realized into complete handles first,
+then passes through the remaining faults. Arrival times are based on true
+operation time, not the skewed client clock. Late delays are capped at 6 h;
+duplicate delivery uses a positive delay capped at 6 h. Fault mutations retain
+original values in truth (§5.4). Failure injection deliberately may make an
+observed close total disagree with mutated reads; validate the restored clean
+stream and report the observed discrepancy as an expected injected fault.
 
 | Fault | Default | Effect | Downstream must |
 | --- | --- | --- | --- |
@@ -411,7 +504,7 @@ all faults disabled, `events/` equals the clean stream.
 | `clock_skew` | on | Per-client offset ~ N(0, 2 s), plus 1% of clients with a ±5 min offset. Shifts `event_time` only. | Tolerate reordering. |
 | `loss_window` | 2 per volume per month | Window of 1–6 h in which 30–100% of events are dropped. Dropped events are moved to `truth/dropped_events/`, counted in `loss/`, and listed in `manifest.known_gaps`. | Mask the window as unknown, not "no demand". |
 | `sampling` | off | Uniform sampling rate per volume. | Scale or mask. |
-| `late` | 1% | `ingest_time = event_time + LogNormal(median 5 min)`, tail to ~6 h. | Handle late arrival. |
+| `late` | 1% | `ingest_time = true_event_time + LogNormal(median 5 min)`, tail to ~6 h. | Handle late arrival. |
 | `duplicate` | 0.5% | Re-deliver the same event (same `event_id`) with a later `ingest_time`. | Deduplicate by `event_id`. |
 
 ## 10. Configuration
@@ -449,10 +542,10 @@ actors:
   service: 2
   vacation_weeks_per_quarter: 0.5
 patterns:
-  popularity: {rate_per_user_hour: 6, zipf_s: 1.1, recency_boost_half_life_days: 3}
+  popularity: {rate_per_user_hour: 6, zipf_s: 1.1, recency_boost_half_life_days: 3, working_set_size: 20, working_set_share: 0.7, revisit_share: 0.2, revisit_history: 10}
   weekly_schedule: {instances_per_team: 2, jitter_min: 10, attendance: 0.85}
-  workflow_chain: {chains_per_project: 3, delay_median_s: 120, continue_p: 0.7, drift_share: 0.2}
-  burst: {bursts_per_volume_month: 3, scan_share: 0.3}
+  workflow_chain: {chains_per_project: 3, delay_median_s: 120, continue_p: 0.7, drift_share: 0.2, context_order: 1, max_steps: 20, interruption_p: 0.05}
+  burst: {bursts_per_volume_month: 3, scan_share: 0.3, participation: 0.7, shared_file_share: 0.6, arrival_spread_s: 3600, duration_s: 10800}
   batch_job: {jobs_per_volume: 2, local_time: "02:00"}
   new_file: {new_files_per_project_week: 5, open_decay_half_life_days: 2}
   churn: {writes_per_file_month: 0.5, rename_rate: 0.01, delete_rate: 0.005, replace_rate: 0.005}
@@ -464,6 +557,9 @@ realize:
   read_events: ranges    # ranges | none
   max_read_event_bytes: 16777216
   read_mbps_median: 200
+  read_mbps_sigma: 0.5
+  interactive_think_time_max_s: 300
+  service_think_time_max_s: 0
 sessions: {gap_min: 10}
 emit: {session_id: true, cohort_id: true, client_id: true}
 faults:
@@ -523,6 +619,8 @@ class Intent:
     read_profile: Literal["full", "head", "ranges"]
     head_bytes: int | None
     cause: str                             # pattern_id | "background" | "noise"
+    workflow_run_id: str | None = None      # private context, never event columns
+    job_run_id: str | None = None           # one service session per run
 
 @dataclass(frozen=True)
 class PatternRecord:                       # one line of truth/patterns.jsonl (§5.4)
@@ -551,20 +649,41 @@ class EventRealizer(Protocol):
 class FaultInjector(Protocol):
     name: ClassVar[str]
     def apply(self, events: Iterator[tuple[EventRow, EventTruthRow]], world: World,
-              rng: np.random.Generator) -> Iterator[tuple[EventRow, EventTruthRow]]: ...
+              rng: np.random.Generator) -> Iterator[FaultRecord]: ...
+
+@dataclass(frozen=True)
+class FaultRecord:
+    event: EventRow
+    truth: EventTruthRow
+    disposition: Literal["emitted", "dropped", "sampled_out", "duplicate"]
 
 def run(cfg: Config, out_dir: Path) -> Manifest:
     # 1. rng streams from SeedSequence(seed): world, one per pattern, realizer, one per fault
-    # 2. world = build_world(...); write catalog
+    # 2. world = build_world(...); retain mutable history for final catalog output
     # 3. for each pattern: plan(...) -> truth/patterns.jsonl
     # 4. per volume, per week window: heapq.merge(pattern.intents(...)) -> realize -> faults
     # 5. sort by (ingest_time, event_id) within partitions; write events, truth, loss
-    # 6. manifest + report
+    # 6. finalize catalog history after churn; write manifest + report
 ```
 
 The week-window streaming must not cut chains or handles: generators may
 emit intents up to `window_end + spill` (default 6 h), and the runner
 carries spill-over into the next window.
+
+The fault-chain runner adapts these records between injectors and preserves
+terminal dropped/sampled dispositions; they never disappear from accounting.
+Only emitted events can acquire duplicate deliveries. Each injector consumes
+prior truth and extends it rather than replacing earlier tags/original values.
+
+Workflow expansion is owned by P3: the runner merges base intents, expands
+P1/P2 entry-file triggers once, then merges continuation intents by true time.
+Generated continuation/interruption intents never retrigger P3. Retain session,
+workflow, job, popularity-history and fault-window state across chunks. Chunk
+size must not change output. At period end, stop new work and finish admitted
+handles/chains; retain delayed deliveries and report their extent separately
+from the configured demand period. Spill is a buffering parameter, not a
+license to truncate events. Global partition output must merge arrivals from
+adjacent generation windows before finalizing file order and hashes.
 
 ## 12. CLI
 
@@ -582,11 +701,11 @@ pcache-datagen describe DIR        # prints manifest summary + report/summary.md
 | --- | --- |
 | Schema | Every file matches §5. Enums are valid and required fields are non-null. |
 | Referential integrity | Event `file_id`/`dir_id`/`volume_id`/`client_id` exist in `catalog/` (except `identity_break` IDs, which exist in truth). |
-| Handles | In the **clean** stream (events + dropped, after removing duplicates and undoing skew/identity faults from truth), every `open` has one `close` and totals match. |
+| Handles | Restore the clean stream from delivered and removed events, deduplicate, and undo all field mutations using truth. Successful opens have one close; failed opens have neither reads nor close. Check read sums in range mode; use realizer plan tests for summary mode (§5.1). |
 | Loss reconciliation | §5.3 invariant per row. `manifest.known_gaps` covers every loss window. |
 | No truth leakage | `events/` contains no truth columns, and no event value encodes `pattern_id`/`cause`. |
 | Determinism | Two runs with the same seed give identical `sha256` for all data files. |
-| Fault rates | Each enabled fault's observed rate is within ±20% of the configured rate (on `small`). |
+| Fault rates | On `small`, check probabilistic rates against eligible populations at the corresponding injection stage, not all rows. Report numerator, denominator and expected count. Retain issue #18’s ±20% acceptance tolerance on `small`; tune the acceptance fixture to provide sufficient eligible samples (target expected count ≥100). Sparse custom/tiny runs report insufficient statistical support and use endpoint fixtures; they cannot satisfy the small-preset acceptance gate. Fixed counts and boolean enabled flags are not probabilities. |
 | Manifest | Hashes and row counts match the files. |
 
 **Pattern recovery checks** use only events and catalog for the statistic,
@@ -603,6 +722,22 @@ actually present and learnable:
 | P6 batch job | ≥ 90% of job runs appear within ±15 min of `local_time`. |
 | P7 new file | Opens per day after creation decrease (Spearman < −0.5). |
 | P8 noise | Noise share of foreground opens is within ±20% of `noise_share`. |
+
+Validate injected semantic violations against truth: an intentionally invalid
+range or broken identity is an expected diagnostic, not an automatic dataset
+failure. Schema errors, untagged violations, unmatched truth claims, bad hashes
+and unexplained loss fail validation. Check the restored clean stream as well
+as observed data; a generated fault must not excuse unrelated corruption.
+
+Recovery thresholds apply to controlled, adequately populated fixtures with
+competing patterns/faults disabled or explicitly accounted for. Mixed scenarios
+report diagnostics separately. Short `tiny` runs do not claim weekly recovery.
+P2 reports both the fraction of generated schedule opens within ±1 h (issue
+#16) and attendance-adjusted occurrence coverage. P3 edges are measured within
+an actor/session and separately before/after drift, never across the global
+stream. Constant lifecycle curves, zero planted instances and too few samples
+are reported as not applicable/insufficient data, not successful recovery.
+Add endpoint and interleaving checks from §7.1 to the respective task suites.
 
 `report/quality.json` contains:
 

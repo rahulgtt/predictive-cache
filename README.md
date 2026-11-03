@@ -229,6 +229,12 @@ any specific Redis-compatible command or queue design.
 
 ### Establish the evidence first
 
+For the synthetic development dataset, see the
+[datagen implementation spec](docs/datagen/spec.md) and
+[decisions and model-team handoff](docs/datagen/decisions-and-handoff.md).
+These describe generated access records, not collection of local or cluster
+activity, and do not change the real-evidence requirements below.
+
 There is **no confirmed representative historical access dataset** in this
 repository or in the supplied evidence. Ask the data and filesystem owners
 which authorized structured sources exist, what time span and workloads they
