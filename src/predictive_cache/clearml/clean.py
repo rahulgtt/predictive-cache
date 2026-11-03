@@ -83,7 +83,9 @@ def main(argv: list[str] | None = None) -> None:
         task.execute_remotely(queue_name=args.queue, clone=False)
 
     source = Dataset.get(dataset_id=source_id, only_completed=True)
-    if Task.get_task(task_id=source_id).get_project_name() != "predictive-cache/datasets/synthetic":
+    source_project = Task.get_task(task_id=source_id).get_project_name()
+    expected_project = f"predictive-cache/datasets/synthetic/.datasets/{source.name}"
+    if source_project != expected_project:
         raise ValueError("source Dataset is not in the synthetic data project")
     source_root = Path(source.get_local_copy())
     source_name = validate_source_files(source_root, source.list_files(), source.name)
