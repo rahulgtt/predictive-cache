@@ -31,8 +31,9 @@ contracts, terminology and evidence gates; update it when the design changes.
 
 - Locate/recheck the target with `cluster-manager`; historical inventory is
   not current health. Use Kind for provisioning unless explicitly directed otherwise.
-- Build/test CUFS, Chimera and other Strider components on `strider-dev` /
-  `strider-dev2` in designated containers, not local checkouts; initialize submodules.
+- Build/test this project on `nas-vm` in designated CUFS or Chimera build
+  containers, not local checkouts or `strider-dev` / `strider-dev2`; initialize
+  submodules where applicable.
 - Keep durable Markdown knowledge in `docs/`, PDFs in `artifacts/pdf/`, and
   conventions/templates in `.github/`. Use kebab-case documentation names.
 - `local-space/` is ignored private scratch space; never force-add its files.

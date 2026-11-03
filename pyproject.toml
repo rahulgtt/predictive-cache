@@ -12,22 +12,43 @@ dependencies = ["numpy>=2,<3", "pyarrow>=19,<24", "pydantic>=2.10,<3", "pyyaml>=
 [project.optional-dependencies]
 clearml = ["clearml>=2.1,<2.2"]
 ml = ["scikit-learn>=1.5,<2"]
+warmer = [
+    "pynfs @ git+https://github.com/truenas/pynfs.git@87b2d81d0b38ec7a9d73b7d38bf9559b73b853d9",
+]
 
 [project.scripts]
 pcache-clearml-datagen = "predictive_cache.clearml.datagen:main"
 pcache-datagen = "predictive_cache.datagen.cli:main"
+pcache-chimera-import = "predictive_cache.sources.chimera.cli:main"
+pcache-collect = "predictive_cache.collection.cli:main"
 pcache-prep = "predictive_cache.prep.cli:main"
+pcache-dispatcher = "predictive_cache.dispatcher.cli:main"
 pcache-model = "predictive_cache.ml.cli:main"
 pcache-train = "predictive_cache.ml.train_cli:main"
+pcache-warmer = "predictive_cache.warmer.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.11,<1",
+    "pynfs @ git+https://github.com/truenas/pynfs.git@87b2d81d0b38ec7a9d73b7d38bf9559b73b853d9",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/predictive_cache"]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.pytest.ini_options]
-testpaths = ["tests/datagen", "tests/ml"]
+testpaths = [
+    "tests/collection",
+    "tests/datagen",
+    "tests/dispatcher",
+    "tests/ml",
+    "tests/sources",
+    "tests/warmer",
+]
 
 [tool.ruff]
 target-version = "py312"
