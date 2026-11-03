@@ -119,8 +119,7 @@ def main(
         summary = train(snapshots_dir, cfg, out_dir, tracker)
     except (ValueError, OSError, KeyError, RuntimeError) as exc:
         _fail(tracker, str(exc))
-    tracker.close()
-
+    # Print before closing: a closed ClearML task stops forwarding captured stdout.
     click.echo(
         f"Trained {len(summary['models'])} models from "
         f"{summary['data']['snapshots_dataset_id']} ({summary['data']['data_kind']}) "
@@ -131,3 +130,4 @@ def main(
             f"  {model:20s} {summary['primary']}={entry[summary['primary']]} "
             f"min_score={entry['min_score']} package={entry['package_id']}"
         )
+    tracker.close()
