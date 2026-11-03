@@ -9,8 +9,9 @@ import numpy as np
 
 from .catalog import catalog_rows
 from .config import Config
+from .patterns import NewFile, Noise, Popularity, ProjectLifecycle
 from .schema import Manifest
-from .stubs import NoFaults, StubPatternGenerator, StubRealizer
+from .stubs import NoFaults, StubRealizer
 from .world import build_world
 
 # Stable numeric keys, independent of which components are enabled.
@@ -41,12 +42,23 @@ def run(cfg: Config, out_dir: Path, overwrite: bool = False) -> Manifest:
     from .io import write_dataset
 
     world = build_world(cfg, component_rng(cfg.seed, "world"))
+    window = (min(v.period_start for v in world.volumes), max(v.period_end for v in world.volumes))
+    patterns, base = [], []
+    # P7 establishes metadata before other patterns rank/select the population.
+    for generator, component in (
+        (NewFile(), "new_file"),
+        (ProjectLifecycle(), "lifecycle"),
+        (Popularity(), "popularity"),
+    ):
+        patterns.extend(generator.plan(world, cfg, component_rng(cfg.seed, component)))
+        base.extend(generator.intents(world, window, component_rng(cfg.seed, component)))
+    base.sort(key=lambda i: (i.at, i.intent_id))
+    standalone = not cfg.patterns.popularity.enabled and not cfg.patterns.new_file.enabled
+    noise = Noise(None if standalone else base)
+    patterns.extend(noise.plan(world, cfg, component_rng(cfg.seed, "noise")))
+    intents = noise.intents(world, window, component_rng(cfg.seed, "noise"))
     tables = catalog_rows(world)
     tables.update(events=[], event_truth=[], dropped_events=[], loss_counters=[])
-    window = (min(v.period_start for v in world.volumes), max(v.period_end for v in world.volumes))
-    pattern = StubPatternGenerator()
-    patterns = pattern.plan(world, cfg.patterns, component_rng(cfg.seed, "fixture_intents"))
-    intents = pattern.intents(world, window, component_rng(cfg.seed, "fixture_intents"))
     events = StubRealizer(cfg).realize(world, intents, window, component_rng(cfg.seed, "realizer"))
     records = NoFaults().apply(events, world, component_rng(cfg.seed, "faults"))
     counts = Counter()

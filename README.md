@@ -1,7 +1,8 @@
 # Predictive cache warming
 
 > **Status: design proposal, not an implemented service.** This repository
-> includes the synthetic datagen world builder with event fixture stubs, not the
+> includes synthetic world catalogs and P1/P4/P7/P8 access patterns with fixture
+> event realization, not the
 > Controller, Warmer, complete workload generator, or benchmark described below.
 > Feasibility and data gates must be resolved before performance claims.
 
@@ -28,16 +29,18 @@ of Parquet. `--config scenario.yaml` selects a YAML config instead of `--preset`
 `--seed` and `--format` override it. `--overwrite` replaces only an intact,
 verified generator-owned dataset without unrelated files.
 
-Issues #13–#14 provide schemas, config, writers, manifests, interfaces and
-seeded world catalogs: volumes, project lifecycles, directories, file sizes,
-actors and team assignments. Event generation remains a small fixture per eligible
-volume. Workload patterns, fault injection and event-scale targets remain
-#15–#19. `validate`
-checks schemas and artifact integrity; it does not claim pattern recovery or
-model quality. [Foundation handoff](docs/datagen/issue-13-handoff.md) records
-acceptance evidence and implementation boundaries. The
-[world-builder handoff](docs/datagen/issue-14-handoff.md) records issue #14
-validation and PR review notes.
+Issues #13–#15 provide schemas, catalogs, popularity, project lifecycle,
+new-file demand and uniform noise. The same command now emits synthetic
+patterned opens, new-file create/write records and private pattern truth.
+Reads still use the foundation one-byte fixture and each open gets a separate
+session; full ranges/sessions arrive in #17. Additional workflows are #16,
+faults #18, and recovery reports/preset scale targets #19. Output is buffered
+in memory and preset event counts are not guaranteed yet.
+
+The validate command checks schemas and artifact integrity. Controlled tests
+verify planted #15 patterns; they do not establish real-workload model quality.
+See [the spec](docs/datagen/spec.md#19-patterns-i-implementation-choices-issue-15)
+for the noise mixture, new-file controls and internal interface refinements.
 
 ## What we are trying to prove
 

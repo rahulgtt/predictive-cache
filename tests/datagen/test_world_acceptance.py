@@ -194,7 +194,7 @@ def test_seed_determinism_and_sparse_pipeline(tmp_path):
     assert len(cohorts) == 1
     assert any(a.cohort_id is None for a in world.actors)
     run(cfg, tmp_path / "sparse")
-    assert validate_dataset(tmp_path / "sparse")["events"] == 3
+    assert validate_dataset(tmp_path / "sparse")["data_kind"] == "synthetic"
 
 
 def test_future_project_membership_preserves_deferred_working_set_interface():
