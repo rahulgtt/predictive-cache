@@ -162,9 +162,15 @@ queues the task. A worker reuses that scenario, generates into a fresh temporary
 directory, validates the complete output, and uploads a synchronous
 `synthetic-dataset-test-only` task artifact. That archive includes `truth/`:
 it is for compatibility tests only and must never be passed to feature or
-training code. It is not the finalized, truth-separated ClearML Dataset
-convention in §3. The future pipeline must resolve that packaging contract
-before using a datagen output as its input.
+training code. The worker also publishes a finalized ClearML Dataset in
+`predictive-cache/datasets/synthetic`, named by the generator `dataset_id`.
+It contains only `events/`, `catalog/`, `loss/`, `config.resolved.yaml`, and
+the original `manifest.json`; it excludes `truth/` and truth-derived reports.
+The task's `outputs.synthetic_dataset_id` is the immutable ID to pass to the
+cleaning job. Repeated runs with the same scenario can create another Dataset
+version with the same name; use the exact ID, not the name, for lineage.
+The original manifest still lists the test-only files; downstream cleaning
+verifies hashes for the data files it consumes and never opens `truth/`.
 
 Use `--config scenario.yaml` instead of `--preset tiny` for a custom scenario;
 `--seed` and `--format` are optional overrides. The YAML is needed on the

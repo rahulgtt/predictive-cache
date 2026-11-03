@@ -95,7 +95,13 @@ def main(argv: list[str] | None = None) -> None:
             task.get_logger().report_scalar(
                 title="datagen", series="delivered_events", value=result["events"], iteration=0
             )
-            print(f"ClearML task {task.id} uploaded the complete test-only dataset")
+            from predictive_cache.clearml.datasets import publish_data_only
+
+            dataset_id = publish_data_only(out, manifest, task.get_output_destination())
+            task.connect({"synthetic_dataset_id": dataset_id}, name="outputs")
+            print(
+                f"ClearML task {task.id} uploaded test-only artifact and data-only Dataset {dataset_id}"
+            )
 
 
 if __name__ == "__main__":
