@@ -166,9 +166,11 @@ training code. The worker also publishes a finalized ClearML Dataset in
 `predictive-cache/datasets/synthetic`, named by the generator `dataset_id`.
 It contains only `events/`, `catalog/`, `loss/`, `config.resolved.yaml`, and
 a projected `manifest.json`; it excludes `truth/`, truth-derived reports,
-truth-only counts and known-gap annotations. The full generator manifest stays
-in the test-only ZIP. The clean stage derives observation coverage from the
-published loss counters.
+truth-only counts and planted-pattern details. It retains `known_gaps` as
+coverage metadata required by the data-prep contract: cleanup marks those
+hours incomplete, and later label builders must not treat missing reads there
+as negatives. `known_gaps` is not a model feature. The full generator manifest
+stays in the test-only ZIP.
 The task's `outputs.synthetic_dataset_id` is the immutable ID to pass to the
 cleaning job. Repeated runs with the same scenario can create another Dataset
 version with the same name; use the exact ID, not the name, for lineage.
