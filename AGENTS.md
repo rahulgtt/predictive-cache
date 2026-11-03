@@ -141,7 +141,7 @@ The board's `Status` field values are `Backlog`, `Ready`, `In progress`,
 
 | Event | Agent action | Status |
 | --- | --- | --- |
-| Work identified in chat | Create the issue with labels. Link it to the epic/story. Add it to the project. | `Backlog` (todo) |
+| Work identified in chat | Create the issue with a `[<type>/<area>]` title prefix and matching labels. Link it to the epic/story. Add it to the project. | `Backlog` (todo) |
 | Scoped, accepted and ready to pick up | Fill in acceptance criteria. Set `Priority`/`Size` if known. | `Ready` |
 | Work starts | Assign the dev, create the branch, comment the plan if useful. | `In progress` |
 | PR opened | Open the PR from the template, link the issue, add the PR to the project. | `In review` |
@@ -175,7 +175,7 @@ Every issue gets **exactly one `type/*` label** and **at least one
 
 | Type label | Use for |
 | --- | --- |
-| `type/epic` | The single top-level "Predictive Cache" epic (see below). |
+| `type/epic` | The single top-level `[epic] Predictive Cache` issue (see below). |
 | `type/story` | A user-facing or deliverable slice of work under the epic. |
 | `type/feature` | An improvement or new feature. |
 | `type/bug` | Something is broken or behaves incorrectly. |
@@ -194,9 +194,31 @@ Every issue gets **exactly one `type/*` label** and **at least one
 
 If a label is missing, create it with `gh label create` using these exact names.
 
+### Issue titles
+
+Prefix every issue title with its type and primary area, using the label
+suffixes, so items are easy to scan on the project board:
+
+```text
+[<type>/<area>] <short imperative description>
+```
+
+Examples:
+
+- `[bug/ml] Fix label leakage across validation boundary`
+- `[story/warmer] Execute bounded NFS warm plans`
+- `[chore/docs] Add AGENTS.md and templates`
+
+- The title prefix and labels must agree. Use the **primary** area in the
+  title; add any extra areas as labels only.
+- The epic is the one exception: it is titled `[epic] Predictive Cache`.
+- PR titles use the same prefix as the issue they close.
+- When an issue's type or primary area changes, update both its labels and
+  its title.
+
 ### Epic and issue hierarchy
 
-- There is **one epic**: the issue titled **"Predictive Cache"**
+- There is **one epic**: the issue titled **`[epic] Predictive Cache`**
   (`type/epic`). Don't create additional epics without team agreement.
 - The epic's body keeps a task list linking **every story**, whatever its
   area (ML, CUFS, o11y/metrics, performance, ...). Add a link there whenever
@@ -233,7 +255,8 @@ the issue first.
   | **Risks & rollback** | What could break (especially foreground impact) and how to revert. |
   | **Notes for reviewers** | Anything to focus on, open questions, follow-ups. |
 
-- Keep PRs focused on one issue. Add the PR to the project board.
+- Keep PRs focused on one issue. Title the PR with the same `[<type>/<area>]`
+  prefix as its issue. Add the PR to the project board.
 
 ## Related Strider repositories
 

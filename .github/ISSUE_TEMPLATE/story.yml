@@ -1,6 +1,6 @@
 name: Story
 description: A deliverable slice of work under the Predictive Cache epic.
-title: "[Story]: "
+title: "[story/<area>] "
 labels: ["type/story"]
 projects: ["rahulgtt/3"]
 body:
@@ -35,4 +35,4 @@ body:
       description: Contracts, owners, gates, or links to docs/.
   - type: markdown
     attributes:
-      value: "Add at least one `area/*` label after creating the issue."
+      value: "Replace `<area>` in the title with the primary area (ml, controller, warmer, protocol-cufs, telemetry-data, performance, infra, docs) and add the matching `area/*` label(s)."

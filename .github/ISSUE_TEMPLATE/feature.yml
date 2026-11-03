@@ -1,6 +1,6 @@
 name: Improvement / Feature
 description: An improvement or new feature.
-title: "[Feature]: "
+title: "[feature/<area>] "
 labels: ["type/feature"]
 projects: ["rahulgtt/3"]
 body:
@@ -31,4 +31,4 @@ body:
         - [ ]
   - type: markdown
     attributes:
-      value: "Add at least one `area/*` label after creating the issue."
+      value: "Replace `<area>` in the title with the primary area (ml, controller, warmer, protocol-cufs, telemetry-data, performance, infra, docs) and add the matching `area/*` label(s)."

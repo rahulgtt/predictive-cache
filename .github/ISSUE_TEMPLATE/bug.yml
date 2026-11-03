@@ -1,6 +1,6 @@
 name: Bug
 description: Something is broken or behaves incorrectly.
-title: "[Bug]: "
+title: "[bug/<area>] "
 labels: ["type/bug"]
 projects: ["rahulgtt/3"]
 body:
@@ -35,4 +35,4 @@ body:
       description: Note any foreground-read, data-quality or cache-pollution impact.
   - type: markdown
     attributes:
-      value: "Add at least one `area/*` label after creating the issue."
+      value: "Replace `<area>` in the title with the primary area (ml, controller, warmer, protocol-cufs, telemetry-data, performance, infra, docs) and add the matching `area/*` label(s)."
