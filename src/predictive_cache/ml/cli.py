@@ -54,3 +54,21 @@ def dummy(out, value):
     """Write a constant-score package for Controller/eval plumbing (not a model)."""
     zip_path = make_dummy_package(out, value=value)
     click.echo(str(zip_path))
+
+
+@main.command("fake-snapshots")
+@click.option("--out", required=True, type=click.Path(file_okay=False, path_type=Path))
+@click.option("--seed", default=7, show_default=True, type=int)
+@click.option("--days", default=10, show_default=True, type=click.IntRange(min=3))
+def fake_snapshots(out, seed, days):
+    """Write a schema-valid fake snapshot dir with a planted signal (data_kind: fixture)."""
+    from .fixtures import make_fake_snapshots
+
+    train_days, val_days = max(1, days * 6 // 10), max(1, days * 2 // 10)
+    try:
+        path = make_fake_snapshots(
+            out, seed=seed, days=days, split_days=(train_days, train_days + val_days)
+        )
+    except FileExistsError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(str(path))

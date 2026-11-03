@@ -11,11 +11,13 @@ dependencies = ["numpy>=2,<3", "pyarrow>=19,<24", "pydantic>=2.10,<3", "pyyaml>=
 
 [project.optional-dependencies]
 clearml = ["clearml>=2.1,<2.2"]
+ml = ["scikit-learn>=1.5,<2"]
 
 [project.scripts]
 pcache-clearml-datagen = "predictive_cache.clearml.datagen:main"
 pcache-datagen = "predictive_cache.datagen.cli:main"
 pcache-model = "predictive_cache.ml.cli:main"
+pcache-train = "predictive_cache.ml.train_cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
