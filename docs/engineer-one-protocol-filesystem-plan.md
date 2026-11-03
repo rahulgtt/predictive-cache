@@ -1,9 +1,20 @@
 # Engineer 1 implementation plan: CUFS access data and cache warming
 
-**Status:** Proposed; feasibility gates and deployed versions are unverified.  
+**Status:** In progress. Historical NFSv4.1 mount and export checks succeeded;
+deployed source provenance, event capture, Warmer interoperability, cache
+residency and performance benefit remain unverified. See §16 for the latest
+reported evidence and next gates.
+
 **Owner:** Engineer 1 — protocol/filesystem.  
 **Collaborators:** Engineer 2 (ML), Engineer 3 (data/telemetry), Engineer 4 (performance).  
-**Target:** CUFS-backed Chimera on the Kind cluster `nasuni-cluster` on `nas-vm`. Use its explicitly resolved kubeconfig, not the host's default context. For this project, do not access `strider-dev` or `strider-dev2`; run builds and tests on `nas-vm` in the respective Chimera or CUFS build container image.  
+**Historical target:** Disposable CUFS-backed Kind cluster `nasuni-cluster2`
+on `nas-vm`, with volume `nasuni-cluster2-vol1`. The original
+`nasuni-cluster` is a protected comparison cluster. This is a timestamped
+observation, not a current health or authorization check; resolve the
+intended cluster and its kubeconfig before further work. Follow the
+repository's current build-host and container guidance for future builds and
+tests.
+
 **Outcome:** Deliver a verified deployed read-path map and trustworthy event-field contract; prove or disprove that a bounded NFS read materializes cold CUFS data for later foreground reads. Implement a minimal event source and warming adapter only after their prerequisites are verified.
 
 ## 1. Scope and success criteria
@@ -14,7 +25,7 @@
 2. Inventory existing events, tracing, audit logs, fault and residency signals; establish which training fields are available, where, and with what semantics.
 3. Agree on a versioned access-event and origin contract with the ML and telemetry engineers. Identify the minimum safe CUFS hook only if existing telemetry is inadequate.
 4. With the performance engineer, establish an approved cold-data fixture and a non-warming observation method. Compare a cold control with bounded NFS warming followed by a foreground read.
-5. If required and approved, implement disabled-by-default, bounded, best-effort access-event capture and a separately constrained read-only NFS warming adapter. Coordinate transport and Controller ownership with the team.
+5. If required and approved, implement disabled-by-default, bounded, best-effort Chimera access-event capture and a separately constrained read-only NFS warming adapter. Use separate CUFS evidence to evaluate cache materialization; coordinate transport and Controller ownership with the team.
 6. Hand off reproducible evidence, source references, known gaps, and integration contracts.
 
 ### Out of scope
@@ -50,15 +61,15 @@ NFS READ -> Chimera NFS read handler -> chimera_vfs_read[_owned]
 
 | ID | Task | Deliverable | Dependency / exit check |
 |---|---|---|---|
-| P0 | Locate target via `cluster-manager` using its actual backend; read-only inventory of node, volume, image digest, services and relevant metrics. Ask cluster owner before any modifying experiment. | Environment manifest, permissions and image/source mapping. | Use `nasuni-cluster` on `nas-vm`; recheck live state before experiments. |
+| P0 | Locate target via `cluster-manager` using its actual backend; read-only inventory of node, volume, image digest, services and relevant metrics. Ask cluster owner before any modifying experiment. | Environment manifest, permissions and image/source mapping. | Historical target was `nasuni-cluster2` on `nas-vm`; recheck live state and authorization before experiments. |
 | P1 | Trace actual NFS read end to end; map SMB equivalent where relevant. Include offset, length, credentials, mount/volume, inode, actual bytes, error and EOF. | Annotated request/response diagram with code revision and precise call sites. | P0 for deployed equivalence; code-only map can start immediately. |
 | P2 | Trace `readData` stub response, chunk ranges, `faultChunks` success/failure/retry, and where the restored data lives and can later be evicted. | State-transition diagram and fault evidence table. | P1; distinguish source observations from runtime assumptions. |
 | P3 | Inventory existing audit/OTel/log events and data quality; compare each proposed field to actual producer, coverage and loss visibility. | Field matrix with available / unavailable / unknown and owner. | P1–P2; hand off to ML + telemetry. |
 | P4 | Define controlled test fixture, approved reset/seed, cache-observation method and read client. | Written experiment protocol and safe cleanup procedure. | P0, P2; cluster owner + performance engineer approve. |
 | P5 | Execute cold-control vs warm-then-foreground pilot, using equivalent independent fixtures or verified reset. | Raw run records, fault/residency evidence, latency and checksums; pass/fail/inconclusive. | P4; no destructive or shared-state changes without approval. |
 | P6 | Publish event/origin contract: identity, request granularity, result and fault semantics, ordering, privacy, drop accounting. | Versioned contract and fixtures agreed with Engineers 2 and 3. | P3; unknown fields remain explicitly unknown. |
-| P7 | If P3 proves a gap, design and implement a feature-flagged CUFS hook with bounded asynchronous export. | Targeted CUFS change, tests and documented loss/ordering behavior. | P6; separate coding worktree/session; approved destination and origin design. |
-| P8 | If P5 passes, help implement a bounded, read-only NFS adapter in the standalone predictive-cache repository. | Adapter contract/implementation, results and safety controls. | P5, path/authorization validation, controller contract. |
+| P7 | If P3 proves a gap, complete the feature-flagged Chimera-only demand-event producer with bounded asynchronous export. | Targeted Chimera change, tests and documented loss/ordering behavior. | P6; compatible deployment bundle, approved destination and origin design. Separate CUFS evidence remains necessary for P5. |
+| P8 | Develop a bounded, read-only NFS adapter in the standalone predictive-cache repository; do not claim warming benefit without P5. | Adapter contract/implementation, results and safety controls. | Path/authorization validation and controller contract; live benefit requires P5. |
 | P9 | Integrate with telemetry, ML and performance owners; verify origin filtering and fault/error isolation. | Joint acceptance record and reproducible handoff. | P6–P8 as applicable. |
 
 ## 4. Event source: design before implementation
@@ -70,13 +81,21 @@ NFS READ -> Chimera NFS read handler -> chimera_vfs_read[_owned]
 | Volume identity | Mount ID in `cufs_op_read`; volume GUID in volume context | Mapping, lifetime, privacy and cross-mount stability require verification. |
 | File identity | `handle->vfs_private` / inode | Generation, reuse and rename semantics are **not verified**. Do not promise `inode + generation` exists. |
 | Requested offset/length | `request->read.offset` / `length` | Available at VFS adapter in inspected source. |
-| Actual returned bytes and success | `cufs_ll_read` result / `bytes_read`; `File::read` returns success at EOF and normal completion | Define one event per client-visible request, including short reads; avoid double counting internal windows and retries. |
+| Actual returned bytes and success | `cufs_ll_read` result / `bytes_read`; `File::read` returns success at EOF and normal completion | Define one event per observed protocol READ, including short reads; avoid double counting internal windows and retries. A server decision does not prove client receipt. |
 | Stubbed ranges and fault outcome | `result->hasStubbedChunks()`, `faultChunks` result in `File::read` | Range-level facts are internal to per-window retry; define how to aggregate and represent unknown/mixed state. |
 | Origin | Protocol/credential/explicit request metadata, if propagated | Unverified. Unknown origin must not become foreground demand. A username or time-window suppression alone is not proof. |
 | Path | Not established at `File::read` | Do not derive from inode or persist raw paths without a validated, authorized mapping. ML uses opaque identity; warmer needs an independently validated current target. |
 | Event time, session/cohort | Clock and request context, if available | Verify timestamp semantics and approved identity/sessionization; do not invent values. |
 
-**Hook recommendation, conditional:** use `cufs_op_read`/`cufs_ll_read` completion for a single client-visible result and capture range/fault observations at `File::read` only if a narrow, properly typed per-request summary can propagate safely across that boundary. Compare this with an existing producer first. Hooking solely after each `readData` can overcount multiple windows/retries and cannot by itself prove a client-visible success; `File::read` alone does not establish protocol origin or current path. A single hook may not carry all required facts.
+**MVP event-source decision:** use Chimera as the sole continuously ingested
+per-read demand-event source; do not add a second CUFS demand stream. The
+Chimera-only producer is still being developed and does not establish trusted
+origin or stable file identity. CUFS observations remain necessary to test
+faulting and residency, but are separate from demand ingestion. The earlier
+candidate of correlating CUFS adapter completion with `File::read` fault
+metadata is historical investigation, not the selected demand-source design.
+Hooking solely after each `readData` can overcount internal windows and
+retries; neither that hook nor a protocol decision alone proves client receipt.
 
 ### Event semantics to agree before coding
 
@@ -111,15 +130,15 @@ Capture defaults off. No synchronous network or storage calls on the foreground 
 
 - Complete P0–P4 and publish the field matrix, sequence/state diagrams and approved fixture protocol.
 - Ask Engineer 2 to freeze prediction unit and label horizon; ask Engineer 3 to identify existing collectors and delivery guarantees; ask Engineer 4 to specify measurement units and client-cache controls.
-- Gate: no code-change decision until actual event gaps and warm mechanism are known. Fixtures may unblock other lanes but are not model-quality or performance evidence.
+- Gate: do not claim a live event source or warming mechanism until their respective evidence gaps are resolved. Offline implementation and fixtures can unblock other lanes but are not model-quality or performance evidence.
 
-### Phase B — CUFS telemetry, conditional
+### Phase B — Chimera demand events and separate CUFS evidence
 
 - If existing structured events satisfy the contract, reuse them and do not add a hook.
-- Otherwise create a small disabled-by-default CUFS feature in an isolated CUFS coding session. Define which request layer owns the event, how per-window fault state is aggregated, and how mount/volume/origin are passed without ABI or lifetime hazards.
+- Otherwise complete a small disabled-by-default Chimera producer. Define its request and outcome semantics and keep CUFS fault/residency evidence separate from the demand stream.
 - Use existing configuration, lifecycle and telemetry conventions after verifying current code. Add a bounded producer and separately owned exporter; never add a network dependency to read success.
 - Define overflow, coalescing, shutdown, retries and metrics. Keep origin unknown when source metadata is missing.
-- Gate: targeted unit/integration tests cover §§7–8; team validates event samples and loss reconciliation against known reads.
+- Gate: targeted tests cover §7; team validates event samples and loss reconciliation against known reads. Establish a compatible deployable bundle before any live verification.
 
 ### Phase C — Warmer adapter, conditional
 
@@ -144,7 +163,12 @@ Capture defaults off. No synchronous network or storage calls on the foreground 
 | Live mechanism pilot | approved matched cold fixtures, bounded warm and later independent foreground read | Confirms or rejects mechanism for this deployment. Not real-world predictor quality. |
 | Performance | randomized or balanced matched trials with unrelated foreground load and pollution checks | Engineer 4 measures effect and uncertainty; thresholds/counts require agreement before final analysis. |
 
-Use `nas-vm` for builds and tests, in the respective CUFS or Chimera build container images; initialize submodules before testing. Do not access `strider-dev` or `strider-dev2` for this project. Discover exact targeted commands from current manifests/CI; do not assume local checkout commands or run builds/tests in the user's primary checkouts. Provision Strider clusters with Kind only unless explicitly requested otherwise.
+For future builds and tests, use the hosts and designated build containers in
+the current repository guidance and initialize submodules first. Discover
+targeted commands from current manifests/CI; do not run builds or tests in the
+user's primary checkouts. Provision Strider clusters with Kind only unless
+explicitly requested otherwise. Historical results below identify their
+actual execution environment.
 
 ## 8. Suggested execution schedule — all engineers start together
 
@@ -179,13 +203,17 @@ Deliver in an approved shared location:
 2. NFS and SMB read/fault sequence diagrams and a per-field source/availability table.
 3. Versioned event contract, sample fixture events, unknown fields, privacy rules, origin proof and loss/ordering semantics.
 4. Approved cold-fixture/reset/probe runbook and independent control/treatment records: requested/actual ranges, checksums, timestamps, fault/residency evidence, errors, client-cache controls and raw measurements.
-5. Conditional CUFS hook and Warmer adapter change maps, targeted test cases, remote verification evidence and rollout/rollback controls.
+5. Chimera event producer and Warmer adapter change maps, separate CUFS evidence, targeted test cases, remote verification evidence and rollout/rollback controls.
 6. Explicit mechanism verdict: pass, fail or inconclusive; blockers and named owner for every unresolved gate.
 7. Handoff to ML (event semantics/quality), telemetry (producer, counters, run correlation), and performance (fixture/probe and raw evidence).
 
 **No optimization claim is authorized by this plan:** only controlled, independently reproducible, representative performance results can support one.
 
 ## 11. P0 inventory: nasuni-cluster on nas-vm
+
+This section and §§12–14 contain historical observations. Later findings and
+the current target in §16 supersede any conflicting status, authorization or
+next-step statements; do not infer current cluster health from them.
 
 **Observed 2026-11-03; inventory only.** `cluster-manager list --backend kind` and `resolve` identified `nasuni-cluster` on `nas-vm`. Its target-specific kubeconfig showed three Ready Kind nodes, Kubernetes v1.35.1, and three Ready `nasuni/chimera-cufs` pods. `kind get clusters` under the login user's default provider did not list it; use `cluster-manager` to locate the target.
 
@@ -311,3 +339,157 @@ An application-level `read()` is not necessarily one server-side READ: client ca
 4. **Warmer result → evaluation:** report requested/actual bytes, status, timing and errors; later verified foreground events establish usefulness. A successful warm read does not prove sustained residency or a later hit.
 
 The range bucket, forecast horizon, score interpretation, stable identity, path resolution, origin attribution and acceptable capture-loss limits require owner decisions or evidence. Current READ-correlation events are not yet a trustworthy training dataset.
+
+## 16. Historical-cluster evidence and current next steps
+
+The following is a handoff from the canvas dated 2026-11-03, not a fresh
+cluster inventory. It supersedes earlier statements that `nasuni-cluster2`
+was only proposed and that no Warmer implementation existed.
+
+### Observed cluster and export results
+
+- The October 20 cluster-manager provisioned `nasuni-cluster2` on `nas-vm` as
+  a three-node Kind cluster. The reported inventory showed three Ready nodes,
+  Chimera 3/3 Ready, an initialized CUFS backend and plain TCP. Appliance
+  registration completed, the appliance was 2/2 Ready, and Volume
+  `nasuni-cluster2-vol1` was Ready, Active and Healthy. Its volume namespace
+  had nine ready member pods and nine Bound PVCs. Recheck all state before use.
+- The handoff reports that a cloud credential was exposed in chat and should
+  be rotated. Rotation has not been confirmed. Do not copy credential values
+  into this repository.
+- The selected `strider-deploy` revision was
+  `9eca2d7039151df271f2853e75e6b28340bbe7a2`, cluster-manager revision was
+  `217bd9118c082497c0311637e50ea08b6098dd34`, manifest was Strider 1.4.0,
+  and Chimera chart was 1.1.18. The reported server image
+  `chimera-cufs:0.1.0-26` had digest
+  `sha256:2ac4b9977f5e9f0810707dfd9fa9c5e980dc40729b05cfb97ae1008e64bbb27d`;
+  the CUFS init image `cufs-base:0.2.0-48` had digest
+  `sha256:2fa381a6d783d0e738bab943ab23621188979780cca4e817d4243f645918ff7c`.
+  **These deployment revisions and image digests do not establish the
+  Chimera or CUFS source commits that built them.**
+- A temporary root export `demo` was mounted with NFSv4.1 over TCP. A
+  65,536-byte file was written, fsynced and read in a fresh process with
+  matching SHA-256; the file, mount and export were removed. This establishes
+  the reported bounded mount/write/read/delete flow, not remote-object-store
+  service, crash durability or CUFS cache residency. Client caching could
+  have served the read.
+- A temporary bootstrap export was then used to create `/test`. The reported
+  `test-ro` and `test-rw` aliases map to that backing directory and were
+  Ready and Applied on all three nodes. `test-ro` mounted and rejected a
+  create with `EROFS`; `test-rw` mounted and, after NFSv4 grace expired,
+  wrote, fsynced and read back 4,096 bytes with matching SHA-256. The
+  validation file and temporary mounts were removed; the two aliases remained.
+  The reported client source for read-only access was `10.89.0.202:/test-ro`.
+  Export aliases are client-visible names; `/test` is the backing path.
+- Export configuration included `sec=sys` and `root_squash`, with a narrow
+  `allowedHosts` value. Earlier investigation found that host/security
+  configuration fields were not proven enforced by the deployed agent.
+  Do not treat them as a verified network or authentication boundary.
+  Disassembly of the original cluster's REST/NFS libraries also indicated a
+  transient writable, no-root-squash window during export creation or
+  recreation. Its applicability to the historical cluster's agent is not
+  established; verify or use an approved mitigation before relying on
+  read-only export creation.
+- The intended `strider-tests` NFS mount selector was **not run**: the
+  available environments lacked dependencies, the documented install
+  path was not accepted as secure, and a read-only bind was denied by
+  SELinux. The user chose the separate `demo` integrity check instead.
+  That check is not a pytest result.
+
+The original cluster's earlier missing volume-root alias is consistent with
+the failed mount there; the reported log was not request-correlated, so it
+does not prove the exact cause of that attempt. A Ready volume or internal
+CUFS mount does not by itself publish a client-facing NFS alias.
+
+### Event source, correlation and provenance
+
+- The MVP decision is a **Chimera-only per-read demand source**, with separate
+  CUFS evidence for materialization. A bounded, best-effort NFSv4 READ
+  decision/completion event is planned; proposed fields include event time,
+  range, returned bytes, outcome and a request ID where verified. The producer
+  must not claim wire delivery, client receipt, stable file identity or CUFS
+  hit/fault state without separate evidence. Its origin remains `unknown`
+  until supported by a validated attribution mechanism.
+- The earlier multi-layer READ correlation snapshots and their reported
+  local test results in §14 were uncommitted and not deployed. The Chimera
+  owner is reworking that approach into a Chimera-only producer. The newer
+  working snapshot and the historical server/CUFS/adapter bundle have
+  different VFS ABIs; do not mix them. Before live validation, establish a
+  tested experimental historical port and matched bundle, a provenance-backed
+  legacy port, or a fully compatible newer bundle; all require separate
+  deployment review. No custom correlation image was reported published or deployed on
+  `nasuni-cluster2`. An earlier attempted rollout on the original cluster
+  failed: one replacement pod repeatedly exited 139. The reported rollback
+  restored the original server/init image pair and 3/3 readiness. This
+  failure remains relevant to any future deployment and rollback review.
+- The selected candidate for observational Warmer correlation is an
+  NFSv4 COMPOUND tag with READ ordinal, subject to client/server
+  implementation and tests. The tag is client-controlled, not authenticated
+  provenance; missing matches remain unknown. Kerberos/GSS is out of scope.
+  Unknown, warmer and synthetic traffic must not become foreground demand.
+- Queue and local logger drop counters do not prove downstream persistence or
+  complete collection. They reset on process restart; do not subtract across
+  restarts. Stable opaque identity, an authorized path resolver, range
+  semantics, capture coverage and loss accounting remain open decisions.
+
+### Experimental historical port
+
+The later canvas handoff accepts an **experimental**, not release-verified,
+historical baseline: Chimera `00f207bb358c3a6fa2e914e3e42b301e1c726b80`,
+CUFS `963aa684501626ad4d85037f1706f39117019e34`, and build-integration
+reference `d31732a4e2c36de4746d883ed9d7497c4ce50a6f`. Historical
+CUFS, Chimera/in-tree adapter and matched-bundle work is reported underway
+in separate uncommitted worktrees. CUFS/adapter completion correlation is
+diagnostic or cache evidence, **not** a second model-demand stream.
+
+The candidate Chimera core matches several deployed debug-information anchors,
+but its adapter differs and the deployed libevpl pin is unknown. The CUFS
+candidate's header matches the release devel header and predates the RPM
+build, but neither fact proves the runtime library's source or dependencies.
+The build-integration candidate pins a different Chimera revision. The
+reported runtime hashes match across the three historical-cluster pods; the
+effective init-overlay CUFS library differs from the server image's baked-in
+library. Artifact identity is not source provenance.
+
+The implementation must reproduce the historical unversioned 64-byte module
+layout and pointer-form `cufs_ll_read` ABI before accepting feature work.
+Newer iovec-based calls may share a symbol name but not the calling
+convention; matching a symbol or SONAME alone is insufficient. Preserve the
+legacy zero-length getattr bypass and existing read/error behavior. Build the
+server, in-tree adapter and effective CUFS overlay as a matched unit; a rolling
+update is not cluster-wide atomic. Validate the mapped library on every node
+and retain the exact original pair for rollback.
+
+Required checks include bounded event queue, loss and shutdown behavior;
+NFSv4 request reuse, replay and rejected-read cardinality; pointer-form
+CUFS callback and error semantics; adapter positive/zero-length paths; and
+matched module loading and isolated container startup. A later approved
+live READ can verify correlation, but cannot alone prove residency or
+performance benefit. No custom historical image was reported built or
+deployed. The canvas retains the detailed file and test map; source candidates
+and implementation status require revalidation before use.
+
+### Warmer status and next gates
+
+[#41](https://github.com/rahulgtt/predictive-cache/pull/41) merged the manual Warmer guide only. The reported Warmer source, tests,
+entry point and updated guide remain uncommitted in a separate worktree and
+are absent from the tracked base; reported offline tests do not establish
+live NFS interoperability. No bounded live Warmer read or cache-benefit pilot
+was reported. A known fixture and an approved AUTH_SYS numeric identity
+readable through `test-ro` are still needed.
+
+1. Re-resolve the disposable cluster, exports, permissions and current
+   authorization. Preserve the original cluster and existing resources.
+2. With the appropriate approval, create and verify a known fixture through
+   `test-rw`, including size, checksum and identity; measure through `test-ro`.
+3. Finish the Chimera-only event producer and targeted tests. Validate the
+   experimental historical port and paired image bundle, or establish a
+   provenance-backed legacy port or compatible newer bundle. Review the
+   deployment and rollback plan before any cluster change.
+4. Verify a controlled NFSv4 READ event and loss accounting, then run the
+   bounded Warmer against the fixture. Exclude unknown and warmer-origin
+   observations from demand features and labels.
+5. Independently establish equivalent cold state, CUFS fault/residency
+   evidence and a later foreground read. Treat missing evidence or
+   uncontrolled client caching as inconclusive; successful NFS reads alone
+   do not establish warming benefit.
