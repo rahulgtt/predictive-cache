@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 from click.testing import CliRunner
 
 from predictive_cache.datagen.cli import main
@@ -17,16 +18,33 @@ from predictive_cache.datagen.schema import Manifest
 from predictive_cache.datagen.validate import validate_dataset
 
 
+def fixture_config(**kwargs):
+    cfg = load_config(preset="tiny", **kwargs)
+    cfg.period.weeks = 1
+    cfg.projects.initial = 2
+    cfg.projects.new_per_month = 0
+    cfg.files.target_count = 30
+    cfg.actors.users = 3
+    cfg.actors.teams = 1
+    cfg.patterns.new_file.new_files_per_project_week = 1
+    for size in cfg.files.size_distributions:
+        profile = size[1]
+        profile.median_bytes, profile.min_bytes, profile.max_bytes = 4096, 100, 8192
+    return cfg
+
+
 def invoke_generate(out, fmt="parquet", seed=42):
     env = {**os.environ, "PYTHONHASHSEED": str(seed)}
+    config = out.with_suffix(".yaml")
+    config.write_text(yaml.safe_dump(fixture_config(seed=seed).model_dump(mode="json")))
     return subprocess.run(
         [
             sys.executable,
             "-c",
             "from predictive_cache.datagen.cli import main; main()",
             "generate",
-            "--preset",
-            "tiny",
+            "--config",
+            str(config),
             "--format",
             fmt,
             "--seed",
@@ -55,7 +73,7 @@ def test_subprocess_generation_determinism_and_cli(tmp_path, fmt):
         assert CliRunner().invoke(main, ["validate", str(folder)]).exit_code == 0
         description = CliRunner().invoke(main, ["describe", str(folder)])
         assert description.exit_code == 0
-        assert "foundation" in description.output.lower()
+        assert "synthetic" in description.output.lower()
     ma = Manifest.model_validate_json((a / "manifest.json").read_text())
     mb = Manifest.model_validate_json((b / "manifest.json").read_text())
     mc = Manifest.model_validate_json((c / "manifest.json").read_text())
@@ -81,7 +99,7 @@ def test_subprocess_generation_determinism_and_cli(tmp_path, fmt):
 
 def test_overwrite_protects_unrelated_files(tmp_path):
     out = tmp_path / "dataset"
-    cfg = load_config(preset="tiny")
+    cfg = fixture_config()
     run(cfg, out)
     with pytest.raises(ValueError, match="already exists"):
         run(cfg, out)
@@ -106,7 +124,7 @@ def test_output_symlink_rejected(tmp_path):
     link = tmp_path / "link"
     link.symlink_to(target, target_is_directory=True)
     with pytest.raises(ValueError, match="symlink"):
-        run(load_config(preset="tiny"), link, overwrite=True)
+        run(fixture_config(), link, overwrite=True)
 
 
 @pytest.mark.parametrize(
@@ -124,7 +142,7 @@ def test_cli_errors(args):
 
 def test_validate_detects_schema_corruption_after_rehash(tmp_path):
     out = tmp_path / "data"
-    run(load_config(preset="tiny", format="jsonl"), out)
+    run(fixture_config(format="jsonl"), out)
     manifest = json.loads((out / "manifest.json").read_text())
     entry = next(e for e in manifest["files"] if e["path"].startswith("events/"))
     path = out / entry["path"]
@@ -140,7 +158,7 @@ def test_validate_detects_schema_corruption_after_rehash(tmp_path):
 
 def test_manifest_missing_hash_count_corruption(tmp_path):
     out = tmp_path / "data"
-    run(load_config(preset="tiny"), out)
+    run(fixture_config(), out)
     original = (out / "manifest.json").read_text()
     obj = json.loads(original)
     obj["files"][0]["sha256"] = "0" * 64
@@ -161,7 +179,7 @@ def test_manifest_missing_hash_count_corruption(tmp_path):
 
 def test_manifest_cannot_escape_root(tmp_path):
     out = tmp_path / "data"
-    run(load_config(preset="tiny"), out)
+    run(fixture_config(), out)
     obj = json.loads((out / "manifest.json").read_text())
     obj["files"][0]["path"] = "../outside"
     (out / "manifest.json").write_text(json.dumps(obj))
@@ -175,7 +193,7 @@ def test_partition_ids_checked_before_any_write(tmp_path, table_name):
     from predictive_cache.datagen.pipeline import component_rng
     from predictive_cache.datagen.stubs import build_world, catalog_rows
 
-    cfg = load_config(preset="tiny", format="jsonl")
+    cfg = fixture_config(format="jsonl")
     tables = catalog_rows(build_world(cfg, component_rng(cfg.seed, "world")))
     tables.update(events=[], dropped_events=[], event_truth=[], loss_counters=[])
     if table_name == "volumes":
@@ -201,7 +219,7 @@ def test_revision_uses_package_checkout_not_caller(tmp_path, monkeypatch):
     # No foreign commit is needed: the caller has a valid repo but no HEAD.
     monkeypatch.chdir(foreign)
     assert io.source_revision() == expected
-    assert run(load_config(preset="tiny"), tmp_path / "data").generator.git_sha == expected
+    assert run(fixture_config(), tmp_path / "data").generator.git_sha == expected
 
 
 def test_revision_unknown_without_verified_source_checkout(tmp_path, monkeypatch):

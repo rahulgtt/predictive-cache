@@ -621,7 +621,7 @@ class Intent:
     cause: str                             # pattern_id | "background" | "noise"
     workflow_run_id: str | None = None      # private context, never event columns
     job_run_id: str | None = None           # one service session per run
-    operation: Literal["open", "create", "write"] = "open"  # P7 metadata bridge
+    operation: Literal["open", "create", "write", "rename", "delete", "replace"] = "open"
 
 @dataclass(frozen=True)
 class PatternRecord:                       # one line of truth/patterns.jsonl (§5.4)
@@ -957,3 +957,36 @@ fields stay null. Validation remains schema/artifact validation; controlled
 small-preset tests compute #15 recovery from open events and catalog metadata,
 with truth only supplying planted parameters/instance selection. Mixed
 scenarios are not required to retain the isolated Zipf exponent.
+
+
+## 20. Combined workloads, realization and faults (issues #16–18)
+
+The CLI now connects all pattern families, complete operations and faults.
+Wire schemas stay v1; the internal Intent.operation additionally accepts
+rename/delete/replace. Workloads.plan/intents combines P2/P5/P6; WorkflowChain
+expands P1/P2 entries once and returns only continuation/interruption intents.
+P3 inherits lifecycle intensity from its triggers rather than multiplying it
+again. Personal working sets and chronological revisit history are private.
+
+Generation stays buffered for this hackathon implementation. Pattern windows
+filter deterministic plans; admitted bursts/chains and handles finish beyond
+the nominal period. P9 writes update effective size/path histories but do
+not feed back into already planned P1 recency choices. Metadata mutations wait
+for active handles; replacement preserves the path with a new identity.
+Non-stale later opens can resolve that replacement. Pure deleted-file demand
+is skipped except the configured failed stale-open fraction.
+
+Realization supports ranges and summary mode using the same internal read
+plan. Throughput/think-time only schedule synthetic operations; latency and
+cache outcomes remain null. Faults add past-seven-day nightly warmer reads
+and hourly probes before mutation/removal. Origin handles crossing a finalized
+size/deletion boundary are omitted as whole handles. Identity breaks map
+subsequent records after a rename while truth retains real simulated identity.
+
+Fault streams are independent. Loss takes precedence over sampling, duplicates
+only copy delivered events, and truth has one row per unique event ID with
+original values retained. known_gaps includes loss/sampling coverage; counters
+use true UTC hours and satisfy offered = emitted + dropped + sampled_out.
+quality.json contains eligible/affected/expected fault-stage counts. Sampling
+counts removals, and skew outliers use source/client groups as their denominator.
+Full validation/recovery reports and preset scale targets remain #19.

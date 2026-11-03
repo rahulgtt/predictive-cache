@@ -1,10 +1,8 @@
 # Predictive cache warming
 
-> **Status: design proposal, not an implemented service.** This repository
-> includes synthetic world catalogs and P1/P4/P7/P8 access patterns with fixture
-> event realization, not the
-> Controller, Warmer, complete workload generator, or benchmark described below.
-> Feasibility and data gates must be resolved before performance claims.
+> **Status:** synthetic data generation is implemented; the Controller, Warmer
+> service and real-workload performance claims remain separate work.
+> Generated records model fictional activity and never read personal files.
 
 For agent-assisted development, start with [AGENTS.md](AGENTS.md), invoke
 `$pc-milestone`, and follow the [execution and review workflow](docs/ai/workflow.md).
@@ -29,18 +27,20 @@ of Parquet. `--config scenario.yaml` selects a YAML config instead of `--preset`
 `--seed` and `--format` override it. `--overwrite` replaces only an intact,
 verified generator-owned dataset without unrelated files.
 
-Issues #13–#15 provide schemas, catalogs, popularity, project lifecycle,
-new-file demand and uniform noise. The same command now emits synthetic
-patterned opens, new-file create/write records and private pattern truth.
-Reads still use the foundation one-byte fixture and each open gets a separate
-session; full ranges/sessions arrive in #17. Additional workflows are #16,
-faults #18, and recovery reports/preset scale targets #19. Output is buffered
-in memory and preset event counts are not guaranteed yet.
+The generator includes popularity/lifecycle demand, schedules, task chains,
+shared bursts/scans, batch jobs, new files and unrelated noise. It emits
+open/read/close records with ranges and totals, actor sessions, file changes,
+and configurable telemetry faults. Outputs retain the v1 schemas, synthetic
+provenance, separate pattern truth and reconciled loss counters.
 
-The validate command checks schemas and artifact integrity. Controlled tests
-verify planted #15 patterns; they do not establish real-workload model quality.
-See [the spec](docs/datagen/spec.md#19-patterns-i-implementation-choices-issue-15)
-for the noise mixture, new-file controls and internal interface refinements.
+Use YAML with `--config` to adjust existing controls. For smaller ingestion
+fixtures, lower `files.target_count`, `actors.users`, `period.weeks`, and
+`randomness.rate_scale`; `realize.read_events: none` keeps open/close totals
+while omitting per-range rows. No modeled file contents are created.
+`validate` checks schemas and artifact integrity. Fault-stage denominators
+are included in `report/quality.json`; full recovery reports and scale tuning
+remain #19. Generation is buffered in memory, and writes do not feed back
+into previously generated access choices. See [spec §20](docs/datagen/spec.md#20-combined-workloads-realization-and-faults-issues-1618).
 
 ## What we are trying to prove
 
