@@ -246,7 +246,10 @@ def _validate_observed(
             raise ValueError("observed durable_at falls outside the run")
         if row.durable_at < operation.offered_at_utc:
             raise ValueError("observed event predates its offered operation")
-        if row.tag != operation.tag:
+        if manifest.tag_mode == "empty":
+            if operation.tag != "" or row.tag is not None:
+                raise ValueError("observed event correlation tag mismatch")
+        elif row.tag != operation.tag:
             raise ValueError("observed event correlation tag mismatch")
     if set(dispositions) != set(offered):
         raise ValueError("every offered operation requires exactly one disposition")

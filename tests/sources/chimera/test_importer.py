@@ -279,7 +279,7 @@ def _fixture(tmp_path: Path) -> dict[str, Path]:
                 "durable_at": offered_at + timedelta(seconds=2),
                 "status": "durable",
                 "exclusion_reason": None,
-                "tag": _tag(operation_id),
+                "tag": None,
             }
         )
     _jsonl(paths["offered_ledger"], operations)
@@ -401,6 +401,16 @@ def _rows(root: Path, manifest: dict, prefix: str) -> list[dict]:
         if entry["path"].startswith(prefix)
         for line in (root / entry["path"]).read_text().splitlines()
     ]
+
+
+def test_empty_tag_requires_canonical_null_observed_representation(tmp_path):
+    paths = _fixture(tmp_path)
+    rows = [json.loads(line) for line in paths["observed"].read_text().splitlines()]
+    assert all(row["tag"] is None for row in rows)
+    rows[0]["tag"] = ""
+    _jsonl(paths["observed"], rows)
+    with pytest.raises(ValueError, match="observed event correlation tag mismatch"):
+        _import(paths, tmp_path / "out")
 
 
 def test_authoritative_run_is_deterministic_and_cleaner_accepts_it(tmp_path: Path):
@@ -544,6 +554,20 @@ def test_tag_checkpoint_hash_and_permissions_are_enforced(tmp_path: Path):
     _reseal_raw(paths)
     with pytest.raises(ValueError, match="tag digest"):
         _import(paths, tmp_path / "tag")
+
+    paths = _fixture(tmp_path / "observed-tag")
+    observed = [json.loads(line) for line in paths["observed"].read_text().splitlines()]
+    observed[0]["tag"] = "unexpected"
+    _jsonl(paths["observed"], observed)
+    with pytest.raises(ValueError, match="correlation tag"):
+        _import(paths, tmp_path / "observed-tag-out")
+
+    paths = _fixture(tmp_path / "observed-empty-string")
+    observed = [json.loads(line) for line in paths["observed"].read_text().splitlines()]
+    observed[0]["tag"] = ""
+    _jsonl(paths["observed"], observed)
+    with pytest.raises(ValueError, match="correlation tag"):
+        _import(paths, tmp_path / "observed-empty-string-out")
 
     paths = _fixture(tmp_path / "drop")
     checkpoints = [json.loads(line) for line in paths["checkpoints"].read_text().splitlines()]
