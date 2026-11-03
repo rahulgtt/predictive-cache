@@ -1,20 +1,14 @@
 # Predictive Cache
 
-<<<<<<< Updated upstream
-> **Status:** synthetic data generation is implemented; the Controller, Warmer
-> service and real-workload performance claims remain separate work.
-> Generated records model fictional activity and never read personal files.
-=======
 Predict which files a team will read next, then fetch selected data before
 users wait for it to arrive from cloud storage.
->>>>>>> Stashed changes
 
-> **Status: design proposal.** The repository contains plans and specifications,
-> not an implemented Controller, Warmer, data pipeline or benchmark. Diagrams
-> and examples below describe the intended system; they do not establish that
-> the required telemetry or cache controls already work.
+> **Status:** Synthetic data generation is implemented; the Controller, Warmer,
+> live data pipeline and real-workload performance claims remain design work.
+> Generated records model fictional activity and never read personal files.
+> Diagrams and examples below describe the intended system; they do not
+> establish that the required telemetry or cache controls already work.
 
-<<<<<<< Updated upstream
 ## Run the datagen foundation
 
 Python 3.12 and `uv` are required. From the repository root:
@@ -47,13 +41,14 @@ while omitting per-range rows. No modeled file contents are created.
 accounting and fault/truth consistency. `report/quality.json` and
 `report/summary.md` contain descriptive statistics and supported recovery
 diagnostics. [The downstream guide](docs/datagen/downstream-guide.md) explains
-loading, filtering, gaps, history and dataset sharing. Generation is buffered in memory, and writes do not feed back
-into previously generated access choices. See [spec §20](docs/datagen/spec.md#20-combined-workloads-realization-and-faults-issues-1618).
+loading, filtering, gaps, history and dataset sharing. Generation is buffered
+in memory, and writes do not feed back into previously generated access
+choices. See
+[spec §20](docs/datagen/spec.md#20-combined-workloads-realization-and-faults-issues-1618).
 
 ## What we are trying to prove
-=======
-## System diagram
->>>>>>> Stashed changes
+
+### System diagram
 
 There are two paths. The **normal read path** serves users. The **background
 warming path** observes activity and makes extra, bounded reads ahead of demand.
@@ -204,7 +199,6 @@ Warmer to read a different object accidentally.
 
 ### 1. Access event: an observed read
 
-<<<<<<< Updated upstream
 In the earlier source investigation, a representative CUFS code path traced
 `cufs_op_read` through `cufs_ll_read` and `File::read` to `Dkv::readData`,
 with stubbed chunks leading to faulting and a retry. The report cites
@@ -340,14 +334,12 @@ future demand.
 
 #### Illustrative event and label
 
-This example shows a possible shape, **not an existing schema or a statement
-that these fields are currently available**. IDs and paths are placeholders;
-an implementation must apply its approved privacy policy.
-=======
-The field names below follow the [datagen planning schema](docs/datagen/spec.md#51-access-event-events-truthdropped_events).
-This is a **readable subset**, not a complete validated production event.
-Optional context is omitted. Real-source field availability remains open.
->>>>>>> Stashed changes
+The field names below follow the
+[datagen planning schema](docs/datagen/spec.md#51-access-event-events-truthdropped_events).
+This example is a **readable subset**, not a complete validated production
+event or a statement that these fields are available from a real source.
+Optional context is omitted. IDs and paths are placeholders; an implementation
+must apply its approved privacy policy.
 
 ```json
 {
