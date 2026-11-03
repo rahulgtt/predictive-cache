@@ -15,7 +15,7 @@ if __package__ in (None, ""):
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    scenario = parser.add_mutually_exclusive_group(required=True)
+    scenario = parser.add_mutually_exclusive_group()
     scenario.add_argument("--preset", choices=("tiny", "small", "medium"))
     scenario.add_argument("--config", type=Path, help="Scenario YAML on the submitting machine")
     parser.add_argument("--seed", type=int, help="Override the scenario seed")
@@ -28,11 +28,14 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
     from predictive_cache.datagen.config import Config, load_config
 
     task = None
     if args.no_track:
+        if (args.preset is None) == (args.config is None):
+            parser.error("provide exactly one of --preset or --config")
         if args.out is None:
             raise SystemExit("--no-track requires --out so the output remains available")
         cfg = load_config(path=args.config, preset=args.preset, seed=args.seed, format=args.format)
@@ -42,9 +45,12 @@ def main(argv: list[str] | None = None) -> None:
         except ImportError as exc:
             raise SystemExit("Install the ClearML extra: uv sync --extra clearml") from exc
 
+        local = Task.running_locally()
+        if local and (args.preset is None) == (args.config is None):
+            parser.error("provide exactly one of --preset or --config")
         task = Task.init(
             project_name="predictive-cache/datagen",
-            task_name=f"datagen:{args.preset or args.config.stem}",
+            task_name=f"datagen:{args.preset or args.config.stem}" if local else None,
             task_type=Task.TaskTypes.data_processing,
             tags=["#71", "data:synthetic"],
             output_uri=True,
@@ -57,11 +63,12 @@ def main(argv: list[str] | None = None) -> None:
             load_config(
                 path=args.config, preset=args.preset, seed=args.seed, format=args.format
             ).model_dump(mode="json")
-            if Task.running_locally()
+            if local
             else {}
         )
         cfg = Config.model_validate(task.connect_configuration(scenario, name="scenario"))
-        if Task.running_locally():
+        if local:
+            task.set_repo(repo="https://github.com/rahulgtt/predictive-cache.git")
             task.add_tags(f"seed:{cfg.seed}")
         if not args.local:
             task.execute_remotely(queue_name=args.queue, clone=False)
@@ -88,7 +95,13 @@ def main(argv: list[str] | None = None) -> None:
             task.get_logger().report_scalar(
                 title="datagen", series="delivered_events", value=result["events"], iteration=0
             )
-            print(f"ClearML task {task.id} uploaded the complete test-only dataset")
+            from predictive_cache.clearml.datasets import publish_data_only
+
+            dataset_id = publish_data_only(out, manifest, task.get_output_destination())
+            task.connect({"synthetic_dataset_id": dataset_id}, name="outputs")
+            print(
+                f"ClearML task {task.id} uploaded test-only artifact and data-only Dataset {dataset_id}"
+            )
 
 
 if __name__ == "__main__":

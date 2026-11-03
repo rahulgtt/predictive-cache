@@ -148,17 +148,34 @@ credentials configured (§2), run:
 
 ```bash
 uv sync --locked --extra clearml
-uv run --extra clearml python src/predictive_cache/clearml/datagen.py --preset tiny --queue default
+CLEARML_FILES_HOST=http://clearml.team32.internal:8081 \
+  uv run --extra clearml python src/predictive_cache/clearml/datagen.py --preset tiny --queue default
 ```
+
+Use the same file-server hostname as the worker. The submitting machine
+may reach the API by IP, but an IP-based `CLEARML_FILES_HOST` makes the
+worker's artifact upload fail with HTTP 401. Add the hosts-file entry in §2
+to download artifacts from machines without internal DNS.
 
 The submitting process records the resolved scenario in ClearML before it
 queues the task. A worker reuses that scenario, generates into a fresh temporary
 directory, validates the complete output, and uploads a synchronous
 `synthetic-dataset-test-only` task artifact. That archive includes `truth/`:
 it is for compatibility tests only and must never be passed to feature or
-training code. It is not the finalized, truth-separated ClearML Dataset
-convention in §3. The future pipeline must resolve that packaging contract
-before using a datagen output as its input.
+training code. The worker also publishes a finalized ClearML Dataset in
+`predictive-cache/datasets/synthetic`, named by the generator `dataset_id`.
+It contains only `events/`, `catalog/`, `loss/`, `config.resolved.yaml`, and
+a projected `manifest.json`; it excludes `truth/`, truth-derived reports,
+truth-only counts and planted-pattern details. It retains `known_gaps` as
+coverage metadata required by the data-prep contract: cleanup marks those
+hours incomplete, and later label builders must not treat missing reads there
+as negatives. `known_gaps` is not a model feature. The full generator manifest
+stays in the test-only ZIP.
+The task's `outputs.synthetic_dataset_id` is the immutable ID to pass to the
+cleaning job. Repeated runs with the same scenario can create another Dataset
+version with the same name; use the exact ID, not the name, for lineage.
+The projected manifest lists exactly the published files; downstream cleaning
+verifies their hashes and never opens `truth/`.
 
 Use `--config scenario.yaml` instead of `--preset tiny` for a custom scenario;
 `--seed` and `--format` are optional overrides. The YAML is needed on the
