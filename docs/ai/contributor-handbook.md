@@ -133,7 +133,7 @@ The board's `Status` field values are `Backlog`, `Ready`, `In progress`,
 
 | Event | Agent action | Status |
 | --- | --- | --- |
-| Work identified in chat | Create the issue with a `[<type>/<area>]` title prefix and matching labels. Link it to the epic/story. Add it to the project. | `Backlog` (todo) |
+| Work identified in chat | Create the issue with a `[<type>/<area>]` title prefix and matching labels. Link it to the epic/story. Add it to the project and set `Stage`. | `Backlog` (todo) |
 | Scoped, accepted and ready to pick up | Fill in acceptance criteria. Set `Priority`/`Size` if known. | `Ready` |
 | Work starts | Assign the dev, create the branch, comment the plan if useful. | `In progress` |
 | PR opened | Open the PR from the template, link the issue, add the PR to the project. | `In review` |
@@ -141,11 +141,16 @@ The board's `Status` field values are `Backlog`, `Ready`, `In progress`,
 
 Also post an issue comment for notable progress, blockers or decision changes.
 
+The board's `Stage` field groups ML-pipeline work by phase: `Data` (generation,
+cleaning, features, labels, snapshots), `Training`, `Evaluation` and
+`Inference`. Set it on stories and their sub-issues; leave it empty for work
+outside the ML pipeline (e.g. Warmer, cluster setup).
+
 Useful `gh` commands:
 
 ```bash
 gh project item-add 3 --owner rahulgtt --url <issue-or-pr-url>
-gh project field-list 3 --owner rahulgtt --format json   # Status/Priority/Size field + option IDs
+gh project field-list 3 --owner rahulgtt --format json   # Status/Priority/Size/Stage field + option IDs
 gh project item-list 3 --owner rahulgtt --format json    # item IDs
 gh project item-edit --project-id <project-id> --id <item-id> \
   --field-id <status-field-id> --single-select-option-id <option-id>
