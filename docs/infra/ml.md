@@ -148,8 +148,14 @@ credentials configured (§2), run:
 
 ```bash
 uv sync --locked --extra clearml
-uv run --extra clearml python src/predictive_cache/clearml/datagen.py --preset tiny --queue default
+CLEARML_FILES_HOST=http://clearml.team32.internal:8081 \
+  uv run --extra clearml python src/predictive_cache/clearml/datagen.py --preset tiny --queue default
 ```
+
+Use the same file-server hostname as the worker. The submitting machine
+may reach the API by IP, but an IP-based `CLEARML_FILES_HOST` makes the
+worker's artifact upload fail with HTTP 401. Add the hosts-file entry in §2
+to download artifacts from machines without internal DNS.
 
 The submitting process records the resolved scenario in ClearML before it
 queues the task. A worker reuses that scenario, generates into a fresh temporary
