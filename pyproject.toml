@@ -46,6 +46,7 @@ testpaths = [
     "tests/datagen",
     "tests/dispatcher",
     "tests/ml",
+    "tests/prep",
     "tests/sources",
     "tests/warmer",
 ]
