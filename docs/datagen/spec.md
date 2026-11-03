@@ -808,3 +808,55 @@ stubs. #19's rules can be built against fixtures and run end to end last.
   Add a calibration task once any real trace exists.
 - **Planner objective** (opens vs bytes vs wait time saved; see §1.3): no
   generator change expected.
+
+## 17. Foundation contract refinements (issue #13)
+
+The initial implementation uses fixture stubs; §6–9 workload behavior and
+§10.3 scale targets remain work for #14–#19. All workload tuning is accepted
+and validated in config now, but the stubs do not implement those controls.
+Reports and `manifest.limitations` explicitly state this distinction.
+
+### Schemas and serialization
+
+`src/predictive_cache/datagen/schema.py` defines Arrow types and nullability.
+Catalog identifiers/text are strings, counts and sizes are int64, time columns
+are UTC microsecond timestamps, holidays are date32 lists, and weekday/project
+lists are typed lists. Actor cohort/client IDs are nullable to support omitted
+identity signals. Other nullable catalog fields are those identified in §5.2.
+Pattern `params` is a JSON object in `patterns.jsonl`; the internal Arrow schema
+stores its canonical JSON string. No new columns are added to event schema v1.
+The P4 pattern kind is `project_lifecycle` as in §7.
+
+Manifest `files` covers every output artifact except the manifest itself,
+including config and reports. `rows` is null for non-tabular artifacts.
+`generator.runtime` records Python and serialization dependency versions;
+`limitations` records foundation restrictions. The resolved config hash is
+SHA256 of compact, sorted, UTF-8 JSON with nonfinite numbers forbidden, not of
+YAML presentation. Dependency versions are pinned in `uv.lock`.
+
+JSONL timestamps use exactly six fractional digits and Z. Empty tables preserve
+Arrow schemas in Parquet; JSONL empty files are interpreted through their named
+schema. Partition date is UTC ingestion date, not event date. Complete artifact
+validation is required before `--overwrite`; arbitrary/symlinked directories
+and unlisted files are rejected. Full behavioral validation remains #19.
+
+### Internal API and scope
+
+`load_config(path=None, preset=None, seed=None, format=None)` resolves preset
+then nested YAML values then CLI overrides. Unknown keys fail. Custom uses
+small defaults before explicit overrides; the CLI requires exactly one of
+`--preset` or `--config`. All pattern/fault enable switches are part of config.
+The shared `World`, domain records, `Intent`, `PatternRecord`, `FaultRecord`
+and protocols live in `model.py`; fixture implementations live in `stubs.py`,
+so later issues can replace them without making consumers depend on stubs.
+
+`run(cfg, out_dir, overwrite=False)` delegates serialization to
+`write_dataset(cfg, out_dir, tables, patterns, known_gaps, overwrite=False)`.
+The table dictionary includes all catalog tables, events, removed events,
+loss counters and event truth; pattern records are separate. The foundation
+buffers its small fixture; bounded scale streaming and cross-window workload
+state must be integrated with real patterns in subsequent tasks. Fixed numeric
+RNG component keys avoid changing the world when a component is disabled.
+
+This section clarifies draft interfaces and manifest metadata for reviewer
+attention; it does not change the acceptance requirements of #14–#19.
