@@ -226,25 +226,46 @@ row is written per group that has an `open` or at least one `read`:
   `open_missing = true`.
 - **`close_time` / `close_known_at`:** from the `close`. Null with
   `close_missing = true` if there is no close.
-- **`completed_known_at`:** the **latest** `known_at` among all of the
-  group's kept events (open, reads, close). A read delivered after its close
-  is therefore not backdated, and `completed_known_at ≥ open_known_at`
-  always holds.
+- **`completed_known_at`:** when the open's byte facts become visible. It
+  must be computable identically in batch and live (ML spec §8.2), so it
+  is defined by an **incremental handle tracker** that processes the
+  group's kept events in `(known_at, event_id)` order:
+  - *With a close:*
+    `completed_known_at = close_known_at + clean.completion_grace_s`
+    (default 60 s).
+  - *Without a close:* the handle completes when no event of the group
+    arrives for `clean.handle_timeout_s` (default 3600 s). Then
+    `completed_known_at = last event's known_at + handle_timeout_s`.
+  - Reads with `known_at > completed_known_at` are **late after
+    completion**:
+    - they are excluded from the open's byte facts below and counted
+      (`late_reads_after_completion`);
+    - they stay in `open_ranges`, because labels describe demand, not
+      visibility.
+
+  `completed_known_at ≥ open_known_at` always holds. The batch cleaner
+  **must** run the same `HandleTracker` (§10) over events sorted by
+  `(known_at, event_id)`, so batch and live agree by construction.
 - **Byte reconciliation.** Failed and invalid reads were already excluded
-  (§4.3). Cleaning tracks, per `handle_id`, whether the input contained
-  **any** non-duplicate read event (kept or excluded).
-  - *Range mode* (the input had ≥ 1 read event for the handle):
-    - `bytes_read` = sum of kept reads' `bytes_read`, which is 0 if all
-      reads were excluded;
+  (§4.3), and late-after-completion reads don't count. The source's read
+  mode is **declared** in `clean.read_mode` (part of the serving contract,
+  ML spec §5), never inferred per handle. Inferring it would let a late
+  read silently switch a handle to close totals.
+  - *`read_mode: ranges`* (default; datagen `realize.read_events: ranges`):
+    - `bytes_read` = sum of kept reads' `bytes_read` known by
+      `completed_known_at`. It is 0 if there are none and a successful open
+      or close exists, and null if the group has neither;
     - `distinct_bytes_read` = size of the union of their ranges.
-    - If a close exists and its `handle_bytes_read != bytes_read`, set
-      `bytes_inconsistent = true` and keep the read-derived values. The
-      close may include failed or lost reads, and is never used to restore
-      excluded bytes.
-  - *Summary mode* (the input had no read events for the handle, but has a
-    close): `bytes_read` = `handle_bytes_read`, `distinct_bytes_read` is
-    null.
-  - *Neither:* both null.
+    - Close totals are **never** used for byte facts. If a close's
+      `handle_bytes_read != bytes_read`, set `bytes_inconsistent = true`
+      (failed, lost or late reads).
+  - *`read_mode: summary`* (datagen `read_events: none`; the source emits
+    no per-range reads):
+    - `bytes_read` = the close's `handle_bytes_read` (null without a
+      close);
+    - `distinct_bytes_read` is null.
+    - Any read events that do appear are counted as
+      `unexpected_reads_in_summary_mode` and ignored for byte facts.
 - **`full_read`:** `coalesce(distinct_bytes_read, bytes_read) ≥ 0.9 × file_size`;
   null if both are null.
 - **`consumed`** (nullable bool, a byte fact known at
@@ -307,7 +328,8 @@ ID above), `volume_id`, `file_id`, `offset`, `length` (= `bytes_read`),
   "counts": {
     "input_events": 0, "kept_events": 0, "excluded_by_reason": {},
     "opens": 0, "opens_open_missing": 0, "opens_close_missing": 0,
-    "opens_bytes_inconsistent": 0, "open_ranges": 0, "meta_events": 0,
+    "opens_bytes_inconsistent": 0, "late_reads_after_completion": 0,
+    "open_ranges": 0, "meta_events": 0,
     "catalog_miss_files": 0, "catalog_miss_events": 0
   },
   "coverage": {"hours": 0, "complete": 0, "incomplete": 0, "no_counters": 0,
@@ -507,15 +529,19 @@ at the whole cleaned dataset, past and future; labels never feed features.
   default `[t, t + 300 s)`.
 - **Demand in W** is defined by **when consumption happened**, not when the
   handle opened:
-  - *Range mode:* successful `open_ranges` rows of the file with
+  - *`read_mode: ranges`:* successful `open_ranges` rows of the file with
     `effective_time ∈ W`;
-  - *Summary mode* (an open with no ranges): an open with
-    `consumed = true` and `open_time ∈ W`. If its `close_time` (or
-    `completed_known_at` when the close is missing) is at or after the next
-    split boundary, the label is unknown, so a label never depends on facts
-    from the next split.
+  - *`read_mode: summary`:* an open with `consumed = true` and
+    `open_time ∈ W`.
   - An open in W whose consumption is unknown (`consumed` null), with no
     other demand in W, makes the label unknown.
+  - **Label availability across splits:** a label fact is a contributing
+    read's `known_at`, or a summary-mode open's `completed_known_at`. If
+    **any** fact for the file in W has `known_at` ≥ the start of the next
+    split, the label is **unknown** and the row is dropped. This holds even
+    for a fact that would have made the row positive. A row's label
+    therefore never depends on data first observed in a later split. It is
+    counted as `label_unknown_late_fact`.
 
   Call the opens that contribute demand in W **qualifying opens**.
 - **`demand` (default):**
@@ -659,7 +685,20 @@ Same shape as §4.7, with `stage: "snapshots"`, plus:
   count);
 - counts per split (ticks, rows, positives, unknown dropped, ticks dropped
   per status);
-- mean candidate coverage per split.
+- mean candidate coverage per split;
+- **`serving_contract`**: `{"config": …, "sha256": …}`. `config` is the
+  canonical resolved configuration of everything that affects feature
+  values, eligibility or candidates:
+  - the `clean` section (incl. `read_mode`, `completion_grace_s`,
+    `handle_timeout_s`, `dedupe_window_s`);
+  - the `features`, `coaccess` and `candidates` sections;
+  - the catalog policy (§3.1);
+  - `feature_version`.
+
+  `sha256` is computed over its canonical JSON (sorted keys, no
+  whitespace). Model packages copy it, and the Controller enforces it (ML
+  spec §5, §8.6). Snapshot-only settings (ticks, splits, sampling, labels)
+  are recorded separately and are not part of the contract.
 
 ## 9. Configuration
 
@@ -667,6 +706,10 @@ Same shape as §4.7, with `stage: "snapshots"`, plus:
 clean:
   max_future_skew_s: 3600
   max_late_s: 604800
+  completion_grace_s: 60
+  handle_timeout_s: 3600
+  read_mode: ranges             # ranges | summary; declared per source (§4.5)
+  dedupe_window_s: 21600        # live only (ML spec §8.2); batch dedupes globally
   coverage:
     max_loss_fraction: 0.0
     skew_margin_s: 600
@@ -708,6 +751,19 @@ writes the resolved config into its output.
 ```python
 # src/predictive_cache/prep/clean/pipeline.py
 def run_clean(input_dir: Path, cfg: CleanConfig, out_dir: Path) -> Manifest: ...
+
+# src/predictive_cache/prep/clean/rules.py      (shared with the live Controller, ML spec §8.2)
+def classify_event(event: dict, now_or_ingest: datetime, cfg: CleanConfig) -> str | None: ...
+# returns an exclusion reason (§4.3 rules 1 and 3–8) or None; duplicates are checked by the caller
+
+# src/predictive_cache/prep/clean/handles.py    (shared with the live Controller, ML spec §8.2)
+class HandleTracker:
+    def __init__(self, cfg: CleanConfig): ...
+    def push(self, event: dict) -> list[Update]: ...       # kept events in (known_at, event_id) order;
+                                                          # returns OpenObserved / MetaChanged now
+    def advance(self, now: datetime) -> list[Update]: ...  # emits OpenCompleted whose completed_known_at <= now
+    def flush(self) -> list[Update]: ...                   # end of input: complete all open handles
+    late_reads_after_completion: int
 
 # src/predictive_cache/prep/coverage.py
 class Coverage:
@@ -825,7 +881,10 @@ pcache-prep describe DIR        # prints manifest summary + report/summary.md
 - **Reconstruction fixtures** (§4.5):
   - missing close;
   - missing open;
-  - summary mode (`read_events: none`);
+  - `read_mode: summary` (datagen `read_events: none`);
+  - `read_mode: ranges` with a range read delivered after
+    `close_known_at + completion_grace_s`: it is excluded from byte facts,
+    and the close total is never substituted;
   - overlapping ranges (distinct bytes counted once);
   - a close total that disagrees with the kept reads after a failed read
     (`bytes_inconsistent`, read-derived bytes kept);
@@ -864,8 +923,11 @@ pcache-prep describe DIR        # prints manifest summary + report/summary.md
   - an open known before *t* whose zero-byte close is known after *t*: byte
     features at *t* don't reflect the close, and at a later
     *t′* > `completed_known_at` they do;
-  - a read delivered after its close (`read.known_at > close.known_at`):
-    `completed_known_at` equals the read's `known_at`.
+  - a read delivered after its close but within the grace period is part of
+    the open's byte facts, with `completed_known_at = close_known_at +
+    completion_grace_s`. A read delivered after that is
+    late-after-completion: counted, excluded from byte facts, kept in
+    `open_ranges`.
 - **Catalog isolation:**
   - a file created after *t* is not visible;
   - a file that exists at *t* with a future catalog `deleted_at` stays
@@ -887,8 +949,10 @@ pcache-prep describe DIR        # prints manifest summary + report/summary.md
     positive, counting only bytes read in W;
   - a handle opened in W with all reads after W is not positive from those
     reads;
-  - a summary-mode open in W whose close is after the next boundary becomes
-    unknown;
+  - a label fact (range read, or summary-mode completion) in W with
+    `known_at` after the next split boundary makes the label unknown, in both
+    range and summary mode, including facts delivered after `val_start` and
+    `test_start`;
   - ticks whose window plus skew embargo crosses a split boundary, or whose
     window passes `period.end`, are dropped. Include a ±max-skew fixture on
     both sides of each boundary;
