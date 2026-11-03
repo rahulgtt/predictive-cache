@@ -1,14 +1,39 @@
 # Predictive cache warming
 
 > **Status: design proposal, not an implemented service.** This repository
-> currently contains the project documentation, not the Controller, Warmer,
-> data pipeline, or benchmark described below. The implementation plan is a
-> draft; feasibility and data gates must be resolved before performance claims.
+> includes the synthetic datagen foundation with fixture stubs, not the
+> Controller, Warmer, complete workload generator, or benchmark described below.
+> Feasibility and data gates must be resolved before performance claims.
 
 For agent-assisted development, start with [AGENTS.md](AGENTS.md), invoke
 `$pc-milestone`, and follow the [execution and review workflow](docs/ai/workflow.md).
 The [milestone map](docs/plan/milestones.md) connects agent tasks to the design
 gates below. These development tools do not add an agent runtime to the product.
+
+## Run the datagen foundation
+
+Python 3.12 and `uv` are required. From the repository root:
+
+```bash
+uv sync --locked
+uv run pcache-datagen generate --preset tiny --out /tmp/pcache-tiny
+uv run pcache-datagen validate /tmp/pcache-tiny
+uv run pcache-datagen describe /tmp/pcache-tiny
+uv run pytest
+uv run ruff check .
+```
+
+Use a new output directory for each run. `--format jsonl` selects JSONL instead
+of Parquet. `--config scenario.yaml` selects a YAML config instead of `--preset`;
+`--seed` and `--format` override it. `--overwrite` replaces only an intact,
+verified generator-owned dataset without unrelated files.
+
+Issue #13 provides schemas, config, writers, manifests, interfaces and a small
+nonempty fixture per configured volume. It does **not** implement workload
+patterns, fault injection, or the preset's scale targets (#14–#19). `validate`
+checks schemas and artifact integrity; it does not claim pattern recovery or
+model quality. [Foundation handoff](docs/datagen/issue-13-handoff.md) records
+acceptance evidence and implementation boundaries.
 
 ## What we are trying to prove
 

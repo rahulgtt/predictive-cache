@@ -1,2 +1,13 @@
 local-space/
 tools/ai/personal
+
+# Python environments and generated build/test files
+.tools/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/

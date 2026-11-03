@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "predictive-cache"
+version = "0.1.0"
+description = "Synthetic access-event foundation for Predictive Cache"
+requires-python = ">=3.12,<3.13"
+dependencies = ["numpy>=2,<3", "pyarrow>=19,<24", "pydantic>=2.10,<3", "pyyaml>=6,<7", "click>=8.1,<9"]
+
+[project.scripts]
+pcache-datagen = "predictive_cache.datagen.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/predictive_cache"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/datagen"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
