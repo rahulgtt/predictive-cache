@@ -46,6 +46,30 @@ in memory, and writes do not feed back into previously generated access
 choices. See
 [spec §20](docs/datagen/spec.md#20-combined-workloads-realization-and-faults-issues-1618).
 
+## Clean the synthetic access dataset
+
+Use `pcache-prep clean` to build versioned demand tables from a datagen output
+directory. The cleaner excludes warmer, synthetic and unknown-origin events,
+failures, invalid ranges and duplicate deliveries, then reconstructs opens and
+hourly coverage. Its production path never reads `truth/`.
+
+```bash
+uv sync --locked
+uv run pcache-datagen generate --preset tiny --out /tmp/pcache-tiny
+uv run pcache-prep clean --input /tmp/pcache-tiny --out /tmp/pcache-clean
+uv run pcache-prep describe /tmp/pcache-clean
+```
+
+`--format jsonl` writes inspectable fixture tables. Supply `--config FILE`
+with a `clean:` section to declare `read_mode: ranges` or `summary` and
+adjust coverage and completion settings. Use `summary` only with a source
+that emits close totals instead of individual reads. The output manifest
+records parent identity, source-manifest hash, resolved config hash, table
+hashes and observation coverage. Generated datasets belong outside Git.
+Synthetic cleaning results establish pipeline correctness, not model quality
+on real workloads. See [the data-prep spec](docs/data-prep/spec.md) for exact
+rules, schemas and time semantics.
+
 ## What we are trying to prove
 
 ### System diagram
