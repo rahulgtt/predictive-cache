@@ -17,13 +17,13 @@ def validate_source_files(root: Path, listed_files: list[str], dataset_name: str
     from predictive_cache.clearml.datasets import data_only_files
     from predictive_cache.datagen.config import load_config as load_generator_config
     from predictive_cache.datagen.io import config_hash
-    from predictive_cache.datagen.schema import Manifest
+    from predictive_cache.datagen.schema import DataOnlyManifest
 
     root = Path(root)
     manifest_path = root / "manifest.json"
     if manifest_path.is_symlink() or not manifest_path.is_file():
         raise ValueError("source Dataset has no safe manifest.json")
-    manifest = Manifest.model_validate_json(manifest_path.read_text())
+    manifest = DataOnlyManifest.model_validate_json(manifest_path.read_text())
     if manifest.dataset_id != dataset_name:
         raise ValueError("source Dataset name differs from generator manifest dataset_id")
     if (

@@ -7,21 +7,27 @@ import pytest
 import yaml
 
 from predictive_cache.clearml.clean import validate_source_files
-from predictive_cache.clearml.datasets import data_only_files
+from predictive_cache.clearml.datasets import data_only_files, project_data_manifest
 from predictive_cache.datagen.config import load_config
-from predictive_cache.datagen.io import sha256
+from predictive_cache.datagen.io import canonical_json, sha256
 from predictive_cache.datagen.pipeline import run
+from predictive_cache.prep.clean.pipeline import run_clean
+from predictive_cache.prep.config import CleanConfig
 
 
 def test_truth_free_source_contract(tmp_path):
     full = tmp_path / "full"
     manifest = run(load_config(preset="tiny"), full)
     data_only = tmp_path / "data-only"
-    files = data_only_files(full, manifest)
+    projected = project_data_manifest(manifest)
+    files = data_only_files(full, projected)
     for relative in files + ["manifest.json"]:
         destination = data_only / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(full / relative, destination)
+    (data_only / "manifest.json").write_text(
+        canonical_json(projected.model_dump(mode="json")) + "\n"
+    )
     listed = [
         path.relative_to(data_only).as_posix() for path in data_only.rglob("*") if path.is_file()
     ]
@@ -45,9 +51,14 @@ def test_truth_free_source_contract(tmp_path):
     with pytest.raises(ValueError, match="resolved config hash"):
         validate_source_files(data_only, listed, manifest.dataset_id)
     shutil.copyfile(full / "config.resolved.yaml", resolved)
-    shutil.copyfile(full / "manifest.json", data_only / "manifest.json")
+    (data_only / "manifest.json").write_text(
+        canonical_json(projected.model_dump(mode="json")) + "\n"
+    )
 
     event = next(data_only.glob("events/**/*.parquet"))
     event.write_bytes(b"corrupted")
     with pytest.raises(ValueError, match="corrupted"):
         validate_source_files(data_only, listed, manifest.dataset_id)
+    shutil.copyfile(full / event.relative_to(data_only), event)
+    cleaned = run_clean(data_only, CleanConfig(), tmp_path / "clean")
+    assert cleaned["parent"]["dataset_id"] == manifest.dataset_id
