@@ -73,6 +73,10 @@ These come from [README.md](../../README.md). Any code, issue or PR must respect
 - For CUFS, Chimera and other Strider components, **do not build or run tests
   in local checkouts**. Use `strider-dev` / `strider-dev2` and the designated
   build containers. Initialize submodules first.
+- ML experiment tracking, datasets, models and training/eval runs use the
+  team ClearML server. See [ML platform](../infra/ml.md) for endpoints,
+  SDK setup, naming conventions and the data policy. Never commit ClearML
+  credentials.
 
 ## Documentation: `docs/`
 
