@@ -13,10 +13,35 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from predictive_cache.collection.harness import (
+    build_operation,
+    catalog_sha256,
+    planned_operations,
+)
+from predictive_cache.collection.models import (
+    CollectionManifest,
+    FixtureCatalog,
+    FixtureEntry,
+    RetentionPolicy,
+    SoftwareVersions,
+    StopRules,
+)
+from predictive_cache.collection.provenance import (
+    APPROVED_COLLECTOR_SHA256,
+    APPROVED_PROVIDER_PACKAGE_SHA256,
+    APPROVED_PROVIDER_SHA256,
+    APPROVED_VALIDATION_RUNBOOK_SHA256,
+    APPROVED_VALIDATOR_SHA256,
+)
 from predictive_cache.datagen.io import canonical_json
 from predictive_cache.prep.cli import main as prep_main
 from predictive_cache.sources.chimera.cli import main
-from predictive_cache.sources.chimera.importer import import_dataset
+from predictive_cache.sources.chimera.importer import (
+    _validate_catalog,
+    _validate_ledger,
+    _validation_permit,
+    import_dataset,
+)
 
 START = datetime(2026, 1, 5, 10, tzinfo=UTC)
 END = START + timedelta(hours=5)
@@ -557,3 +582,218 @@ def test_existing_output_is_never_replaced(tmp_path: Path):
     assert oct(os.stat(out).st_mode & 0o777) == "0o700"
     with pytest.raises(ValueError, match="atomic replacement"):
         _import(paths, out)
+
+
+def _full_validation_contract(tmp_path: Path):
+    fixtures = tuple(
+        FixtureEntry(
+            fixture_id=f"fixture-{index:02d}",
+            volume_id=VOLUME_ID,
+            file_id=hashlib.sha256(f"file-{index}".encode()).hexdigest(),
+            dir_id=f"dir-{index:02d}",
+            export_id=EXPORT_ID,
+            export_name=EXPORT_NAME,
+            export_path=f"/{EXPORT_NAME}",
+            relative_path=f"fixtures/file-{index:02d}.bin",
+            size_bytes=65536,
+            sha256=hashlib.sha256(f"content-{index}".encode()).hexdigest(),
+        )
+        for index in range(60)
+    )
+    catalog = FixtureCatalog(fixtures=fixtures)
+    manifest = CollectionManifest(
+        run_id="controlled-validation",
+        run_ref=hashlib.sha256(b"controlled-validation").hexdigest()[:32],
+        cluster_id="cluster-1",
+        namespace="nasuni",
+        volume_id=VOLUME_ID,
+        export_id=EXPORT_ID,
+        cluster_manifest_sha256="1" * 64,
+        fixture_catalog_sha256=catalog_sha256(catalog),
+        event_schema_sha256="2" * 64,
+        budget_evidence_sha256="3" * 64,
+        seed=32,
+        start_time=START,
+        end_time=END,
+        offered_rate_per_s=1 / 60,
+        offered_count=300,
+        range_bytes=(4096,),
+        range_offsets=(0, 12288, 24576, 36864, 49152),
+        client_id="kernel-nfs-client",
+        tag_mode="empty",
+        software=SoftwareVersions(
+            predictive_cache_revision="a" * 40,
+            chimera_image="chimera:test",
+            chimera_image_sha256="4" * 64,
+            cufs_image="cufs:test",
+            cufs_image_sha256="5" * 64,
+            collector_schema_version="chimera-read-event-v2",
+        ),
+        stop_rules=StopRules(latency_guardrail_ms=5000),
+        retention=RetentionPolicy(
+            owner="owner",
+            cleanup_owner="owner",
+            cleanup_action="delete",
+        ),
+    )
+    planned = planned_operations(manifest, catalog)
+    rows = [
+        build_operation(
+            manifest,
+            item,
+            offered_at=START + timedelta(minutes=item[0]),
+            monotonic_ns=item[0] + 1,
+            timing_mode="wallclock",
+        )
+        for item in planned
+    ]
+    manifest_path = tmp_path / "manifest.json"
+    _json(manifest_path, manifest.model_dump(mode="json"))
+    fixtures_by_id = _validate_catalog(catalog, manifest)
+    return manifest, catalog, rows, manifest_path, fixtures_by_id
+
+
+def _permit(
+    tmp_path: Path,
+    manifest: CollectionManifest,
+    rows: list,
+    manifest_path: Path,
+    count: int,
+    **updates,
+) -> Path:
+    value = {
+        "validation_permit_version": 1,
+        "permit_id": str(uuid.uuid4()),
+        "run_id": manifest.run_id,
+        "full_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "validation_operations": count,
+        "operation_indexes": list(range(count)),
+        "operation_ids": [row.operation_id for row in rows[:count]],
+        "provider_package_sha256": APPROVED_PROVIDER_PACKAGE_SHA256,
+        "provider_sha256": APPROVED_PROVIDER_SHA256,
+        "collector_sha256": APPROVED_COLLECTOR_SHA256,
+        "validator_sha256": APPROVED_VALIDATOR_SHA256,
+        "runbook_sha256": APPROVED_VALIDATION_RUNBOOK_SHA256,
+        "status": "approved",
+        "expires_at": datetime.now(UTC) + timedelta(hours=1),
+    }
+    value.update(updates)
+    path = tmp_path / f"permit-{count}.json"
+    _json(path, value)
+    return path
+
+
+@pytest.mark.parametrize("count", [1, 2, 3])
+def test_validation_permit_accepts_only_deterministic_prefix(tmp_path: Path, count: int):
+    manifest, catalog, rows, manifest_path, fixtures = _full_validation_contract(tmp_path)
+    permit_path = _permit(tmp_path, manifest, rows, manifest_path, count)
+    permit = _validation_permit(
+        permit_path,
+        manifest,
+        manifest_path.read_bytes(),
+        catalog,
+    )
+    validated = _validate_ledger(
+        rows[:count],
+        manifest,
+        fixtures,
+        tuple(planned_operations(manifest, catalog)[:count]),
+    )
+    assert tuple(validated) == permit.operation_ids
+
+
+def test_validation_permit_cannot_weaken_full_run_rules(tmp_path: Path):
+    manifest, catalog, rows, manifest_path, fixtures = _full_validation_contract(tmp_path)
+    with pytest.raises(ValueError, match="count"):
+        _validate_ledger(rows[:1], manifest, fixtures)
+    assert len(_validate_ledger(rows, manifest, fixtures)) == 300
+    for count in (0, 4):
+        permit_path = _permit(tmp_path, manifest, rows, manifest_path, count)
+        with pytest.raises(ValueError, match="validation permit"):
+            _validation_permit(
+                permit_path,
+                manifest,
+                manifest_path.read_bytes(),
+                catalog,
+            )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"full_manifest_sha256": "0" * 64},
+        {"provider_sha256": "0" * 64},
+        {"run_id": "foreign-run"},
+        {"operation_ids": ["f" * 64]},
+        {"expires_at": START},
+    ],
+)
+def test_validation_permit_rejects_forged_or_stale_provenance(tmp_path: Path, updates):
+    manifest, catalog, rows, manifest_path, _ = _full_validation_contract(tmp_path)
+    permit_path = _permit(tmp_path, manifest, rows, manifest_path, 1, **updates)
+    with pytest.raises(ValueError, match="validation permit"):
+        _validation_permit(
+            permit_path,
+            manifest,
+            manifest_path.read_bytes(),
+            catalog,
+        )
+
+
+def test_validation_permit_rejects_symlink_and_nonprefix_rows(tmp_path: Path):
+    manifest, catalog, rows, manifest_path, fixtures = _full_validation_contract(tmp_path)
+    permit_path = _permit(tmp_path, manifest, rows, manifest_path, 1)
+    link = tmp_path / "permit-link.json"
+    link.symlink_to(permit_path)
+    with pytest.raises(ValueError, match="regular non-symlink"):
+        _validation_permit(link, manifest, manifest_path.read_bytes(), catalog)
+    _validation_permit(
+        permit_path,
+        manifest,
+        manifest_path.read_bytes(),
+        catalog,
+    )
+    expected_prefix = tuple(planned_operations(manifest, catalog)[:1])
+    wrong_prefix = rows[1].model_copy(update={"operation_index": 0})
+    with pytest.raises(ValueError, match="deterministic prefix"):
+        _validate_ledger([wrong_prefix], manifest, fixtures, expected_prefix)
+    transplanted = rows[1].model_copy(
+        update={
+            "operation_index": 0,
+            "operation_id": rows[0].operation_id,
+        }
+    )
+    with pytest.raises(ValueError, match="deterministic prefix"):
+        _validate_ledger([transplanted], manifest, fixtures, expected_prefix)
+
+
+def test_cli_passes_validation_permit_explicitly(tmp_path: Path, monkeypatch):
+    captured = {}
+
+    def fake_import(**kwargs):
+        captured.update(kwargs)
+        return type("Imported", (), {"dataset_id": "validation"})()
+
+    monkeypatch.setattr("predictive_cache.sources.chimera.cli.import_dataset", fake_import)
+    permit = tmp_path / "permit.json"
+    arguments = [
+        "--event-sources",
+        str(tmp_path / "sources.json"),
+        "--observed",
+        str(tmp_path / "observed.jsonl"),
+        "--run-manifest",
+        str(tmp_path / "manifest.json"),
+        "--offered-ledger",
+        str(tmp_path / "offered.jsonl"),
+        "--fixture-catalog",
+        str(tmp_path / "catalog.json"),
+        "--checkpoints",
+        str(tmp_path / "checkpoints.jsonl"),
+        "--validation-permit",
+        str(permit),
+        "--out",
+        str(tmp_path / "out"),
+    ]
+    result = CliRunner().invoke(main, arguments)
+    assert result.exit_code == 0, result.output
+    assert captured["validation_permit_path"] == permit

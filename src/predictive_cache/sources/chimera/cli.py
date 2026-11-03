@@ -24,6 +24,11 @@ from .importer import import_dataset
     "--fixture-catalog", "fixture_catalog_path", type=click.Path(path_type=Path), required=True
 )
 @click.option("--checkpoints", "checkpoints_path", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--validation-permit",
+    "validation_permit_path",
+    type=click.Path(path_type=Path),
+)
 @click.option("--out", "out_dir", type=click.Path(path_type=Path), required=True)
 @click.option("--format", "format_", type=click.Choice(["parquet", "jsonl"]), default="parquet")
 def main(
@@ -33,6 +38,7 @@ def main(
     offered_ledger_path: Path,
     fixture_catalog_path: Path,
     checkpoints_path: Path,
+    validation_permit_path: Path | None,
     out_dir: Path,
     format_: str,
 ) -> None:
@@ -45,6 +51,7 @@ def main(
             offered_ledger_path=offered_ledger_path,
             fixture_catalog_path=fixture_catalog_path,
             checkpoints_path=checkpoints_path,
+            validation_permit_path=validation_permit_path,
             out_dir=out_dir,
             format=format_,
         )

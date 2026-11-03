@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import json
 import os
 import platform
 import shutil
@@ -13,7 +14,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from predictive_cache.collection.harness import planned_operations
 from predictive_cache.collection.models import (
+    AdapterValidationPermit,
     Checkpoint,
     CollectionManifest,
     CollectorFileManifest,
@@ -21,6 +24,13 @@ from predictive_cache.collection.models import (
     FixtureEntry,
     ObservedEvent,
     OfferedOperation,
+)
+from predictive_cache.collection.provenance import (
+    APPROVED_COLLECTOR_SHA256,
+    APPROVED_PROVIDER_PACKAGE_SHA256,
+    APPROVED_PROVIDER_SHA256,
+    APPROVED_VALIDATION_RUNBOOK_SHA256,
+    APPROVED_VALIDATOR_SHA256,
 )
 from predictive_cache.datagen.io import canonical_json, sha256, source_revision, write_table
 from predictive_cache.datagen.schema import Manifest, normalize_rows
@@ -69,8 +79,16 @@ def _validate_ledger(
     rows: list[OfferedOperation],
     manifest: CollectionManifest,
     fixtures: dict[tuple[str, str], FixtureEntry],
+    expected_validation_prefix: (
+        tuple[tuple[int, FixtureEntry, int, int, str], ...] | None
+    ) = None,
 ) -> dict[str, OfferedOperation]:
-    if len(rows) != manifest.offered_count:
+    expected_count = (
+        len(expected_validation_prefix)
+        if expected_validation_prefix is not None
+        else manifest.offered_count
+    )
+    if len(rows) != expected_count:
         raise ValueError("offered ledger count does not match the run manifest")
     by_id: dict[str, OfferedOperation] = {}
     indexes = []
@@ -112,9 +130,93 @@ def _validate_ledger(
             raise ValueError("offered operation correlation tag mismatch")
         if row.client_id != manifest.client_id:
             raise ValueError("offered operation client_id mismatch")
-    if sorted(indexes) != list(range(manifest.offered_count)):
+    if indexes != list(range(expected_count)):
         raise ValueError("offered operation indexes must be contiguous from zero")
+    if expected_validation_prefix is not None:
+        for row, expected in zip(rows, expected_validation_prefix, strict=True):
+            index, fixture, offset, count, operation_id = expected
+            if (
+                row.operation_index,
+                row.operation_id,
+                row.fixture_id,
+                row.volume_id,
+                row.file_id,
+                row.dir_id,
+                row.export_id,
+                row.relative_path,
+                row.file_size,
+                row.offset,
+                row.count,
+            ) != (
+                index,
+                operation_id,
+                fixture.fixture_id,
+                fixture.volume_id,
+                fixture.file_id,
+                fixture.dir_id,
+                fixture.export_id,
+                fixture.relative_path,
+                fixture.size_bytes,
+                offset,
+                count,
+            ):
+                raise ValueError(
+                    "offered ledger does not match the permitted deterministic prefix"
+                )
     return by_id
+
+
+def _validation_permit(
+    path: Path,
+    manifest: CollectionManifest,
+    manifest_bytes: bytes,
+    catalog: FixtureCatalog,
+) -> AdapterValidationPermit:
+    data = read_bytes(path)
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("validation permit contains duplicate JSON keys")
+            value[key] = item
+        return value
+
+    try:
+        raw = json.loads(data, object_pairs_hook=unique_object)
+        permit = AdapterValidationPermit.model_validate(raw)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ValueError(f"{path}: invalid validation permit") from error
+    if (
+        manifest.seed != 32
+        or manifest.offered_count != 300
+        or manifest.offered_rate_per_s != 1 / 60
+        or manifest.max_concurrency != 1
+        or manifest.range_bytes != (4096,)
+        or manifest.range_offsets != (0, 12288, 24576, 36864, 49152)
+        or manifest.checkpoint_interval_s != 900
+        or manifest.checkpoint_tolerance_s != 30
+        or manifest.pre_read_plus_read_guardrail_ms != 5000
+        or manifest.stop_rules.latency_guardrail_ms != 5000
+    ):
+        raise ValueError("validation permit requires the approved full collection manifest")
+    expected_ids = tuple(
+        item[4]
+        for item in planned_operations(manifest, catalog)[: permit.validation_operations]
+    )
+    if (
+        permit.run_id != manifest.run_id
+        or permit.full_manifest_sha256 != hashlib.sha256(manifest_bytes).hexdigest()
+        or permit.operation_ids != expected_ids
+        or permit.provider_package_sha256 != APPROVED_PROVIDER_PACKAGE_SHA256
+        or permit.provider_sha256 != APPROVED_PROVIDER_SHA256
+        or permit.collector_sha256 != APPROVED_COLLECTOR_SHA256
+        or permit.validator_sha256 != APPROVED_VALIDATOR_SHA256
+        or permit.runbook_sha256 != APPROVED_VALIDATION_RUNBOOK_SHA256
+        or permit.expires_at <= datetime.now(UTC)
+    ):
+        raise ValueError("validation permit does not match approved provenance")
+    return permit
 
 
 def _validate_observed(
@@ -203,6 +305,7 @@ def _validate_checkpoints(
     streams: dict[tuple[str, str], list[ChimeraEvent]],
     source_hashes: dict[str, str],
     source_sizes: dict[str, int],
+    validation_permit: AdapterValidationPermit | None = None,
 ) -> None:
     source_by_stream = {
         (source.pod_uid, source.producer_epoch): source for source in sources.files
@@ -237,13 +340,18 @@ def _validate_checkpoints(
             raise ValueError("checkpoint reports a latency guardrail breach")
     if set(grouped) != set(source_by_stream):
         raise ValueError("checkpoint streams must exactly match event source streams")
-    expected_times = [
+    full_expected_times = [
         manifest.start_time + timedelta(seconds=manifest.checkpoint_interval_s * index)
         for index in range(21)
     ]
     for stream, rows in grouped.items():
         rows.sort(key=lambda row: row.scheduled_at)
-        if [row.scheduled_at for row in rows] != expected_times:
+        expected_times = (
+            full_expected_times[: len(rows)]
+            if validation_permit is not None
+            else full_expected_times
+        )
+        if not rows or [row.scheduled_at for row in rows] != expected_times:
             raise ValueError(f"{stream}: incomplete 15-minute checkpoint coverage")
         if any(
             row.captured_at < row.scheduled_at
@@ -267,31 +375,32 @@ def _validate_checkpoints(
                 or current.last_synced_sequence < previous.last_synced_sequence
             ):
                 raise ValueError(f"{stream}: producer sequence reset")
-        final = rows[-1]
-        expected_count = len(streams[stream])
-        if any(
-            (
-                final.last_enqueued_sequence != expected_count,
-                final.last_synced_sequence != expected_count,
-                final.synced_count != expected_count,
-                final.queue_depth != 0,
-                final.worker_in_flight != 0,
-            )
-        ):
-            raise ValueError(f"{stream}: final checkpoint does not prove a synced barrier")
-        evidence = [
-            item
-            for row in rows
-            for item in (row.active_jsonl, row.backup_jsonl)
-            if item is not None
-        ]
-        if not any(
-            item.path == source.raw_jsonl_path
-            and item.sha256 == source_hashes[source.raw_jsonl_path]
-            and item.size_bytes == source_sizes[source.raw_jsonl_path]
-            for item in evidence
-        ):
-            raise ValueError(f"{stream}: source file lacks matching checkpoint evidence")
+        if validation_permit is None:
+            final = rows[-1]
+            expected_count = len(streams[stream])
+            if any(
+                (
+                    final.last_enqueued_sequence != expected_count,
+                    final.last_synced_sequence != expected_count,
+                    final.synced_count != expected_count,
+                    final.queue_depth != 0,
+                    final.worker_in_flight != 0,
+                )
+            ):
+                raise ValueError(f"{stream}: final checkpoint does not prove a synced barrier")
+            evidence = [
+                item
+                for row in rows
+                for item in (row.active_jsonl, row.backup_jsonl)
+                if item is not None
+            ]
+            if not any(
+                item.path == source.raw_jsonl_path
+                and item.sha256 == source_hashes[source.raw_jsonl_path]
+                and item.size_bytes == source_sizes[source.raw_jsonl_path]
+                for item in evidence
+            ):
+                raise ValueError(f"{stream}: source file lacks matching checkpoint evidence")
 
 
 def _event_result(status: int) -> str:
@@ -515,6 +624,7 @@ def import_dataset(
     fixture_catalog_path: Path,
     checkpoints_path: Path,
     out_dir: Path,
+    validation_permit_path: Path | None = None,
     format: str = "parquet",
 ) -> Manifest:
     """Import one immutable controlled collection run atomically."""
@@ -532,6 +642,18 @@ def import_dataset(
     input_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in input_bytes.items()}
     manifest = parse_json(input_bytes["run_manifest"], inputs["run_manifest"], CollectionManifest)
     catalog = parse_json(input_bytes["fixture_catalog"], inputs["fixture_catalog"], FixtureCatalog)
+    permit = (
+        _validation_permit(
+            Path(validation_permit_path),
+            manifest,
+            input_bytes["run_manifest"],
+            catalog,
+        )
+        if validation_permit_path is not None
+        else None
+    )
+    if permit is not None:
+        input_hashes["validation_permit"] = sha256(Path(validation_permit_path))
     sources = parse_json(
         input_bytes["event_sources"], inputs["event_sources"], CollectorFileManifest
     )
@@ -541,11 +663,28 @@ def import_dataset(
     observed_rows = parse_jsonl(input_bytes["observed"], inputs["observed"], ObservedEvent)
     checkpoints = parse_jsonl(input_bytes["checkpoints"], inputs["checkpoints"], Checkpoint)
     fixtures = _validate_catalog(catalog, manifest)
-    offered = _validate_ledger(ledger, manifest, fixtures)
+    offered = _validate_ledger(
+        ledger,
+        manifest,
+        fixtures,
+        (
+            tuple(
+                planned_operations(manifest, catalog)[: permit.validation_operations]
+            )
+            if permit is not None
+            else None
+        ),
+    )
     observed = _validate_observed(observed_rows, manifest, offered)
     streams, source_hashes, source_sizes = _load_raw_events(inputs["event_sources"], sources)
     _validate_checkpoints(
-        checkpoints, manifest, sources, streams, source_hashes, source_sizes
+        checkpoints,
+        manifest,
+        sources,
+        streams,
+        source_hashes,
+        source_sizes,
+        permit,
     )
     output_events, exclusions, event_report = _validate_and_build_events(
         streams, observed, offered, fixtures, manifest

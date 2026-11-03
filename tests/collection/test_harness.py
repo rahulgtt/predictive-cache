@@ -40,6 +40,7 @@ from predictive_cache.collection.io import (
     write_jsonl,
 )
 from predictive_cache.collection.models import (
+    AdapterValidationPermit,
     Checkpoint,
     CleanupCompletionRecord,
     CleanupScheduleRecord,
@@ -462,7 +463,7 @@ def test_catalog_rejects_canonical_and_path_aliases():
         planned_operations(manifest(export_id=8), catalog())
 
 
-def test_authorized_live_shape_is_exactly_sixty_files_by_five_offsets():
+def live_catalog_manifest():
     fixtures = tuple(
         FixtureEntry(
             fixture_id=f"fixture-{index:02d}",
@@ -480,13 +481,20 @@ def test_authorized_live_shape_is_exactly_sixty_files_by_five_offsets():
     )
     live_catalog = FixtureCatalog(fixtures=fixtures)
     live_manifest = manifest(
+        seed=32,
         offered_rate_per_s=1 / 60,
         offered_count=300,
         range_bytes=(4096,),
         range_offsets=(0, 12288, 24576, 36864, 49152),
         fixture_catalog_sha256=catalog_sha256(live_catalog),
         tag_mode="empty",
+        stop_rules=StopRules(latency_guardrail_ms=5000),
     )
+    return live_catalog, live_manifest
+
+
+def test_authorized_live_shape_is_exactly_sixty_files_by_five_offsets():
+    live_catalog, live_manifest = live_catalog_manifest()
     operations = planned_operations(live_manifest, live_catalog)
     assert len(operations) == 300
     assert len({(item[1].file_id, item[2], item[3]) for item in operations}) == 300
@@ -1245,6 +1253,76 @@ def test_finalize_requires_verified_outputs_and_reconciliation(tmp_path):
     assert '"reconciliation.json"' in inventory
     assert '"validated_dataset"' in inventory
     assert '"bounded_validation_evidence"' in inventory
+
+
+def test_bounded_run_seals_adapter_validation_permit_before_execution(
+    tmp_path,
+    monkeypatch,
+):
+    run_dir = private_dir(tmp_path)
+    live_catalog, live_manifest = live_catalog_manifest()
+    atomic_write_model(run_dir / "manifest.json", live_manifest)
+    atomic_write_model(run_dir / "fixture-catalog.json", live_catalog)
+    observed = {}
+    subprocess_calls = []
+
+    class FakeRunner:
+        def run(self, manifest, catalog, evidence_dir, executor, **kwargs):
+            permit_path = evidence_dir / "adapter-validation-permit.json"
+            assert permit_path.is_file()
+            observed["permit"] = AdapterValidationPermit.model_validate_json(
+                permit_path.read_text()
+            )
+            return kwargs["operation_limit"]
+
+    monkeypatch.setattr("predictive_cache.collection.cli.CollectionRunner", FakeRunner)
+    monkeypatch.setattr(
+        "predictive_cache.collection.cli.DirectMountExecutor",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "predictive_cache.collection.cli.CommandCheckpointProvider",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "predictive_cache.collection.cli.subprocess.run",
+        lambda args, **kwargs: subprocess_calls.append(args),
+    )
+    result = CliRunner().invoke(
+        main,
+        [
+            "run",
+            "--run-dir",
+            str(run_dir),
+            "--mount-root",
+            str(tmp_path),
+            "--checkpoint-command",
+            str(tmp_path / "provider"),
+            "--validation-operations",
+            "2",
+            "--adapter-command",
+            str(tmp_path / "adapter"),
+            "--cleaner-command",
+            str(tmp_path / "cleaner"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    permit = observed["permit"]
+    manifest = CollectionManifest.model_validate_json((run_dir / "manifest.json").read_text())
+    catalog_model = FixtureCatalog.model_validate_json(
+        (run_dir / "fixture-catalog.json").read_text()
+    )
+    expected = planned_operations(manifest, catalog_model)[:2]
+    assert permit.operation_indexes == (0, 1)
+    assert permit.operation_ids == tuple(item[4] for item in expected)
+    assert subprocess_calls == [
+        [
+            tmp_path / "adapter",
+            run_dir,
+            run_dir / "adapter-validation-permit.json",
+        ],
+        [tmp_path / "cleaner", run_dir],
+    ]
 
 
 def test_finalize_rejects_forged_and_tampered_dataset_hashes(tmp_path):
