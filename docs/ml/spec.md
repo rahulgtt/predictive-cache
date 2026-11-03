@@ -812,10 +812,19 @@ class LogRegScorer  # implements Scorer; fit uses scikit-learn, score is numpy-o
 def train(snapshots_dir: Path, cfg: TrainConfig, out_dir: Path, tracker: Tracker) -> list[Path]: ...
 
 # src/predictive_cache/ml/metrics.py          (#57)
-def select(rows: pa.Table, scores: np.ndarray, budget: Budget, range_cap: int,
+@dataclass(frozen=True)
+class Budget: kind: Literal["top_k", "bytes"]; value: int     # Budget.parse("top_25" | "bytes_256MiB"); .name
+def select(rows: pa.Table, scores: np.ndarray, budget: Budget, range_cap: int = 16 MiB,
            min_score: float = float("-inf")) -> np.ndarray: ...   # bool mask; rows with score < min_score never selected
-def evaluate(snapshots: pa.Table, universe: pa.Table, scores: np.ndarray, budgets: list[Budget]) -> dict: ...
+def evaluate(snapshots: pa.Table, universe: pa.Table, scores: np.ndarray, budgets: list[Budget], *,
+             split: str | None = None, range_cap: int = 16 MiB, min_score: float = float("-inf")) -> dict: ...
+# split None: inferred from the snapshots' single split; ambiguous -> ValueError (universe spans all splits)
+# -> {"overall": {...}, "per_volume": {vol: {...}}, "per_tick": pa.Table, "n_ticks", "n_rows"};
+#    metric keys "recall@<budget>", "precision@…", "warmed_bytes@…", "positive_warmed_share@…",
+#    "coverage", "pr_auc", "unknown_at_t_share"; undefined ratios (zero denominator) are None
+def micro(per_tick: pa.Table, metric: str) -> float | None: ...
 def bootstrap_diff(per_tick_a: pa.Table, per_tick_b: pa.Table, metric: str, reps: int, seed: int) -> tuple[float, float]: ...
+def reliability(scores: np.ndarray, labels: np.ndarray, bins: int = 10) -> tuple[list[dict], float] | None: ...   # None unless scores in [0, 1]
 
 # src/predictive_cache/ml/evaluate.py         (#58)
 def freeze(snapshots_dir: Path, packages: list[Path], cfg: EvalConfig, out: Path) -> dict: ...
