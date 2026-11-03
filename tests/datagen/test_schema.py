@@ -106,3 +106,18 @@ def test_nullable_and_utc():
 def test_catalog_and_truth_reject_invalid(table, changes):
     with pytest.raises(ValueError):
         validate_rows(table, [sample_rows()[table][0] | changes])
+
+
+def test_fast_arrow_rows_preserve_exact_utc_microseconds():
+    import pyarrow as pa
+
+    from predictive_cache.datagen.io import table_rows
+
+    values = [
+        datetime(1969, 12, 31, 23, 59, 59, 999999, tzinfo=UTC),
+        datetime(2026, 1, 5, 0, 0, 0, 1, tzinfo=UTC),
+        datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=UTC),
+        None,
+    ]
+    table = pa.table({"at": pa.array(values, type=pa.timestamp("us", tz="UTC"))})
+    assert table_rows(table) == [{"at": value} for value in values]

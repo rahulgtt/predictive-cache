@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import re
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
 import pyarrow as pa
+import pyarrow.compute as pc
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 OPERATIONS = frozenset("open read close create write rename delete".split())
@@ -170,52 +172,138 @@ def utc_datetime(value):
     return value
 
 
-def _value(value, typ):
+@lru_cache(maxsize=None)
+def _checker(typ):
+    """Compile the fixed Arrow contract once, not once per cell."""
     if pa.types.is_timestamp(typ):
-        return utc_datetime(value)
+        return utc_datetime
+    if pa.types.is_integer(typ):
+        bound = 2 ** (typ.bit_width - 1)
+
+        def integer(value):
+            if type(value) is not int or not -bound <= value < bound:
+                raise ValueError("expected in-range integer")
+            return value
+
+        return integer
+    if pa.types.is_string(typ):
+
+        def string(value):
+            if not isinstance(value, str):
+                raise ValueError("expected string")
+            return value
+
+        return string
     if pa.types.is_date32(typ):
-        if isinstance(value, str):
-            value = date.fromisoformat(value)
-        if type(value) is not date:
-            raise ValueError("expected date")
-    elif pa.types.is_integer(typ):
-        if type(value) is not int or not -(2 ** (typ.bit_width - 1)) <= value < 2 ** (
-            typ.bit_width - 1
+
+        def day(value):
+            if isinstance(value, str):
+                value = date.fromisoformat(value)
+            if type(value) is not date:
+                raise ValueError("expected date")
+            return value
+
+        return day
+    if pa.types.is_list(typ):
+        item = _checker(typ.value_type)
+
+        def items(value):
+            if not isinstance(value, list) or any(v is None for v in value):
+                raise ValueError("expected non-null list elements")
+            return [item(v) for v in value]
+
+        return items
+    raise ValueError(f"unsupported contract type: {typ}")
+
+
+@lru_cache(maxsize=4096)
+def _canonical_object(raw):
+    obj = json.loads(raw)
+    if (
+        not isinstance(obj, dict)
+        or json.dumps(obj, sort_keys=True, separators=(",", ":"), allow_nan=False) != raw
+    ):
+        raise ValueError("expected a canonical JSON object")
+
+
+def validate_table(name, table):
+    """Validate already typed Parquet columns without a Python row round trip."""
+    contract = SCHEMAS[name]
+    if not table.schema.equals(contract, check_metadata=False):
+        raise ValueError(f"Arrow schema mismatch for {name}")
+    table.validate(full=True)
+    for field in contract:
+        column = table[field.name]
+        if not field.nullable and column.null_count:
+            raise ValueError(f"{name}.{field.name}: null required value")
+        if pa.types.is_list(field.type) and pc.list_flatten(column).null_count:
+            raise ValueError(f"{name}.{field.name}: null list element")
+        allowed = ENUMS.get(name, {}).get(field.name)
+        if (
+            allowed is not None
+            and pc.any(
+                pc.invert(pc.is_in(column.drop_null(), value_set=pa.array(sorted(allowed))))
+            ).as_py()
         ):
-            raise ValueError("expected in-range integer")
-    elif pa.types.is_string(typ):
-        if not isinstance(value, str):
-            raise ValueError("expected string")
-    elif pa.types.is_list(typ):
-        if not isinstance(value, list) or any(v is None for v in value):
-            raise ValueError("expected non-null list elements")
-        value = [_value(v, typ.value_type) for v in value]
-    return value
+            raise ValueError(f"invalid {field.name}")
+    if name in ("events", "dropped_events"):
+        if pc.any(pc.not_equal(table["schema_version"], 1)).as_py():
+            raise ValueError("unsupported event schema version")
+        if any(table[k].null_count != table.num_rows for k in ("cache_outcome", "latency_ms")):
+            raise ValueError("reserved cache/latency fields must be null")
+    if name == "event_truth":
+        if pc.any(
+            pc.invert(
+                pc.is_in(pc.list_flatten(table["faults"]), value_set=pa.array(sorted(FAULTS)))
+            )
+        ).as_py():
+            raise ValueError("unknown fault tag")
+    json_field = (
+        "original_fields_json"
+        if name == "event_truth"
+        else "params"
+        if name == "patterns"
+        else None
+    )
+    if json_field:
+        for value in pc.unique(table[json_field]).to_pylist():
+            _canonical_object(value)
+    return table
 
 
 def normalize_rows(name: str, rows) -> list[dict[str, Any]]:
     """Validate rows and return Arrow-ready copies; accept ISO JSON dates/times."""
     result = []
     contract = SCHEMAS[name]
+    names = frozenset(contract.names)
+    fields = [
+        (f.name, f.nullable, _checker(f.type), ENUMS.get(name, {}).get(f.name)) for f in contract
+    ]
+    json_field = (
+        "original_fields_json"
+        if name == "event_truth"
+        else "params"
+        if name == "patterns"
+        else None
+    )
     for index, row in enumerate(rows):
-        if not isinstance(row, dict) or set(row) - set(contract.names):
+        if not isinstance(row, dict) or row.keys() - names:
             raise ValueError(f"{name}[{index}]: unknown columns or invalid row")
         normalized = {}
-        for field in contract:
-            value = row.get(field.name)
+        for field, nullable, check, allowed in fields:
+            value = row.get(field)
             if value is None:
-                if not field.nullable:
-                    raise ValueError(f"{name}[{index}].{field.name}: null/missing required value")
+                if not nullable:
+                    raise ValueError(f"{name}[{index}].{field}: null/missing required value")
             else:
-                if name == "patterns" and field.name == "params" and isinstance(value, dict):
+                if name == "patterns" and field == "params" and isinstance(value, dict):
                     value = json.dumps(
                         value, sort_keys=True, separators=(",", ":"), allow_nan=False
                     )
-                value = _value(value, field.type)
-                allowed = ENUMS.get(name, {}).get(field.name)
+                value = check(value)
                 if allowed is not None and value not in allowed:
-                    raise ValueError(f"invalid {field.name}: {value}")
-            normalized[field.name] = value
+                    raise ValueError(f"invalid {field}: {value}")
+            normalized[field] = value
         if name in ("events", "dropped_events"):
             if normalized["schema_version"] != 1:
                 raise ValueError("unsupported event schema version")
@@ -223,21 +311,8 @@ def normalize_rows(name: str, rows) -> list[dict[str, Any]]:
                 raise ValueError("reserved cache/latency fields must be null")
         if name == "event_truth" and not set(normalized["faults"]) <= FAULTS:
             raise ValueError("unknown fault tag")
-        json_field = (
-            "original_fields_json"
-            if name == "event_truth"
-            else "params"
-            if name == "patterns"
-            else None
-        )
         if json_field:
-            raw = normalized[json_field]
-            obj = json.loads(raw)
-            if (
-                not isinstance(obj, dict)
-                or json.dumps(obj, sort_keys=True, separators=(",", ":"), allow_nan=False) != raw
-            ):
-                raise ValueError(f"{json_field} must be a canonical JSON object")
+            _canonical_object(normalized[json_field])
         result.append(normalized)
     return result
 

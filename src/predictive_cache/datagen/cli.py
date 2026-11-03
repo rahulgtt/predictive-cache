@@ -40,7 +40,7 @@ def generate(preset, config_path, out, seed, output_format, overwrite):
 @main.command()
 @click.argument("directory", type=click.Path(exists=True, file_okay=False, path_type=Path))
 def validate(directory):
-    """Check schemas and artifact integrity; pattern recovery awaits issue #19."""
+    """Check artifacts, references, handles, ranges, losses and fault restoration."""
     from .validate import validate_dataset
 
     try:
@@ -49,7 +49,7 @@ def validate(directory):
         raise click.ClickException(str(exc)) from exc
     click.echo(
         f"Valid: {result['files']} artifacts, {result['events']} events. "
-        "Scope: schemas and artifact integrity; no workload-quality claim."
+        "Scope: artifact and semantic checks; see report for recovery diagnostics."
     )
 
 

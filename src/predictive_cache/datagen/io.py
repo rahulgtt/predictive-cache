@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import tempfile
 from collections import Counter, defaultdict
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 
-from .schema import SCHEMAS, Manifest, rows_to_table
+from .schema import SCHEMAS, Manifest, rows_to_table, validate_table
 
 TABLE_PATHS = {
     "volumes": "catalog/volumes",
@@ -66,6 +66,22 @@ def config_hash(cfg: Any) -> str:
     return hashlib.sha256(canonical_json(cfg.model_dump(mode="json")).encode()).hexdigest()
 
 
+def table_rows(table: pa.Table) -> list[dict]:
+    """Decode UTC microseconds directly, avoiding optional timezone imports per cell."""
+    timestamp_names = [field.name for field in table.schema if pa.types.is_timestamp(field.type)]
+    columns = [
+        table[field.name].cast(pa.int64()) if field.name in timestamp_names else table[field.name]
+        for field in table.schema
+    ]
+    rows = pa.Table.from_arrays(columns, names=table.column_names).to_pylist()
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    for row in rows:
+        for name in timestamp_names:
+            if row[name] is not None:
+                row[name] = epoch + timedelta(microseconds=row[name])
+    return rows
+
+
 def write_table(path: Path, name: str, rows: list[dict]) -> int:
     table = rows_to_table(name, rows)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -82,7 +98,7 @@ def write_table(path: Path, name: str, rows: list[dict]) -> int:
         )
     else:
         with path.open("w", encoding="utf-8", newline="\n") as stream:
-            for row in table.to_pylist():
+            for row in table_rows(table):
                 stream.write(canonical_json(row) + "\n")
     return table.num_rows
 
@@ -110,9 +126,7 @@ def read_table(path: Path, name: str) -> pa.Table:
     if path.suffix == ".parquet":
         # ParquetFile avoids hive partition-column inference overriding volume_id.
         table = pq.ParquetFile(path).read()
-        if not table.schema.equals(SCHEMAS[name], check_metadata=False):
-            raise ValueError(f"{path}: Arrow schema mismatch for {name}")
-        return rows_to_table(name, table.to_pylist())
+        return validate_table(name, table)
     rows = []
     for line in path.read_text().splitlines():
         row = json.loads(line)
@@ -223,7 +237,16 @@ def write_dataset(
 
         suffix = cfg.format
         for name, relative in TABLE_PATHS.items():
-            rows = sorted(tables[name], key=canonical_json)
+            keys = {
+                "volumes": ("volume_id",),
+                "directories": ("dir_id",),
+                "files": ("file_id",),
+                "file_paths": ("file_id", "valid_from", "path"),
+                "actors": ("actor_id",),
+                "loss_counters": ("volume_id", "hour_start"),
+                "event_truth": ("event_id",),
+            }[name]
+            rows = sorted(tables[name], key=lambda row: tuple(row[k] for k in keys))
             filename = f"{relative}.{suffix}"
             register(filename, write_table(stage / filename, name, rows))
         for name, root in PARTITIONED.items():
@@ -241,9 +264,7 @@ def write_dataset(
                     instant = volume["period_start"]
                     grouped[(volume["volume_id"], instant.astimezone(UTC).date().isoformat())] = []
             for (volume, day), rows in sorted(grouped.items()):
-                rows.sort(
-                    key=lambda row: (row["ingest_time"], row["event_id"], canonical_json(row))
-                )
+                rows.sort(key=lambda row: (row["ingest_time"], row["event_id"]))
                 filename = f"{root}/volume_id={volume}/date={day}/part-00000.{suffix}"
                 register(filename, write_table(stage / filename, name, rows))
         pattern_rows = [
@@ -255,31 +276,34 @@ def write_dataset(
         validate_rows("patterns", pattern_rows)
         path = stage / "truth/patterns.jsonl"
         path.write_text(
-            "".join(canonical_json(row) + "\n" for row in sorted(pattern_rows, key=canonical_json))
+            "".join(
+                canonical_json(row) + "\n"
+                for row in sorted(pattern_rows, key=lambda row: row["pattern_id"])
+            )
         )
         register("truth/patterns.jsonl", len(pattern_rows))
         (stage / "config.resolved.yaml").write_text(
             yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=True)
         )
         register("config.resolved.yaml")
-        report = {
-            "implementation": "synthetic_workloads_events_and_faults",
-            "validation_scope": "schema_and_artifact_integrity",
-            "data_kind": "synthetic",
-            "events": len(tables["events"]),
-            "not_implemented": ["full recovery reports and preset scale/runtime targets (#19)"],
-            **(report_updates or {}),
-        }
+        from .report import build_report, render_summary
+        from .semantic import restore_clean, validate_semantics
+
+        clean = restore_clean(tables)
+        checks = validate_semantics(tables, cfg, pattern_rows, known_gaps, clean=clean)
+        report = build_report(
+            cfg,
+            tables,
+            pattern_rows,
+            known_gaps,
+            report_updates,
+            clean=clean,
+            validation=checks,
+        )
         (stage / "report").mkdir()
         (stage / "report/quality.json").write_text(canonical_json(report) + "\n")
         register("report/quality.json")
-        (stage / "report/summary.md").write_text(
-            "# Synthetic access dataset\n\n"
-            "Fictional workloads, complete read operations and configured telemetry faults.\n"
-            "No modeled contents or measured latency/cache outcomes.\n"
-            f"\nEvents: {len(tables['events'])}. Validation: schema/artifact integrity.\n"
-            "Fault-stage counts are in quality.json. Full recovery reports and scale tuning await #19.\n"
-        )
+        (stage / "report/summary.md").write_text(render_summary(report))
         register("report/summary.md")
         digest = config_hash(cfg)
         git_sha = source_revision()
@@ -324,7 +348,7 @@ def write_dataset(
             "created_at": datetime.now(UTC),
             "limitations": [
                 "synthetic only; not evidence of real-workload model quality",
-                "buffered generation; preset scale/runtime targets and full recovery reports await #19",
+                "buffered generation; runtime depends on preset, output format and host",
                 "P9 writes update catalog history but do not feed back into already generated P1 choices",
             ],
         }

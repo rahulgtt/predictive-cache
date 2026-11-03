@@ -1,5 +1,6 @@
 """P1: project Zipf popularity, local calendars, diurnal rate and recency."""
 
+from bisect import bisect_right
 from datetime import timedelta
 from zoneinfo import ZoneInfo
 
@@ -89,6 +90,12 @@ class Popularity:
         if peak == 0:
             return
         history = {a.actor_id: [] for a in self.users}
+        # Ranked membership changes only at creation/deletion boundaries.
+        boundaries = {
+            pid: sorted({t for f in pool for t in (f.created_at, f.deleted_at) if t is not None})
+            for pid, pool in self.pools.items()
+        }
+        live_pools = {}
         for vi, volume in enumerate(world.volumes):
             users = [a for a in self.users if a.volume_id == volume.volume_id]
             for hi, hour in hours(volume, window):
@@ -116,9 +123,13 @@ class Popularity:
                             if local_rng.random() < factor:
                                 candidates.append((at, actor, pid))
                 for at, actor, pid in sorted(candidates, key=lambda c: (c[0], c[1].actor_id, c[2])):
-                    available = [
-                        (rank, f) for rank, f in enumerate(self.pools[pid], 1) if live(f, at)
-                    ]
+                    epoch = bisect_right(boundaries[pid], at)
+                    if pid not in live_pools or live_pools[pid][0] != epoch:
+                        live_pools[pid] = (
+                            epoch,
+                            [(rank, f) for rank, f in enumerate(self.pools[pid], 1) if live(f, at)],
+                        )
+                    available = live_pools[pid][1]
                     if not available:
                         continue
                     recent = set(history[actor.actor_id])
