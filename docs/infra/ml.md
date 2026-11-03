@@ -165,12 +165,15 @@ it is for compatibility tests only and must never be passed to feature or
 training code. The worker also publishes a finalized ClearML Dataset in
 `predictive-cache/datasets/synthetic`, named by the generator `dataset_id`.
 It contains only `events/`, `catalog/`, `loss/`, `config.resolved.yaml`, and
-the original `manifest.json`; it excludes `truth/` and truth-derived reports.
+a projected `manifest.json`; it excludes `truth/`, truth-derived reports,
+truth-only counts and known-gap annotations. The full generator manifest stays
+in the test-only ZIP. The clean stage derives observation coverage from the
+published loss counters.
 The task's `outputs.synthetic_dataset_id` is the immutable ID to pass to the
 cleaning job. Repeated runs with the same scenario can create another Dataset
 version with the same name; use the exact ID, not the name, for lineage.
-The original manifest still lists the test-only files; downstream cleaning
-verifies hashes for the data files it consumes and never opens `truth/`.
+The projected manifest lists exactly the published files; downstream cleaning
+verifies their hashes and never opens `truth/`.
 
 Use `--config scenario.yaml` instead of `--preset tiny` for a custom scenario;
 `--seed` and `--format` are optional overrides. The YAML is needed on the
