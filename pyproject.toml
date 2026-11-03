@@ -11,6 +11,7 @@ dependencies = ["numpy>=2,<3", "pyarrow>=19,<24", "pydantic>=2.10,<3", "pyyaml>=
 
 [project.scripts]
 pcache-datagen = "predictive_cache.datagen.cli:main"
+pcache-model = "predictive_cache.ml.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
@@ -19,7 +20,7 @@ dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
 packages = ["src/predictive_cache"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests/datagen"]
+testpaths = ["tests/datagen", "tests/ml"]
 
 [tool.ruff]
 target-version = "py312"
