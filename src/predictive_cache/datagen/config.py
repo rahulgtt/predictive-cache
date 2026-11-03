@@ -138,10 +138,62 @@ class FileKinds(Settings):
         return self
 
 
+class SizeDistribution(Settings):
+    median_bytes: Positive
+    sigma: NonNegative = 1.0
+    min_bytes: PositiveCount
+    max_bytes: Annotated[int, Field(gt=0, le=2**63 - 1, strict=True)]
+
+    @model_validator(mode="after")
+    def ordered_bounds(self) -> SizeDistribution:
+        if self.min_bytes > self.max_bytes:
+            raise ValueError("size min_bytes must not exceed max_bytes")
+        return self
+
+
+class SizeDistributions(Settings):
+    doc: SizeDistribution = Field(
+        default_factory=lambda: SizeDistribution(
+            median_bytes=400 * 1024, min_bytes=4 * 1024, max_bytes=50 * 2**20
+        )
+    )
+    drawing: SizeDistribution = Field(
+        default_factory=lambda: SizeDistribution(
+            median_bytes=20 * 2**20, min_bytes=100 * 1024, max_bytes=500 * 2**20
+        )
+    )
+    cad_model: SizeDistribution = Field(
+        default_factory=lambda: SizeDistribution(
+            median_bytes=150 * 2**20, min_bytes=5 * 2**20, max_bytes=4 * 2**30
+        )
+    )
+    image: SizeDistribution = Field(
+        default_factory=lambda: SizeDistribution(
+            median_bytes=4 * 2**20, min_bytes=50 * 1024, max_bytes=200 * 2**20
+        )
+    )
+    media: SizeDistribution = Field(
+        default_factory=lambda: SizeDistribution(
+            median_bytes=300 * 2**20, min_bytes=10 * 2**20, max_bytes=20 * 2**30
+        )
+    )
+    dataset: SizeDistribution = Field(
+        default_factory=lambda: SizeDistribution(
+            median_bytes=2**30, min_bytes=50 * 2**20, max_bytes=50 * 2**30
+        )
+    )
+    small: SizeDistribution = Field(
+        default_factory=lambda: SizeDistribution(
+            median_bytes=8 * 1024, min_bytes=100, max_bytes=256 * 1024
+        )
+    )
+
+
 class Files(Settings):
     target_count: PositiveCount = 5000
     per_dir_mean: Positive = 25
     kinds: FileKinds = Field(default_factory=FileKinds)
+    size_distributions: SizeDistributions = Field(default_factory=SizeDistributions)
 
 
 class Actors(Settings):
