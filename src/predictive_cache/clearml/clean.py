@@ -15,6 +15,8 @@ if __package__ in (None, ""):
 def validate_source_files(root: Path, listed_files: list[str], dataset_name: str) -> str:
     """Check the downloaded source against the generator manifest before cleaning."""
     from predictive_cache.clearml.datasets import data_only_files
+    from predictive_cache.datagen.config import load_config as load_generator_config
+    from predictive_cache.datagen.io import config_hash
     from predictive_cache.datagen.schema import Manifest
 
     root = Path(root)
@@ -24,6 +26,11 @@ def validate_source_files(root: Path, listed_files: list[str], dataset_name: str
     manifest = Manifest.model_validate_json(manifest_path.read_text())
     if manifest.dataset_id != dataset_name:
         raise ValueError("source Dataset name differs from generator manifest dataset_id")
+    if (
+        config_hash(load_generator_config(path=root / "config.resolved.yaml"))
+        != manifest.config_sha256
+    ):
+        raise ValueError("source Dataset resolved config hash differs from manifest")
     expected = {str(path) for path in data_only_files(root, manifest)} | {"manifest.json"}
     if set(listed_files) != expected:
         raise ValueError("source Dataset must contain exactly the data-only manifest files")
@@ -76,6 +83,8 @@ def main(argv: list[str] | None = None) -> None:
         task.execute_remotely(queue_name=args.queue, clone=False)
 
     source = Dataset.get(dataset_id=source_id, only_completed=True)
+    if Task.get_task(task_id=source_id).get_project_name() != "predictive-cache/datasets/synthetic":
+        raise ValueError("source Dataset is not in the synthetic data project")
     source_root = Path(source.get_local_copy())
     source_name = validate_source_files(source_root, source.list_files(), source.name)
     with ExitStack() as stack:

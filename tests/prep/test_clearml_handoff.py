@@ -1,12 +1,15 @@
 """The ClearML clean worker must only consume the data-only generator subset."""
 
+import json
 import shutil
 
 import pytest
+import yaml
 
 from predictive_cache.clearml.clean import validate_source_files
 from predictive_cache.clearml.datasets import data_only_files
 from predictive_cache.datagen.config import load_config
+from predictive_cache.datagen.io import sha256
 from predictive_cache.datagen.pipeline import run
 
 
@@ -30,6 +33,20 @@ def test_truth_free_source_contract(tmp_path):
         )
     with pytest.raises(ValueError, match="name differs"):
         validate_source_files(data_only, listed, "another-dataset")
+    resolved = data_only / "config.resolved.yaml"
+    modified = yaml.safe_load(resolved.read_text())
+    modified["seed"] += 1
+    resolved.write_text(yaml.safe_dump(modified, sort_keys=True))
+    published = json.loads((data_only / "manifest.json").read_text())
+    next(entry for entry in published["files"] if entry["path"] == "config.resolved.yaml")[
+        "sha256"
+    ] = sha256(resolved)
+    (data_only / "manifest.json").write_text(json.dumps(published))
+    with pytest.raises(ValueError, match="resolved config hash"):
+        validate_source_files(data_only, listed, manifest.dataset_id)
+    shutil.copyfile(full / "config.resolved.yaml", resolved)
+    shutil.copyfile(full / "manifest.json", data_only / "manifest.json")
+
     event = next(data_only.glob("events/**/*.parquet"))
     event.write_bytes(b"corrupted")
     with pytest.raises(ValueError, match="corrupted"):
