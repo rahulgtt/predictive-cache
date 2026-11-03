@@ -7,6 +7,7 @@ import os
 import signal
 import stat
 import subprocess
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 
@@ -19,6 +20,7 @@ from .harness import (
     DryRunExecutor,
     catalog_sha256,
     checkpoint_stop_reasons,
+    planned_operations,
     reconcile,
 )
 from .io import (
@@ -29,6 +31,7 @@ from .io import (
     sha256,
 )
 from .models import (
+    AdapterValidationPermit,
     Checkpoint,
     CleanupScheduleRecord,
     CollectionManifest,
@@ -36,21 +39,12 @@ from .models import (
     FixtureCatalog,
     ReconciliationReport,
 )
-
-APPROVED_PROVIDER_PACKAGE_SHA256 = (
-    "3c6d3a4cb164cc4df87c36480dab49621e140f9307a170e393233eb8221feece"
-)
-APPROVED_PROVIDER_SHA256 = (
-    "51d92af0b0beab61ac77dd4dd7b5d19cd9a4fd83e4a709e74582b3be244682d4"
-)
-APPROVED_COLLECTOR_SHA256 = (
-    "09158174889f25a6abd7a70a33d24ad1d2efaba3f8ec935e0d5344eba5959225"
-)
-APPROVED_VALIDATOR_SHA256 = (
-    "8d3dc5aad205c6fca55aa8b7c34e933906ca3f7758befb9c1bdf1d835c53e7da"
-)
-APPROVED_VALIDATION_RUNBOOK_SHA256 = (
-    "cf5e2238aa026aa5f3f8f80c7e46b8658859a349c3a2748b7a425e4bb3b405be"
+from .provenance import (
+    APPROVED_COLLECTOR_SHA256,
+    APPROVED_PROVIDER_PACKAGE_SHA256,
+    APPROVED_PROVIDER_SHA256,
+    APPROVED_VALIDATION_RUNBOOK_SHA256,
+    APPROVED_VALIDATOR_SHA256,
 )
 
 
@@ -262,6 +256,27 @@ def run(
         )
     manifest = load_model(run_dir / "manifest.json", CollectionManifest)
     catalog = load_model(run_dir / "fixture-catalog.json", FixtureCatalog)
+    if validation_operations is not None:
+        _validate_full_profile(manifest)
+        planned = planned_operations(manifest, catalog)[:validation_operations]
+        atomic_write_model(
+            run_dir / "adapter-validation-permit.json",
+            AdapterValidationPermit(
+                permit_id=str(uuid.uuid4()),
+                run_id=manifest.run_id,
+                full_manifest_sha256=sha256(run_dir / "manifest.json"),
+                validation_operations=validation_operations,
+                operation_indexes=tuple(item[0] for item in planned),
+                operation_ids=tuple(item[4] for item in planned),
+                provider_package_sha256=APPROVED_PROVIDER_PACKAGE_SHA256,
+                provider_sha256=APPROVED_PROVIDER_SHA256,
+                collector_sha256=APPROVED_COLLECTOR_SHA256,
+                validator_sha256=APPROVED_VALIDATOR_SHA256,
+                runbook_sha256=APPROVED_VALIDATION_RUNBOOK_SHA256,
+                status="approved",
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+            ),
+        )
     if dry_run:
         executor = DryRunExecutor()
         runner = CollectionRunner(sleep=lambda _: None)
@@ -311,7 +326,14 @@ def run(
         validation_mode=validation_operations is not None,
     )
     if validation_operations is not None:
-        subprocess.run([adapter_command, run_dir], check=True)
+        subprocess.run(
+            [
+                adapter_command,
+                run_dir,
+                run_dir / "adapter-validation-permit.json",
+            ],
+            check=True,
+        )
         subprocess.run([cleaner_command, run_dir], check=True)
     click.echo(f"offered={count}")
 

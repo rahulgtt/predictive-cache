@@ -191,6 +191,17 @@ python -m predictive_cache.collection.cli run \
 This still performs provider checkpoint/pre-read/post-read, aligned O_DIRECT
 fixture I/O, canonical observed publication, adapter ingestion and cleaning
 under the normal stop rules. It is validation evidence, not the five-hour run.
+Before the first READ, the harness immutably writes
+`adapter-validation-permit.json`. The permit binds the unchanged full
+300-operation manifest hash, exact deterministic first one-to-three operation
+indexes and IDs, one-hour expiry, unique permit ID, and the approved
+package/provider/collector/validator/runbook hashes. The adapter receives that
+permit explicitly. Without it, the adapter still requires all 300 ledger rows;
+the permit cannot authorize a non-prefix row, a rewritten manifest, or more
+than three operations. The harness invokes the adapter callback with exactly
+two arguments: `RUN_DIR` and the immutable permit path. The wrapper must pass
+that second argument as the importer's explicit `--validation-permit`; permit
+auto-discovery from a short ledger is forbidden.
 
 Hash byte sources are non-self-referential:
 

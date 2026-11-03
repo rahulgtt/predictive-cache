@@ -126,6 +126,34 @@ class RetentionPolicy(StrictModel):
     retain_until: None = None
 
 
+class AdapterValidationPermit(StrictModel):
+    validation_permit_version: Literal[1] = 1
+    permit_id: CanonicalUuid
+    run_id: SafeId
+    full_manifest_sha256: Sha256
+    validation_operations: int = Field(ge=1, le=3)
+    operation_indexes: tuple[int, ...]
+    operation_ids: tuple[Sha256, ...]
+    provider_package_sha256: Sha256
+    provider_sha256: Sha256
+    collector_sha256: Sha256
+    validator_sha256: Sha256
+    runbook_sha256: Sha256
+    status: Literal["approved"]
+    expires_at: datetime
+
+    _expires_utc = field_validator("expires_at")(_utc)
+
+    @model_validator(mode="after")
+    def exact_prefix_shape(self) -> AdapterValidationPermit:
+        expected = tuple(range(self.validation_operations))
+        if self.operation_indexes != expected:
+            raise ValueError("validation operation indexes must be the exact prefix")
+        if len(self.operation_ids) != self.validation_operations:
+            raise ValueError("validation operation IDs must match the approved count")
+        return self
+
+
 class CollectionManifest(StrictModel):
     manifest_version: Literal[2] = 2
     run_id: SafeId

@@ -39,8 +39,8 @@ the output report and manifest runtime metadata.
 | Collection manifest | Frozen v2 five-hour synthetic NFSv4.1 READ run, Warmer disabled, canonical volume/export identity, schema/image hashes, source-compatible `run_ref`, unique non-overlapping `range_offsets`, checkpoint tolerance, untagged-correlation window, tag mode and stop rules. |
 | Offered ledger | Durable pre-issue operation records with canonical operation IDs, fixture identity, range, client and exact tag. |
 | Observed JSONL | Authoritative durable/excluded disposition and offered-operation correlation. |
-| Fixture catalog | Canonical v2 32-hex volume ID, 64-hex file ID, numeric export ID, decoded export name, fixture directory and immutable controlled path/size. |
-| Checkpoints | Twenty records per pod/epoch with exact 15-minute `scheduled_at`, `captured_at` no more than 30 seconds late, Chimera's 1-based sequences and exact producer-epoch UUID. |
+| Fixture catalog | Canonical v2 32-hex volume ID, 64-hex file ID, numeric export ID, export name/path, fixture directory and immutable controlled path/size. |
+| Checkpoints | Twenty-one records per pod/epoch from run start through the final 15-minute boundary, with `captured_at` no more than 30 seconds late and exact producer identity/watermarks. |
 
 ### Single-writer boundary
 
@@ -103,7 +103,7 @@ fail closed. Empty tags remain `origin=synthetic`.
 ## Identity, range and result rules
 
 - Raw volume/file IDs must exactly match a fixture on `(volume_id, file_id)`.
-- Raw numeric export ID and decoded export name must match the run, fixture
+- Raw numeric export ID and decoded absolute export path must match the fixture
   and offered record. Missing or conflicting identity fails closed.
 - The fixture's `dir_id` supplies the event directory; the adapter never
   invents a directory ID.
@@ -118,18 +118,23 @@ fail closed. Empty tags remain `origin=synthetic`.
 
 ## Sequence, checkpoint and loss reconciliation
 
-- Every source file has one exact pod/epoch envelope, and the checkpoint and
-  envelope `(pod_name, pod_uid, producer_epoch)` identity sets must agree.
-- Chimera producer sequences must be in file order and contiguous from `1`.
-- Each pod/epoch has exactly twenty scheduled checkpoints. Missing records or
+- Every source file has one exact producer envelope, and checkpoint/source
+  `(pod_name, pod_uid, node_name, producer_epoch)` identity sets must agree.
+- The exact start checkpoint supplies each stream's immutable sequence
+  baseline `B`. Run raw/sidecar/observed rows must remain in source order at
+  exactly `B+1..B+N`; historical rows at or below `B`, gaps, duplicates,
+  rollback and cross-epoch resets fail closed.
+- Each pod/epoch has exactly twenty-one scheduled checkpoints. Missing records or
   capture later than `checkpoint_tolerance_s` after the scheduled time fail
   the import.
 - Epoch changes, sequence resets, unexplained restarts, drops, unhealthy
   state, parse/identity/checksum/read errors and latency guardrail breaches
   fail the import.
-- The final checkpoint must prove
-  `last_enqueued_sequence == last_synced_sequence == synced_count ==
-  raw event count`, with zero queue depth and no worker in flight.
+- For a full run, the final checkpoint must prove
+  `last_enqueued_sequence == last_synced_sequence == synced_count == B + raw
+  event count`, with zero queue depth and no worker in flight. A bounded
+  validation permit accepts only the captured schedule prefix and still
+  requires exact `B+1..B+N` raw/sidecar/observed continuity.
 - Every offered operation has exactly one durable or approved-excluded
   disposition. Unknown, missing, duplicate, contradictory and unexpected
   dispositions fail closed.
