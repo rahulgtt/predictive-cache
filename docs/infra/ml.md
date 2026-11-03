@@ -140,6 +140,35 @@ evidence only, never model-quality claims.
 | A task is stuck in a queue | Check the queue name (`default` for steps, `services` for controllers) and the worker status, then ask the owner |
 | Restart, upgrade, resize, disk full | Ask the owner. The VM is managed outside this repo. |
 
+### Datagen task smoke run
+
+The optional `pcache-clearml-datagen` entrypoint in this repo is a single
+compute task, not the full pipeline. From a committed checkout with SDK
+credentials configured (§2), run:
+
+```bash
+uv sync --locked --extra clearml
+uv run --extra clearml python src/predictive_cache/clearml/datagen.py --preset tiny --queue default
+```
+
+The submitting process records the resolved scenario in ClearML before it
+queues the task. A worker reuses that scenario, generates into a fresh temporary
+directory, validates the complete output, and uploads a synchronous
+`synthetic-dataset-test-only` task artifact. That archive includes `truth/`:
+it is for compatibility tests only and must never be passed to feature or
+training code. It is not the finalized, truth-separated ClearML Dataset
+convention in §3. The future pipeline must resolve that packaging contract
+before using a datagen output as its input.
+
+Use `--config scenario.yaml` instead of `--preset tiny` for a custom scenario;
+`--seed` and `--format` are optional overrides. The YAML is needed on the
+submitting machine only. The ClearML configuration can be edited on a cloned
+task and rerun. `--local` runs with tracking on the submitting machine;
+`--no-track --out /tmp/fresh-dir` runs without ClearML for a local check.
+Start with `tiny`; larger preset row and runtime targets are not verified.
+Check the task console, validation result, artifact, code revision and resolved
+scenario before treating a run as complete.
+
 ## 6. Not decided yet
 
 - **Pipelines** (datagen → clean → snapshots → train → eval → register):

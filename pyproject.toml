@@ -9,7 +9,11 @@ description = "Synthetic access-event foundation for Predictive Cache"
 requires-python = ">=3.12,<3.13"
 dependencies = ["numpy>=2,<3", "pyarrow>=19,<24", "pydantic>=2.10,<3", "pyyaml>=6,<7", "click>=8.1,<9"]
 
+[project.optional-dependencies]
+clearml = ["clearml>=2.1,<2.2"]
+
 [project.scripts]
+pcache-clearml-datagen = "predictive_cache.clearml.datagen:main"
 pcache-datagen = "predictive_cache.datagen.cli:main"
 pcache-model = "predictive_cache.ml.cli:main"
 
