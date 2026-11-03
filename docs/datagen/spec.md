@@ -586,7 +586,7 @@ e.g. "only P2 + P8".
 
 | Preset | Volumes | Files | Users | Weeks | Approx. events | Runtime target | Use |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `tiny` | 1 | ~300 | 10 | 2 | 10k–50k | < 10 s | Unit tests, CI, JSONL fixtures |
+| `tiny` | 1 | ~300 | 10 | 2 | 10k–50k | < 10 s | Manual smoke tests, JSONL fixtures |
 | `small` | 1 | ~5k | 50 | 8 | 1–3 M | < 2 min | Dev loop, recovery checks |
 | `medium` | 3 (different tz, one DST) | ~50k | 300 | 12 | 10–30 M | < 15 min | Scale/perf of downstream code |
 
@@ -791,7 +791,7 @@ never commit generated data except tiny JSONL fixtures under `tests/`.
 | [#16](https://github.com/rahulgtt/predictive-cache/issues/16) | Patterns II: P2, P3, P5, P6 | §7 |
 | [#17](https://github.com/rahulgtt/predictive-cache/issues/17) | Event realization and churn (P9) | §8 |
 | [#18](https://github.com/rahulgtt/predictive-cache/issues/18) | Fault injection and loss accounting | §5.3, §9 |
-| [#19](https://github.com/rahulgtt/predictive-cache/issues/19) | Validation, report, recovery checks, presets, CI | §10.3, §12, §13 |
+| [#19](https://github.com/rahulgtt/predictive-cache/issues/19) | Validation, report, recovery checks, presets | §10.3, §12, §13 |
 
 #13 should land first, but #14–#18 can start in parallel against §11 using
 stubs. #19's rules can be built against fixtures and run end to end last.
@@ -1013,14 +1013,15 @@ accounting and is not an independent noise-detection score.
 Recovery failures are distinct from structural corruption: the command checks
 the dataset contract while reports expose planted-pattern results. Controlled
 positive/negative fixtures and sufficiently populated fault-rate tests gate
-the report formulas in CI. Production consumers must never read recovery
+the report formulas when tests are run manually. Production consumers must never read recovery
 truth as features or use simulated restoration as their cleaner.
 
 Parquet timestamp conversion and schema checks use exact typed paths; JSONL
 retains strict value validation. Wire schemas and deterministic data-file
-guarantees remain unchanged. The tiny CI job measures generation plus semantic
-validation after environment setup, including Python package imports, and
-checks both runtime and the 10k–50k observed-row range.
+guarantees remain unchanged. Tiny was measured locally for generation plus
+semantic validation after environment setup, including Python package imports,
+and checked against the runtime and 10k–50k observed-row targets. Automated
+GitHub workflows are excluded at the user's request for this one-time generator.
 
 [Downstream guide](downstream-guide.md) provides commands, loading/filtering
 examples, dataset sharing, origin semantics, gap handling and as-of catalog

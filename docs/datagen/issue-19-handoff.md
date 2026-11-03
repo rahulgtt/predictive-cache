@@ -11,7 +11,7 @@ Status: partial #19; larger preset acceptance remains open. No real access data.
 | Corruption rejected per rule | Schema, references, pairing, totals, ranges, loss, leakage, truth and hash corruption fixtures; valid injected faults restore correctly | Passed |
 | Counts, hourly histogram, popularity, size/fault/origin report | quality.json and readable summary.md; explicit measurement bases and denominators | Passed |
 | P1–P8 recovery checks | Existing controlled generator tests plus positive/negative/sparse report checks; mixed cases are diagnostic | Passed within controlled fixture scope |
-| Tiny 10k–50k rows, generation + validation under 10s | 13,092 rows in 4.343s locally; CI runs the same timed path | Local passed; CI result recorded on PR |
+| Tiny 10k–50k rows, generation + validation under 10s | 13,092 rows in 4.343s locally | Local passed; automated CI excluded by user request |
 | Small 1–3M rows under 120s | Default before final scan optimizations: 529,709 rows, generation alone 122.386s. Final tuning attempt: 693,947 rows, 184.357s including validation | Not met |
 | Medium 10–30M rows under 15min | Not benchmarked; buffered memory use is a constraint on this host | Unverified |
 
@@ -49,8 +49,9 @@ Reproduce the functional checks from the checkout:
 .venv/bin/pcache-datagen describe /tmp/my-pcache-tiny
 ```
 
-The CI workflow shows the exact timed Python harness; dependency installation
-is outside the 10-second measurement. Generated artifacts stay outside Git.
+Checks are run manually for this one-time data-generation use case. No GitHub
+Actions workflow is included, per the user's scope decision. Dependency setup
+is outside the timing measurement. Generated artifacts stay outside Git.
 
 ## Review and next action
 
