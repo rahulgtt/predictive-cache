@@ -2,6 +2,7 @@
 
 from . import baselines as _baselines  # noqa: F401  (registers baseline-*)
 from . import dummy as _dummy  # noqa: F401  (registers dummy-constant)
+from . import logreg as _logreg  # noqa: F401  (registers logreg-v1; sklearn only at fit time)
 from .package import LoadedPackage, PackageError, load_package, write_package
 from .scorer import KEY_COLUMNS, Scorer, register_scorer, scorer_class
 

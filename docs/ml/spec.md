@@ -212,30 +212,53 @@ stored in `model.json`:
 ### 6.3 `pcache-train`
 
 ```text
-pcache-train --snapshots DIR --out DIR [--config FILE] [--models logreg-v1,baseline-mru,...] [--no-track]
+pcache-train (--snapshots DIR | --snapshots-dataset ID) [--out DIR] [--config FILE]
+             [--models logreg-v1,baseline-mru,...] [--tag T ...] [--queue Q] [--no-track]
+pcache-model fake-snapshots --out DIR [--seed N] [--days N]   # schema-valid fixture with a planted signal
 ```
 
+- **Input:**
+  - a local data-prep snapshot directory, or a ClearML Dataset ID
+    (`Dataset.get(...).get_local_copy()`);
+  - the snapshots manifest must carry `serving_contract` (data-prep §8.6);
+  - `pcache-model fake-snapshots` writes a `data_kind: fixture` directory
+    in the same layout, so training can run before data prep produces
+    real snapshots.
 - **Reads only the `train` and `val` splits.** Reading any `split=test`
-  file is a bug, and a test asserts it never happens.
+  file is a bug. A test corrupts the test files and asserts training
+  still succeeds.
 - **Output:**
-  - `packages/<model_type>/` for each model;
+  - `packages/<model_type>-<package_id>/` and `.zip` for each model;
   - `val_report.json` and `val_report.md` (§7 metrics on val for every
     model);
   - `train_manifest.json` (stage `train`, parent snapshots dataset, config
     hash, git sha).
 - **With tracking (§9):**
-  - one ClearML task `train:<model_type>` per model in
-    `predictive-cache/train`;
-  - val metrics logged as scalars, and the package zip uploaded and
-    registered as an OutputModel tagged `candidate`, with metadata
-    `package_id`.
+  - **one** ClearML task `train:<models>` per run in
+    `predictive-cache/train`, with `inputs` (the dataset ID) and the
+    `train` config connected, so a cloned task can be edited and
+    re-enqueued;
+  - val metrics logged as scalars per model, and the C sweep;
+  - each package zip registered as an OutputModel named by `model_type`,
+    tagged `candidate` and `data:<kind>`, with metadata `package_id`.
+  - Deviation from earlier drafts (one task per model): ClearML allows one
+    task per process, and one task keeps the dataset parameter in one
+    place.
+- **Tracking switches on only when a server is explicitly configured**
+  (`CLEARML_API_HOST`, `CLEARML_CONFIG_FILE` or `~/clearml.conf`). An
+  unconfigured SDK must never fall back to a public demo server.
+- **Remote runs:** `src/predictive_cache/clearml/train.py` is the
+  file-path entry agents re-run (same pattern as the datagen task). `--queue`
+  requires `--snapshots-dataset`, because agents can't see local
+  directories.
 - **Serving-policy selection on val:** candidate thresholds are
   **quantiles of this model's val scores** at
   `{0, 0.5, 0.8, 0.9, 0.95}`. Quantile 0 means no threshold
   (`min_score: null` in the package; JSON has no −∞), so negative-score
   baselines such as MRU still plan.
   - For each threshold, compute the primary metric on val with the §7.1
-    selector applied only to rows with `score ≥ min_score`.
+    selector applied only to rows with `score ≥ min_score`. A threshold
+    that excludes no row is skipped, since it's the same as none.
   - Choose the **highest** threshold whose primary value is ≥
     `train.serving_policy.min_score_keep` (0.95) × the unthresholded
     value. This saves bytes at little recall cost; if none qualifies,
@@ -957,10 +980,12 @@ created once datagen and data prep are close to done.
 
 ```toml
 [project.optional-dependencies]
-ml = ["scikit-learn>=1.5,<2", "matplotlib>=3.9,<4"]       # training + eval reports
-tracking = ["clearml>=1.16,<2"]
-controller = ["clearml>=1.16,<2"]                         # model fetch; runtime scoring is numpy/pyarrow only
+clearml = ["clearml>=2.1,<2.2"]                           # tracking, datasets, model registry, remote runs
+ml = ["scikit-learn>=1.5,<2"]                             # training only; runtime scoring is numpy/pyarrow only
 ```
+
+`matplotlib` for evaluation curves is added with #58. The Controller
+needs only `clearml` (to fetch packages) on top of the base dependencies.
 
 The Controller uses the stdlib `http.server` (a threading server) for
 `/v1/events` and the health endpoints. There is no web framework in v1.
