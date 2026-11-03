@@ -3,9 +3,10 @@
 Read [AGENTS.md](../../AGENTS.md), [README.md](../../README.md), and the linked
 issue before work. README owns architecture, contracts, evidence gates, and
 terminology. This workflow adds coordination, not another design or backlog.
-The repository currently contains design documentation, with no Controller,
-Warmer, pipeline, or benchmark implementation. Python is the intended starting
-language; the two deployables remain Controller and bounded read-only NFS Warmer.
+The repository includes a synthetic datagen foundation and an experimental
+manual NFS reader, but no Controller, automated Warmer service, complete
+pipeline, or benchmark. Python is the intended starting language; the two
+proposed deployables remain Controller and bounded read-only NFS Warmer.
 
 ## Roles and authority
 

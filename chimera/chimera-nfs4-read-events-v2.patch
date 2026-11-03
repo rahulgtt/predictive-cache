@@ -1,0 +1,3197 @@
+diff --git a/docs/configuration.md b/docs/configuration.md
+index c4cc602a7defc309dd0cd4978f9e310b63758639..dc8ae3c7671bc69fe0b68fd37cc30d40e5542d46 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -110,6 +110,8 @@ the canonical place to set them.
+ | `portmap_hostname` | string | — | Hostname/IP to advertise in portmap registrations. |
+ | `nfs4_session_slots` | int | `64` | Max in-flight compounds per NFSv4.1 session. |
+ | `nfs4_delegations` | bool | `false` | Hand out NFSv4 read/write delegations. |
++| `nfs4_read_correlation` | bool | `false` | Produce NFSv4.1 READ decision events. |
++| `nfs4_read_event_path` | string | — | Owner-only JSONL sink for READ events. Recommended whenever correlation is enabled. |
+ | `nfs4_lease_time` | int (s) | `90` | NFSv4 lease duration. |
+ | `nfs4_grace_time` | int (s) | `180` | NFSv4 grace period after restart (state reclaim window). |
+ | `nfs4_courtesy_time` | int (s) | `86400` | How long expired-but-courteous client state is retained. |
+@@ -133,6 +135,123 @@ See [Advanced and testing options](#advanced-and-testing-options) for a small se
+ of keys that exist for development and benchmarking and should not be used on a
+ production server.
+ 
++#### NFSv4 READ events
++
++When `nfs4_read_correlation` is enabled, Chimera attempts one INFO event with
++`schema=nfs4_read_v2` for each first-execution NFSv4.1 session `READ` reaching
++its decision layer. NFSv4.0, replayed cached compounds, and READs not reached
++because an earlier operation failed do not emit. The record includes a random
++process-local `local_id`, producer epoch/sequence, request decision
++`event_time_ns`, worker serialization `sink_time_ns`, target creation time,
++backing `volume_id`, canonical SHA-256 `file_id`, base64url export name, a
++base64url wrapped NFS `target_fh`, hashed client/session evidence, deterministic
++operation ID, compound operation/slot/sequence indexes, bounded compound tag
++plus digest, requested range, returned bytes, NFS status, outcome, EOF, and
++optional post-read file size.
++
++`file_id` is SHA-256 over
++`"chimera-read-v2\0" || mount_id[16] || BE16(inner_fh_len) || inner_fh`; export
++aliases and re-wrapping under a rotated NFS FH key therefore retain one model
++identity. `operation_id` is SHA-256 over
++`"chimera-read-op-v2\0" || sessionid[16] || BE32(slotid) || BE32(sequenceid) ||
++BE32(compound_op_index)`, making multi-READ compounds distinct while cached
++replay remains silent. Raw client and session identifiers are not logged.
++
++`sink_time_ns` is an availability timestamp for normalizer `ingest_time` /
++`known_at`; `event_time_ns` remains the request event time. Normally sink time
++is later, but wall-clock adjustment means consumers must not require a strict
++ordering between the two.
++
++`target_fh` is an executable opaque locator: a suitably authorized private
++warmer can use it with `PUTFH` followed by `OPEN(CLAIM_FH)` without resolving a
++mutable path. It does not bypass normal NFS credentials, export policy, ACL, or
++share checks, but it exposes stable file identity and must therefore be treated
++as sensitive capability-like data. This MVP writes it to the ordinary INFO
++log. That is a deliberate non-production privacy boundary: restrict log access,
++retention, and export before enabling the stream. No file data is emitted.
++
++The raw compound tag is copied into the event with a 256-byte bound, base64url
++encoded for logging, and accompanied by its original length, truncation flag,
++and SHA-256 digest. Structured tags have the exact 104-byte ASCII form
++`pc1:<role>:<plan_ref32hex>:<task_ref32hex>:<nonce32hex>`, where role is `w`
++(warmer), `d` (controlled demand), or `s` (synthetic). Such roles are reported
++as `origin_claim` with `origin_trust=client_asserted`; invalid/unstructured
++tags report `origin_claim=unknown origin_trust=client_asserted`. Chimera never labels an
++ordinary READ as trusted foreground demand.
++
++For deterministic training-data retrieval, set `nfs4_read_event_path` to a
++dedicated file on an owner-only persistent mount. The worker appends one bounded
++JSON object per line. It opens nonblocking with `O_NOFOLLOW`, accepts only a
++regular file owned by the daemon user with one link, and only then forces mode
++`0600`; FIFOs, sockets, devices, directories, symlinks, wrong-owner files, and
++empty/overlong paths are rejected. It calls `fdatasync` before publishing the
++event's synced watermark. On a partial write or sync failure it truncates back
++to the pre-record offset so a later retry cannot leave malformed JSONL. It
++drains the queue and flushes the sink during normal teardown. The file rotates
++at 64 MiB to a single `.1` backup using directory-relative operations and
++directory fsyncs, bounding each pod's sink footprint to approximately 128 MiB.
++File I/O is performed only by the event worker; NFS request threads retain the
++same bounded trylock enqueue and never wait for storage. If the file cannot be
++opened or written, the worker counts a `stage="sink"` drop and retries opening
++it on the next event.
++
++The ordinary INFO line is diagnostic and may still be rejected by the shared
++nonblocking logger; it is not the authoritative training transport. An empty
++compound tag is valid and is rendered as an empty `compound_tag_b64` value.
++
++The event records an operation decision before compound serialization, not
++wire delivery or client receipt; a later compound-level error may replace the
++response. It deliberately identifies a pseudonymous backing volume and file,
++and includes an executable wrapped target FH, but does not report CUFS cache
++state. Treat the stream as sensitive access-pattern and object-identity data:
++limit it to the PoC owner/dispatcher, use the shortest practical retention,
++prevent broad log export, and securely delete it after the experiment.
++Re-executed retransmissions have distinct event IDs, while cached NFS replays
++and READs not reached because an earlier compound operation failed have no
++event. NFSv3, SMB, S3, `READ_PLUS`, and internal reads are not covered.
++
++The stream is best effort, not an audit log. Queue admission, encoding, sink
++I/O, rollback, rotation, and diagnostic logging may fail. Process-local
++`chimera_nfs4_read_events_dropped{stage="queue"}` counts failures to timestamp
++or enqueue, including queue contention and saturation; `stage="encode"` counts
++invalid bounded event data; `stage="sink"` counts JSONL open/write/sync errors;
++and `stage="log"` counts diagnostic logger admission failures, including
++disabled or below-INFO logging. `stage="rollback"` counts a failure to truncate
++a partial record; `stage="rotation"` counts a failure in the durable rotation
++sequence. The worker publishes counter updates
++periodically; counters reset on restart. A successful JSONL line with zero
++queue/encode/sink drops is the delivery acceptance criterion; `stage="log"`
++does not affect authoritative sink delivery. Events are independent of sampled
++tracing.
++
++`chimera_nfs4_read_event_state{state=...}` exposes:
++
++- `last_enqueued_sequence`: newest event admitted to the in-process queue;
++- `last_synced_sequence`: newest producer sequence whose JSONL record completed
++  `fdatasync`;
++- `synced_count`: total records synced by this process;
++- `queue_depth`: events still waiting in the worker queue;
++- `worker_in_flight`: one while the worker is encoding/writing/syncing an event;
++- `delivery_clean`: epoch-scoped latch initialized to one and permanently set
++  to zero by any queue/encode/sink/rollback/rotation drop;
++- `barrier_ready`: coherent worker snapshot equal to one only when
++  `last_enqueued_sequence == last_synced_sequence`, queue depth is zero, and no
++  event is in flight. A publisher rechecks `delivery_clean` after publishing
++  candidate readiness, so a concurrent foreground drop cannot restore ready.
++
++`chimera_nfs4_read_event_producer_info{producer_epoch="<uuid>"} 1` exposes the
++exact, lossless producer epoch carried by JSONL records. The epoch is created
++once per NFS event-service initialization and remains immutable until teardown;
++an NFS service reinitialization in the same pod creates a new epoch. Collectors
++must reject a JSONL record whose epoch does not match the live producer info
++metric and must never subtract counters across epochs.
++
++A line becoming visible is not durability proof. Consumers must wait until the
++line's `producer_sequence` is at most `last_synced_sequence`, `queue_depth` is
++zero, `worker_in_flight` is zero, `delivery_clean` and `barrier_ready` are one,
++and
++queue/encode/sink/rollback/rotation drops remain zero.
++
+ #### `server.smb_auth`
+ 
+ Domain-authentication backends for SMB.
+diff --git a/src/common/logging.c b/src/common/logging.c
+index 8f287e75c0c2b9c0378aac597474ac1144c9ec6a..4d9b372ff56b43c755dc39100cfe2b6422fce448 100644
+--- a/src/common/logging.c
++++ b/src/common/logging.c
+@@ -390,6 +390,64 @@ chimera_vlog(
+     pthread_mutex_unlock(&ChimeraLogBufLock);
+ } /* chimera_vlog */
+ 
++SYMBOL_EXPORT int
++chimera_log_try_info(
++    const char *mod,
++    const char *file,
++    int         line,
++    const char *fmt,
++    ...)
++{
++    char            message[2048];
++    char            entry[3072];
++    struct timespec ts;
++    struct tm       tm_info;
++    va_list         args;
++    int             n, length;
++
++    if (ChimeraLogDisabled || ChimeraLogLevel < CHIMERA_LOG_INFO) {
++        return 0;
++    }
++
++    va_start(args, fmt);
++    n = vsnprintf(message, sizeof(message), fmt, args);
++    va_end(args);
++    if (n < 0 || (size_t) n >= sizeof(message)) {
++        return 0;
++    }
++
++    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
++        return 0;
++    }
++    chimera_timet2tmZ(ts.tv_sec, &tm_info);
++    length = snprintf(entry, sizeof(entry),
++                      "time=%04d-%02d-%02dT%02d:%02d:%02d.%09ldZ message=\"%s\""
++                      " process=%" PRIu64 " thread=%" PRIu64
++                      " level=info module=%s source=\"%s:%d\"\n",
++                      tm_info.tm_year + 1900, tm_info.tm_mon + 1,
++                      tm_info.tm_mday, tm_info.tm_hour, tm_info.tm_min,
++                      tm_info.tm_sec, ts.tv_nsec, message,
++                      (uint64_t) getpid(), (uint64_t) gettid(),
++                      mod, file, line);
++    if (length < 0 || (size_t) length >= sizeof(entry)) {
++        return 0;
++    }
++    if (pthread_mutex_trylock(&ChimeraLogBufLock) != 0) {
++        return 0;
++    }
++    if (!ChimeraLogBuf ||
++        (size_t) (ChimeraLogBuf + CHIMERA_LOG_BUF_SIZE - ChimeraLogBufPtr) <=
++        (size_t) length) {
++        pthread_mutex_unlock(&ChimeraLogBufLock);
++        return 0;
++    }
++
++    memcpy(ChimeraLogBufPtr, entry, length + 1);
++    ChimeraLogBufPtr += length;
++    pthread_mutex_unlock(&ChimeraLogBufLock);
++    return 1;
++} /* chimera_log_try_info */
++
+ SYMBOL_EXPORT void
+ __chimera_debug(
+     const char *mod,
+diff --git a/src/common/logging.h b/src/common/logging.h
+index baa89f64a6d6e8961238b5552fb72e469f5c6505..5803c7b09435e140eb6668a4ec16247baf43e4b5 100644
+--- a/src/common/logging.h
++++ b/src/common/logging.h
+@@ -47,6 +47,15 @@ chimera_vlog(
+     const char *fmt,
+     va_list     argp);
+ 
++/* Try to enqueue one complete INFO line without waiting for the log buffer. */
++int
++chimera_log_try_info(
++    const char *mod,
++    const char *file,
++    int         line,
++    const char *fmt,
++    ...);
++
+ void __chimera_debug(
+     const char *mod,
+     const char *file,
+diff --git a/src/common/tests/CMakeLists.txt b/src/common/tests/CMakeLists.txt
+index 0aa788541522e64a36a3d1ad7dd653d030f06f8a..88e3d13c5ba1d09eea75855c62317c4489f49a57 100644
+--- a/src/common/tests/CMakeLists.txt
++++ b/src/common/tests/CMakeLists.txt
+@@ -4,4 +4,8 @@
+ 
+ add_executable(rbtree_test rbtree_test.c)
+ 
+-add_test(chimera/common/rbtree_test rbtree_test)
+\ No newline at end of file
++add_test(chimera/common/rbtree_test rbtree_test)
++
++add_executable(log_try_info_test log_try_info_test.c ../snprintf.c)
++target_link_libraries(log_try_info_test evpl unwind pthread dl)
++add_test(chimera/common/log_try_info_test log_try_info_test)
+\ No newline at end of file
+diff --git a/src/common/tests/log_try_info_test.c b/src/common/tests/log_try_info_test.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd76b3f6897ba994c0673c88d3ec4109963bf2e0
+--- /dev/null
++++ b/src/common/tests/log_try_info_test.c
+@@ -0,0 +1,70 @@
++// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
++//
++// SPDX-License-Identifier: LGPL-2.1-only
++
++#define _GNU_SOURCE 1
++
++#undef NDEBUG
++#include <assert.h>
++#include <string.h>
++
++#include "../logging.c"
++
++int
++main(void)
++{
++    static char buffer[CHIMERA_LOG_BUF_SIZE];
++    char        oversized[2049];
++    char       *after_success;
++    char       *event_entry;
++    char       *message_start;
++    char       *message_end;
++
++    ChimeraLogBuf    = buffer;
++    ChimeraLogBufPtr = buffer;
++    assert(chimera_log_try_info("test", "test.c", 1, "value=%d", 42));
++    assert(strstr(buffer, "message=\"value=42\""));
++    after_success = ChimeraLogBufPtr;
++
++    event_entry = after_success;
++    assert(chimera_log_try_info(
++               "nfs", "nfs4_read_events.c", 1,
++               "schema=nfs4_read_v2 local_id=id export_name_b64=dm9sdW1lLTc"
++               " target_fh=AAECAw operation_id=abcd file_size=4096"));
++    message_start = strstr(event_entry, "message=\"");
++    assert(message_start);
++    message_start += strlen("message=\"");
++    message_end = strstr(message_start, "\" process=");
++    assert(message_end);
++    assert(strstr(message_start, "export_name_b64=dm9sdW1lLTc"));
++    assert(strstr(message_start, "target_fh=AAECAw"));
++    assert(strstr(message_end, " level=info module=nfs "));
++    assert(memchr(message_start, '"', (size_t) (message_end - message_start)) == NULL);
++    after_success = ChimeraLogBufPtr;
++
++    pthread_mutex_lock(&ChimeraLogBufLock);
++    assert(!chimera_log_try_info("test", "test.c", 1, "locked"));
++    pthread_mutex_unlock(&ChimeraLogBufLock);
++    assert(ChimeraLogBufPtr == after_success);
++
++    ChimeraLogBufPtr = buffer + sizeof(buffer) - 1;
++    assert(!chimera_log_try_info("test", "test.c", 1, "full"));
++    assert(ChimeraLogBufPtr == buffer + sizeof(buffer) - 1);
++    ChimeraLogBufPtr = after_success;
++
++    memset(oversized, 'x', sizeof(oversized) - 1);
++    oversized[sizeof(oversized) - 1] = '\0';
++    assert(!chimera_log_try_info("test", "test.c", 1, "%s", oversized));
++    assert(ChimeraLogBufPtr == after_success);
++
++    ChimeraLogDisabled = 1;
++    assert(!chimera_log_try_info("test", "test.c", 1, "disabled"));
++    ChimeraLogDisabled = 0;
++    ChimeraLogLevel    = CHIMERA_LOG_ERROR;
++    assert(!chimera_log_try_info("test", "test.c", 1, "filtered"));
++    ChimeraLogLevel  = CHIMERA_LOG_INFO;
++    ChimeraLogBuf    = NULL;
++    ChimeraLogBufPtr = NULL;
++    assert(!chimera_log_try_info("test", "test.c", 1, "uninitialized"));
++    return 0;
++} /* main */
+diff --git a/src/daemon/daemon.c b/src/daemon/daemon.c
+index ed04e43b37f80090520823b9cd33f1eba2af9b4e..5c36f088e9cf0884793ab09e84532dcae1586cc3 100644
+--- a/src/daemon/daemon.c
++++ b/src/daemon/daemon.c
+@@ -569,6 +569,23 @@ main(
+         chimera_server_config_set_nfs4_drc(server_config, json_is_true(json_value));
+     }
+ 
++    json_value = json_object_get(server_params, "nfs4_read_correlation");
++    if (json_is_boolean(json_value)) {
++        chimera_server_config_set_nfs4_read_correlation(server_config, json_is_true(json_value));
++    }
++
++    json_value = json_object_get(server_params, "nfs4_read_event_path");
++    if (json_is_string(json_value)) {
++        const char *path = json_string_value(json_value);
++        if (!path[0] || strlen(path) >= 256) {
++            fprintf(stderr,
++                    "server.nfs4_read_event_path must be 1..255 bytes\n");
++            return 1;
++        }
++        chimera_server_config_set_nfs4_read_event_path(
++            server_config, path);
++    }
++
+     /* force NFSv4.1 session persistence regardless
+      * of CREATE_SESSION4_FLAG_PERSIST.  See server.h for rationale. */
+     json_value = json_object_get(server_params, "nfs4_force_session_persist");
+diff --git a/src/server/nfs/CMakeLists.txt b/src/server/nfs/CMakeLists.txt
+index ec3ae867150a7d948d3189ba5e0cccc99206dbbb..e2b91d24be3d9a70f6b1203b851bc941f13ef92b 100644
+--- a/src/server/nfs/CMakeLists.txt
++++ b/src/server/nfs/CMakeLists.txt
+@@ -5,7 +5,7 @@
+ include_directories(${NFS_COMMON_INCLUDE_DIR})
+ 
+ # Create libraries for NFSv3 and NFSv4
+-add_library(chimera_nfs SHARED nfs.c nfs4_session.c nfs4_state.c nfs4_lease.c nfs4_recovery.c nfs4_drc.c nfs3_drc.c nfs4_v40_drc.c nfs_drc_reply.c nfs4_callback.c nfs_mount.c nfs_portmap.c nfs3_dump.c nfs4_dump.c nfs_trace.c nfs3_trace.c nfs4_trace.c
++add_library(chimera_nfs SHARED nfs.c nfs4_session.c nfs4_state.c nfs4_lease.c nfs4_recovery.c nfs4_drc.c nfs3_drc.c nfs4_v40_drc.c nfs_drc_reply.c nfs4_callback.c nfs_mount.c nfs_portmap.c nfs3_dump.c nfs4_dump.c nfs_trace.c nfs3_trace.c nfs4_trace.c nfs4_read_events.c
+             nfs_fh_keyring.c
+             nfs_external_portmap.c nfs_nlm.c nfs_nlm_state.c nfs_nlm_granted.c nfs_nsm.c nfs_nsm_state.c
+             nfs3_proc_null.c nfs3_proc_getattr.c nfs3_proc_setattr.c nfs3_proc_lookup.c 
+@@ -39,7 +39,7 @@ add_library(chimera_nfs SHARED nfs.c nfs4_session.c nfs4_state.c nfs4_lease.c nf
+             nfs_gss.c)
+ 
+ target_compile_definitions(chimera_nfs PRIVATE XXH_INLINE_ALL)
+-target_link_libraries(chimera_nfs chimera_nfs_common chimera_common evpl evpl_rpc2 pthread uuid urcu-qsbr urcu-common gssapi_krb5)
++target_link_libraries(chimera_nfs chimera_nfs_common chimera_common evpl evpl_rpc2 pthread uuid urcu-qsbr urcu-common gssapi_krb5 crypto)
+ 
+ install(TARGETS chimera_nfs DESTINATION lib)
+ 
+diff --git a/src/server/nfs/nfs.c b/src/server/nfs/nfs.c
+index 4d5fe64b216203082fe6533e80ab87a6e7bd89ae..728a18a33a8474e2874e300d3acc5d68bf8ae549 100644
+--- a/src/server/nfs/nfs.c
++++ b/src/server/nfs/nfs.c
+@@ -398,7 +398,12 @@ nfs_server_init(
+     NLM_V4_init(&shared->nlm_v4);
+     SM_INTER_V1_init(&shared->nsm_v1);
+ 
+-    shared->metrics      = metrics;
++    shared->metrics = metrics;
++    if (chimera_server_config_get_nfs4_read_correlation(config)) {
++        shared->read_events = nfs4_read_events_create(
++            metrics,
++            chimera_server_config_get_nfs4_read_event_path(config));
++    }
+     shared->op_histogram = prometheus_metrics_create_histogram_time(metrics, "chimera_nfs_op_latency_nanoseconds",
+                                                                     "The latency of NFS operations in nanoseconds", 34);
+ 
+@@ -745,6 +750,8 @@ nfs_server_destroy(void *data)
+     struct evpl                      *evpl;
+     struct chimera_vfs_thread        *vfs_thread;
+ 
++    nfs4_read_events_destroy(shared->read_events);
++
+     /* Create a temporary evpl and VFS thread for releasing handles */
+     evpl       = evpl_create(NULL);
+     vfs_thread = chimera_vfs_thread_init(evpl, shared->vfs);
+diff --git a/src/server/nfs/nfs4_proc_compound.c b/src/server/nfs/nfs4_proc_compound.c
+index 06db53370a0a60780b81265f16b1f1bce60871ad..47b0c36a9f66b8a7e042ebfb41678d45fd446cbb 100644
+--- a/src/server/nfs/nfs4_proc_compound.c
++++ b/src/server/nfs/nfs4_proc_compound.c
+@@ -2,6 +2,8 @@
+ //
+ // SPDX-License-Identifier: LGPL-2.1-only
+ 
++#include <time.h>
++
+ #include "nfs4_procs.h"
+ #include "nfs4_session.h"
+ #include "nfs4_recovery.h"
+@@ -15,6 +17,7 @@
+ #include "nfs4_rofs.h"
+ #include "nfs4_export_policy_collect.h"
+ #include "nfs4_compound_cleanup.h"
++#include "vfs/vfs_fh.h"
+ #include "nfs_drc_reply.h"
+ #include "vfs/vfs_internal.h"
+ 
+@@ -90,6 +93,93 @@ nfs4_release_write_args(
+     }
+ } /* nfs4_release_write_args */
+ 
++static void
++nfs4_read_event_begin(
++    struct nfs_request    *req,
++    const struct READ4args *args)
++{
++    struct chimera_server_nfs_shared *shared = req->thread->shared;
++    struct nfs4_read_event           *event  = &req->read_event;
++    struct timespec                   now;
++    int     target_len = 0;
++    size_t  tag_len;
++
++    memset(event, 0, sizeof(*event));
++    event->offset    = args->offset;
++    event->requested = args->count;
++    event->compound_op_index = (uint32_t) req->index;
++    event->slot_id            = req->slot_id;
++    event->sequence_id        = req->slot_seqid;
++    if (clock_gettime(CLOCK_REALTIME, &now) == 0) {
++        event->target_created_ns =
++            (uint64_t) now.tv_sec * 1000000000ULL + now.tv_nsec;
++    }
++
++    tag_len = req->args_compound->tag.len;
++    event->compound_tag_original_len = (uint32_t) tag_len;
++    event->compound_tag_len = tag_len > NFS4_READ_EVENT_TAG_SIZE ?
++        NFS4_READ_EVENT_TAG_SIZE : (uint16_t) tag_len;
++    event->compound_tag_truncated = tag_len > NFS4_READ_EVENT_TAG_SIZE;
++    if (event->compound_tag_len) {
++        memcpy(event->compound_tag, req->args_compound->tag.data,
++               event->compound_tag_len);
++    }
++    chimera_nfs_abort_if(
++        !nfs4_read_events_digest(tag_len ?
++                                 req->args_compound->tag.data : "",
++                                 tag_len,
++                                 event->compound_tag_id),
++        "Failed to digest NFSv4 compound tag");
++
++    event->export_id = req->export_id;
++    pthread_mutex_lock(&shared->exports_lock);
++    const struct chimera_nfs_export *export =
++        req->export_id > 0 && req->export_id < CHIMERA_NFS_MAX_EXPORTS ?
++        shared->exports_by_id[req->export_id] : NULL;
++    if (export) {
++        strncpy(event->export_name, export->name,
++                sizeof(event->export_name) - 1);
++    }
++    pthread_mutex_unlock(&shared->exports_lock);
++
++    if (req->session) {
++        event->session_valid = true;
++        chimera_nfs_abort_if(
++            !nfs4_read_events_digest(req->session->nfs4_session_id,
++                                     sizeof(req->session->nfs4_session_id),
++                                     event->session_ref),
++            "Failed to digest NFSv4 READ session identity");
++        chimera_nfs_abort_if(
++            !nfs4_read_events_client_ref(
++                req->session->nfs4_session_clientid, event->client_ref),
++            "Failed to digest NFSv4 READ client identity");
++        chimera_nfs_abort_if(
++            !nfs4_read_events_operation_id(
++                req->session->nfs4_session_id,
++                event->slot_id, event->sequence_id,
++                event->compound_op_index, event->operation_id),
++            "Failed to digest NFSv4 READ operation identity");
++    }
++
++    if (req->fhlen < CHIMERA_VFS_MOUNT_ID_SIZE ||
++        req->fhlen > NFS4_FHSIZE ||
++        fh_is_nfs4_root(req->fh, req->fhlen)) {
++        return;
++    }
++    memcpy(event->volume_id, req->fh, sizeof(event->volume_id));
++    chimera_nfs_abort_if(
++        !nfs4_read_events_file_id(event->volume_id, req->fh,
++                                  (uint16_t) req->fhlen, event->file_id),
++        "Failed to digest NFSv4 READ file identity");
++    chimera_nfs_fh_encode(req, req->fh, req->fhlen,
++                          event->target_fh, &target_len);
++    if (target_len <= 0 || target_len > (int) sizeof(event->target_fh)) {
++        return;
++    }
++    event->target_fh_len = (uint16_t) target_len;
++    event->identity_valid = true;
++} /* nfs4_read_event_begin */
++
+ void
+ chimera_nfs4_compound_process(
+     struct nfs_request *req,
+@@ -220,6 +310,11 @@ chimera_nfs4_compound_process(
+ 
+     resop->resop = argop->argop;
+ 
++    chimera_nfs4_read_event_set_active(req, argop->argop);
++    if (req->read_event_active) {
++        nfs4_read_event_begin(req, &argop->opread);
++    }
++
+     /* Open a span for this operation (child of the compound span) and re-point
+      * the VFS parent at it so the op's VFS work nests under the op, not the
+      * whole compound. */
+diff --git a/src/server/nfs/nfs4_proc_read.c b/src/server/nfs/nfs4_proc_read.c
+index ed7182d1f3de6e0930ea833cf249da62dc8cece1..d3e9f3fdb2749749d3d10e0be9d517a18f30b17c 100644
+--- a/src/server/nfs/nfs4_proc_read.c
++++ b/src/server/nfs/nfs4_proc_read.c
+@@ -30,6 +30,13 @@ chimera_nfs4_read_complete(
+         res->resok4.data.length = count;
+         res->resok4.data.iov    = iov;
+         res->resok4.data.niov   = niov;
++        if (req->read_event_active) {
++            req->read_event.eof = eof;
++            if (attr && (attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE)) {
++                req->read_event.file_size       = attr->va_size;
++                req->read_event.file_size_valid = true;
++            }
++        }
+     } else {
+         res->status = chimera_nfs4_errno_to_nfsstat4(error_code);
+         evpl_iovecs_release(req->thread->evpl, iov, niov);
+@@ -92,7 +99,7 @@ chimera_nfs4_read_open_callback(
+                                args->count,
+                                iov,
+                                256,
+-                               0,
++                               CHIMERA_VFS_ATTR_SIZE,
+                                &io_owner,
+                                chimera_nfs4_read_complete,
+                                req);
+@@ -105,7 +112,7 @@ chimera_nfs4_read_open_callback(
+                      args->count,
+                      iov,
+                      256,
+-                     0,
++                     CHIMERA_VFS_ATTR_SIZE,
+                      chimera_nfs4_read_complete,
+                      req);
+ } /* chimera_nfs4_read_open_callback */
+@@ -343,7 +350,7 @@ chimera_nfs4_read(
+                            args->count,
+                            iov,
+                            256,
+-                           0,
++                           CHIMERA_VFS_ATTR_SIZE,
+                            &io_owner,
+                            chimera_nfs4_read_complete,
+                            req);
+diff --git a/src/server/nfs/nfs4_procs.h b/src/server/nfs/nfs4_procs.h
+index 618fddc95f39114694d925f8abcd8ba7bfa3fbd7..20250296736c1f4ecb3dba77cb51222c51de5982 100644
+--- a/src/server/nfs/nfs4_procs.h
++++ b/src/server/nfs/nfs4_procs.h
+@@ -9,6 +9,7 @@
+ #include <sys/stat.h>
+ #include "nfs_common.h"
+ #include "nfs_internal.h"
++#include "nfs4_read_events.h"
+ 
+ /* Static root file handle for the nfs4_root pseudo-filesystem */
+ static const uint8_t *nfs4_root_fh     = (const uint8_t *) "CHIMERA NFS4 ROOT FH";
+@@ -753,6 +754,19 @@ chimera_nfs4_validate_name(const xdr_opaque *name)
+     return NFS4_OK;
+ } /* chimera_nfs4_validate_name */
+ 
++static inline void
++chimera_nfs4_read_event_set_active(
++    struct nfs_request *req,
++    uint32_t            operation)
++{
++    req->read_event_active =
++        operation == OP_READ &&
++        req->thread->shared->read_events &&
++        req->minorversion == 1 &&
++        req->seen_sequence &&
++        req->session;
++} /* chimera_nfs4_read_event_set_active */
++
+ static inline void
+ chimera_nfs4_compound_complete(
+     struct nfs_request *req,
+@@ -760,6 +774,15 @@ chimera_nfs4_compound_complete(
+ {
+     struct chimera_server_nfs_thread *thread = req->thread;
+ 
++    if (req->read_event_active) {
++        uint32_t bytes = status == NFS4_OK ?
++            req->res_compound.resarray[req->index].opread.resok4.data.length : 0;
++        req->read_event_active = false;
++        req->read_event.status = status;
++        req->read_event.bytes  = bytes;
++        nfs4_read_events_emit(thread->shared->read_events, &req->read_event);
++    }
++
+     if (status != NFS4_OK) {
+         req->res_compound.status = status;
+ 
+diff --git a/src/server/nfs/nfs4_read_events.c b/src/server/nfs/nfs4_read_events.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b22d7a2f2af78de6daa40b3966f217cb2a03abf
+--- /dev/null
++++ b/src/server/nfs/nfs4_read_events.c
+@@ -0,0 +1,1111 @@
++// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
++//
++// SPDX-License-Identifier: LGPL-2.1-only
++
++#include <ctype.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <openssl/evp.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <time.h>
++#include <unistd.h>
++#include <uuid/uuid.h>
++
++#include "common/logging.h"
++#include "common/macros.h"
++#include "nfs4_read_events.h"
++#include "nfs_internal.h"
++#include "prometheus-c.h"
++
++#define NFS4_READ_EVENT_QUEUE_SIZE 4096
++#define NFS4_READ_EVENT_SINK_MAX_BYTES (64ULL * 1024 * 1024)
++
++struct nfs4_read_queued_event {
++    uint64_t timestamp_ns;
++    uint64_t sequence;
++    struct nfs4_read_event event;
++};
++
++struct nfs4_read_events {
++    pthread_mutex_t                     lock;
++    pthread_cond_t                      wake;
++    pthread_t                           worker;
++    struct nfs4_read_queued_event       queue[NFS4_READ_EVENT_QUEUE_SIZE];
++    unsigned int                        head;
++    unsigned int                        count;
++    int                                 stopping;
++    int                                 sink_fd;
++    int                                 sink_dir_fd;
++    int                                 sink_enabled;
++    uint64_t                            sink_bytes;
++    uint64_t                            sink_max_bytes;
++    char                                sink_directory[256];
++    char                                sink_name[128];
++    char                                rotated_name[131];
++    ssize_t                             ( *write_fn )(int, const void *, size_t);
++    int                                 ( *fdatasync_fn )(int);
++    int                                 ( *ftruncate_fn )(int, off_t);
++    int                                 ( *fsync_fn )(int);
++    void                                ( *before_enqueue_lock_fn )(
++        const struct nfs4_read_event *);
++    void                                ( *before_barrier_publish_fn )(void);
++    char                                producer_epoch[37];
++    _Atomic uint64_t                    next_sequence;
++    _Atomic uint64_t                    last_enqueued_sequence;
++    _Atomic uint64_t                    last_synced_sequence;
++    _Atomic uint64_t                    synced_count;
++    _Atomic uint64_t                    queue_depth;
++    _Atomic uint64_t                    worker_in_flight;
++    _Atomic uint64_t                    dropped_queue;
++    _Atomic uint64_t                    dropped_encode;
++    _Atomic uint64_t                    dropped_log;
++    _Atomic uint64_t                    dropped_sink;
++    _Atomic uint64_t                    dropped_rollback;
++    _Atomic uint64_t                    dropped_rotation;
++    _Atomic uint64_t                    delivery_clean;
++    uint64_t                            encode_reported;
++    uint64_t                            log_reported;
++    uint64_t                            sink_reported;
++    uint64_t                            rollback_reported;
++    uint64_t                            rotation_reported;
++    struct prometheus_metrics          *metrics;
++    struct prometheus_counter          *drops;
++    struct prometheus_counter_series   *queue_series;
++    struct prometheus_counter_series   *encode_series;
++    struct prometheus_counter_series   *log_series;
++    struct prometheus_counter_series   *sink_series;
++    struct prometheus_counter_series   *rollback_series;
++    struct prometheus_counter_series   *rotation_series;
++    struct prometheus_counter_instance *queue_instance;
++    struct prometheus_counter_instance *encode_instance;
++    struct prometheus_counter_instance *log_instance;
++    struct prometheus_counter_instance *sink_instance;
++    struct prometheus_counter_instance *rollback_instance;
++    struct prometheus_counter_instance *rotation_instance;
++    struct prometheus_gauge             *state_gauge;
++    struct prometheus_gauge             *producer_info_gauge;
++    struct prometheus_gauge_series      *last_enqueued_series;
++    struct prometheus_gauge_series      *last_synced_series;
++    struct prometheus_gauge_series      *synced_count_series;
++    struct prometheus_gauge_series      *queue_depth_series;
++    struct prometheus_gauge_series      *worker_in_flight_series;
++    struct prometheus_gauge_series      *barrier_ready_series;
++    struct prometheus_gauge_series      *delivery_clean_series;
++    struct prometheus_gauge_instance    *last_enqueued_instance;
++    struct prometheus_gauge_instance    *last_synced_instance;
++    struct prometheus_gauge_instance    *synced_count_instance;
++    struct prometheus_gauge_instance    *queue_depth_instance;
++    struct prometheus_gauge_instance    *worker_in_flight_instance;
++    struct prometheus_gauge_instance    *barrier_ready_instance;
++    struct prometheus_gauge_instance    *delivery_clean_instance;
++    struct prometheus_gauge_series      *producer_info_series;
++    struct prometheus_gauge_instance    *producer_info_instance;
++};
++
++static void
++nfs4_read_events_publish_state_locked(struct nfs4_read_events *events)
++{
++    uint64_t enqueued = atomic_load_explicit(
++        &events->last_enqueued_sequence, memory_order_relaxed);
++    uint64_t synced = atomic_load_explicit(
++        &events->last_synced_sequence, memory_order_relaxed);
++    uint64_t in_flight = atomic_load_explicit(
++        &events->worker_in_flight, memory_order_relaxed);
++    uint64_t delivery_clean = atomic_load_explicit(
++        &events->delivery_clean, memory_order_acquire);
++
++    prometheus_gauge_set(events->last_enqueued_instance, (int64_t) enqueued);
++    prometheus_gauge_set(events->last_synced_instance, (int64_t) synced);
++    prometheus_gauge_set(events->synced_count_instance, (int64_t)
++                         atomic_load_explicit(&events->synced_count,
++                                              memory_order_relaxed));
++    prometheus_gauge_set(events->queue_depth_instance, (int64_t) events->count);
++    prometheus_gauge_set(events->worker_in_flight_instance, (int64_t) in_flight);
++    if (events->before_barrier_publish_fn) {
++        events->before_barrier_publish_fn();
++    }
++    int ready = enqueued == synced && events->count == 0 &&
++        in_flight == 0 && delivery_clean == 1;
++    prometheus_gauge_set(events->barrier_ready_instance, ready);
++    if (ready &&
++        atomic_load_explicit(&events->delivery_clean,
++                             memory_order_acquire) == 0) {
++        prometheus_gauge_set(events->barrier_ready_instance, 0);
++    }
++} /* nfs4_read_events_publish_state_locked */
++
++static void
++nfs4_read_events_invalidate_barrier(struct nfs4_read_events *events)
++{
++    atomic_store_explicit(&events->delivery_clean, 0, memory_order_release);
++    if (events->delivery_clean_instance) {
++        prometheus_gauge_set(events->delivery_clean_instance, 0);
++    }
++    if (events->barrier_ready_instance) {
++        prometheus_gauge_set(events->barrier_ready_instance, 0);
++    }
++} /* nfs4_read_events_invalidate_barrier */
++
++static void
++nfs4_read_events_note_queue_drop(struct nfs4_read_events *events)
++{
++    atomic_fetch_add_explicit(&events->dropped_queue, 1, memory_order_relaxed);
++    if (events->queue_instance) {
++        __atomic_fetch_add(&events->queue_instance->value, 1, __ATOMIC_RELAXED);
++    }
++    nfs4_read_events_invalidate_barrier(events);
++} /* nfs4_read_events_note_queue_drop */
++
++static int
++nfs4_read_events_enqueue(
++    struct nfs4_read_events             *events,
++    const struct nfs4_read_queued_event *event)
++{
++    unsigned int           tail;
++    struct timespec        timestamp;
++    struct nfs4_read_queued_event copy = *event;
++
++    if (clock_gettime(CLOCK_REALTIME, &timestamp) != 0) {
++        nfs4_read_events_note_queue_drop(events);
++        return 0;
++    }
++    copy.timestamp_ns = (uint64_t) timestamp.tv_sec * 1000000000ULL + timestamp.tv_nsec;
++    if (events->before_enqueue_lock_fn) {
++        events->before_enqueue_lock_fn(&copy.event);
++    }
++    if (pthread_mutex_trylock(&events->lock) != 0) {
++        nfs4_read_events_note_queue_drop(events);
++        return 0;
++    }
++    if (events->stopping || events->count == NFS4_READ_EVENT_QUEUE_SIZE) {
++        nfs4_read_events_note_queue_drop(events);
++        pthread_mutex_unlock(&events->lock);
++        return 0;
++    }
++    copy.sequence = atomic_fetch_add_explicit(&events->next_sequence, 1,
++                                               memory_order_relaxed);
++
++    tail                = (events->head + events->count) % NFS4_READ_EVENT_QUEUE_SIZE;
++    events->queue[tail] = copy;
++    events->count++;
++    atomic_store_explicit(&events->queue_depth, events->count,
++                          memory_order_release);
++    atomic_store_explicit(&events->last_enqueued_sequence, copy.sequence,
++                          memory_order_release);
++    nfs4_read_events_publish_state_locked(events);
++    pthread_cond_signal(&events->wake);
++    pthread_mutex_unlock(&events->lock);
++    return 1;
++} /* nfs4_read_events_enqueue */
++
++static void
++nfs4_read_events_update_metrics(struct nfs4_read_events *events)
++{
++    uint64_t encode_drops = atomic_load_explicit(&events->dropped_encode, memory_order_relaxed);
++    uint64_t log_drops   = atomic_load_explicit(&events->dropped_log, memory_order_relaxed);
++    uint64_t sink_drops  = atomic_load_explicit(&events->dropped_sink, memory_order_relaxed);
++    uint64_t rollback_drops = atomic_load_explicit(&events->dropped_rollback,
++                                                    memory_order_relaxed);
++    uint64_t rotation_drops = atomic_load_explicit(&events->dropped_rotation,
++                                                    memory_order_relaxed);
++
++    prometheus_counter_add(events->encode_instance,
++                           encode_drops - events->encode_reported);
++    prometheus_counter_add(events->log_instance,
++                           log_drops - events->log_reported);
++    prometheus_counter_add(events->sink_instance,
++                           sink_drops - events->sink_reported);
++    prometheus_counter_add(events->rollback_instance,
++                           rollback_drops - events->rollback_reported);
++    prometheus_counter_add(events->rotation_instance,
++                           rotation_drops - events->rotation_reported);
++    events->encode_reported = encode_drops;
++    events->log_reported = log_drops;
++    events->sink_reported = sink_drops;
++    events->rollback_reported = rollback_drops;
++    events->rotation_reported = rotation_drops;
++} /* nfs4_read_events_update_metrics */
++
++static void
++nfs4_read_events_hex(
++    const uint8_t *input,
++    size_t         length,
++    char          *output)
++{
++    static const char hex[] = "0123456789abcdef";
++
++    for (size_t i = 0; i < length; i++) {
++        output[i * 2]     = hex[input[i] >> 4];
++        output[i * 2 + 1] = hex[input[i] & 0x0f];
++    }
++    output[length * 2] = '\0';
++} /* nfs4_read_events_hex */
++
++static size_t
++nfs4_read_events_base64url(
++    const uint8_t *input,
++    size_t         length,
++    char          *output,
++    size_t         capacity)
++{
++    static const char alphabet[] =
++        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
++    size_t in = 0, out = 0;
++
++    while (in < length) {
++        size_t   remaining = length - in;
++        size_t   encoded = remaining >= 3 ? 4 : remaining + 1;
++        uint32_t value = (uint32_t) input[in++] << 16;
++
++        if (remaining > 1) {
++            value |= (uint32_t) input[in++] << 8;
++        }
++        if (remaining > 2) {
++            value |= input[in++];
++        }
++        if (out + encoded + 1 > capacity) {
++            return 0;
++        }
++        output[out++] = alphabet[(value >> 18) & 0x3f];
++        output[out++] = alphabet[(value >> 12) & 0x3f];
++        if (remaining > 1) {
++            output[out++] = alphabet[(value >> 6) & 0x3f];
++        }
++        if (remaining > 2) {
++            output[out++] = alphabet[value & 0x3f];
++        }
++    }
++    output[out] = '\0';
++    return out;
++} /* nfs4_read_events_base64url */
++
++static const char *
++nfs4_read_events_origin_claim(
++    const char *tag,
++    size_t      length,
++    const char **trust)
++{
++    if (length != 104 ||
++        memcmp(tag, "pc1:", 4) != 0 ||
++        tag[5] != ':' || tag[38] != ':' || tag[71] != ':') {
++        *trust = "client_asserted";
++        return "unknown";
++    }
++    for (size_t i = 6; i < length; i++) {
++        if (i == 38 || i == 71) {
++            continue;
++        }
++        if (!isxdigit((unsigned char) tag[i])) {
++            *trust = "client_asserted";
++            return "unknown";
++        }
++    }
++    *trust = "client_asserted";
++    switch (tag[4]) {
++        case 'w':
++            return "warmer";
++        case 'd':
++            return "controlled_demand";
++        case 's':
++            return "synthetic";
++        default:
++            *trust = "client_asserted";
++            return "unknown";
++    }
++} /* nfs4_read_events_origin_claim */
++
++static void
++nfs4_read_events_finish(
++    struct nfs4_read_events *events,
++    uint64_t                 sequence,
++    bool                     synced)
++{
++    pthread_mutex_lock(&events->lock);
++    if (synced) {
++        atomic_fetch_add_explicit(&events->synced_count, 1,
++                                  memory_order_relaxed);
++        atomic_store_explicit(&events->last_synced_sequence, sequence,
++                              memory_order_release);
++    }
++    atomic_store_explicit(&events->worker_in_flight, 0,
++                          memory_order_release);
++    nfs4_read_events_update_metrics(events);
++    nfs4_read_events_publish_state_locked(events);
++    pthread_mutex_unlock(&events->lock);
++} /* nfs4_read_events_finish */
++
++static int
++nfs4_read_events_write_all(
++    struct nfs4_read_events *events,
++    const char              *buffer,
++    size_t                   length)
++{
++    size_t offset = 0;
++
++    while (offset < length) {
++        ssize_t written = events->write_fn(
++            events->sink_fd, buffer + offset, length - offset);
++
++        if (written > 0) {
++            offset += (size_t) written;
++            continue;
++        }
++        if (written < 0 && errno == EINTR) {
++            continue;
++        }
++        return 0;
++    }
++    return 1;
++} /* nfs4_read_events_write_all */
++
++static int
++nfs4_read_events_open_sink(struct nfs4_read_events *events)
++{
++    struct stat st;
++    int fd;
++
++    if (!events->sink_enabled || !events->sink_name[0]) {
++        return 0;
++    }
++    if (events->sink_dir_fd < 0) {
++        events->sink_dir_fd = open(
++            events->sink_directory,
++            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
++        if (events->sink_dir_fd < 0 ||
++            fstat(events->sink_dir_fd, &st) != 0 ||
++            !S_ISDIR(st.st_mode) ||
++            st.st_uid != geteuid()) {
++            if (events->sink_dir_fd >= 0) {
++                close(events->sink_dir_fd);
++                events->sink_dir_fd = -1;
++            }
++            return 0;
++        }
++    }
++    fd = openat(events->sink_dir_fd, events->sink_name,
++                O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
++                O_NOFOLLOW | O_NONBLOCK,
++                S_IRUSR | S_IWUSR);
++    if (fd < 0) {
++        return 0;
++    }
++    if (fstat(fd, &st) != 0 ||
++        !S_ISREG(st.st_mode) ||
++        st.st_uid != geteuid() ||
++        st.st_nlink != 1) {
++        close(fd);
++        return 0;
++    }
++    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
++        if (fd >= 0) {
++            close(fd);
++        }
++        return 0;
++    }
++    events->sink_fd = fd;
++    events->sink_bytes = st.st_size > 0 ? (uint64_t) st.st_size : 0;
++    return 1;
++} /* nfs4_read_events_open_sink */
++
++static int
++nfs4_read_events_configure_sink(
++    struct nfs4_read_events *events,
++    const char              *path)
++{
++    char        directory[256];
++    const char *name;
++    const char *slash;
++    size_t      path_len, dir_len, name_len;
++    if (!path) {
++        return 1;
++    }
++    path_len = strlen(path);
++    if (path_len == 0 || path_len >= sizeof(directory)) {
++        return 0;
++    }
++    slash = strrchr(path, '/');
++    if (!slash) {
++        memcpy(directory, ".", 2);
++        name = path;
++    } else {
++        dir_len = (size_t) (slash - path);
++        name = slash + 1;
++        if (dir_len == 0) {
++            memcpy(directory, "/", 2);
++        } else {
++            if (dir_len >= sizeof(directory)) {
++                return 0;
++            }
++            memcpy(directory, path, dir_len);
++            directory[dir_len] = '\0';
++        }
++    }
++    name_len = strlen(name);
++    if (name_len == 0 || name_len >= sizeof(events->sink_name) ||
++        strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
++        return 0;
++    }
++    memcpy(events->sink_directory, directory, strlen(directory) + 1);
++    memcpy(events->sink_name, name, name_len + 1);
++    if (snprintf(events->rotated_name, sizeof(events->rotated_name),
++                 "%s.1", name) < 0) {
++        return 0;
++    }
++    events->sink_enabled = 1;
++    return nfs4_read_events_open_sink(events);
++} /* nfs4_read_events_configure_sink */
++
++static int
++nfs4_read_events_rotate_sink(
++    struct nfs4_read_events *events)
++{
++    if (events->sink_fd < 0 ||
++        events->fdatasync_fn(events->sink_fd) != 0) {
++        return 0;
++    }
++    if (unlinkat(events->sink_dir_fd, events->rotated_name, 0) != 0 &&
++        errno != ENOENT) {
++        return 0;
++    }
++    if (events->fsync_fn(events->sink_dir_fd) != 0) {
++        return 0;
++    }
++    if (renameat(events->sink_dir_fd, events->sink_name,
++                 events->sink_dir_fd, events->rotated_name) != 0) {
++        return 0;
++    }
++    int rename_sync_rc = events->fsync_fn(events->sink_dir_fd);
++    close(events->sink_fd);
++    events->sink_fd = -1;
++    if (rename_sync_rc != 0) {
++        return 0;
++    }
++    if (!nfs4_read_events_open_sink(events)) {
++        return 0;
++    }
++    return events->fsync_fn(events->sink_dir_fd) == 0;
++} /* nfs4_read_events_rotate_sink */
++
++static int
++nfs4_read_events_write_sink(
++    struct nfs4_read_events       *events,
++    const struct nfs4_read_event  *read,
++    const struct nfs4_read_queued_event *queued,
++    const char                    *local_id,
++    const char                    *volume_id,
++    const char                    *file_id,
++    const char                    *export_name,
++    const char                    *target_fh,
++    const char                    *operation_id,
++    const char                    *client_ref,
++    const char                    *session_ref,
++    const char                    *compound_tag,
++    const char                    *tag_id,
++    const char                    *origin_claim,
++    const char                    *origin_trust)
++{
++    char line[3072];
++    int  length;
++    bool rotation_needed;
++    off_t record_start;
++    struct timespec sink_time;
++    uint64_t sink_time_ns;
++
++    if (!events->sink_enabled) {
++        return 1;
++    }
++    if (events->sink_fd < 0 && !nfs4_read_events_open_sink(events)) {
++        return 0;
++    }
++    if (clock_gettime(CLOCK_REALTIME, &sink_time) != 0) {
++        return 0;
++    }
++    sink_time_ns = (uint64_t) sink_time.tv_sec * 1000000000ULL +
++        sink_time.tv_nsec;
++    length = snprintf(
++        line, sizeof(line),
++        "{\"schema\":\"nfs4_read_v2\",\"local_id\":\"%s\","
++        "\"producer_epoch\":\"%s\",\"producer_sequence\":\"%" PRIu64 "\","
++        "\"event_time_ns\":\"%" PRIu64 "\",\"sink_time_ns\":\"%" PRIu64 "\","
++        "\"target_created_ns\":\"%" PRIu64 "\","
++        "\"volume_id\":\"%s\",\"file_id\":\"%s\",\"identity_valid\":%s,"
++        "\"export_name_b64\":\"%s\",\"export_id\":%u,"
++        "\"target_fh\":\"%s\",\"operation_id\":\"%s\","
++        "\"client_ref\":\"%s\",\"session_ref\":\"%s\","
++        "\"compound_op_index\":%" PRIu32 ",\"slot_id\":%" PRIu32 ","
++        "\"sequence_id\":%" PRIu32 ",\"compound_tag_b64\":\"%s\","
++        "\"compound_tag_original_length\":%" PRIu32 ","
++        "\"compound_tag_truncated\":%s,\"compound_tag_id\":\"%s\","
++        "\"origin_claim\":\"%s\",\"origin_trust\":\"%s\","
++        "\"requested_offset\":\"%" PRIu64 "\",\"requested_count\":%" PRIu32 ","
++        "\"returned_bytes\":%" PRIu32 ",\"nfs_status\":%" PRIu32 ","
++        "\"outcome\":\"%s\",\"eof\":%s,\"file_size_valid\":%s,"
++        "\"file_size\":",
++        local_id, events->producer_epoch, queued->sequence,
++        queued->timestamp_ns, sink_time_ns, read->target_created_ns,
++        volume_id, file_id,
++        read->identity_valid ? "true" : "false", export_name, read->export_id,
++        target_fh, operation_id, client_ref,
++        read->session_valid ? session_ref : "",
++        read->compound_op_index, read->slot_id, read->sequence_id, compound_tag,
++        read->compound_tag_original_len,
++        read->compound_tag_truncated ? "true" : "false", tag_id,
++        origin_claim, origin_trust, read->offset, read->requested,
++        read->bytes, read->status,
++        read->status == 0 ? "success" : "error",
++        read->status == 0 && read->eof ? "true" : "false",
++        read->file_size_valid ? "true" : "false");
++    if (length < 0 || (size_t) length >= sizeof(line)) {
++        return 0;
++    }
++    if (read->file_size_valid) {
++        int extra = snprintf(line + length, sizeof(line) - (size_t) length,
++                             "\"%" PRIu64 "\"}\n", read->file_size);
++        if (extra < 0 || (size_t) extra >= sizeof(line) - (size_t) length) {
++            return 0;
++        }
++        length += extra;
++    } else {
++        static const char suffix[] = "null}\n";
++        if ((size_t) length + sizeof(suffix) > sizeof(line)) {
++            return 0;
++        }
++        memcpy(line + length, suffix, sizeof(suffix));
++        length += sizeof(suffix) - 1;
++    }
++    rotation_needed = events->sink_bytes &&
++        events->sink_bytes + (uint64_t) length > events->sink_max_bytes;
++    if (rotation_needed && !nfs4_read_events_rotate_sink(events)) {
++        atomic_fetch_add_explicit(&events->dropped_rotation, 1,
++                                  memory_order_relaxed);
++        nfs4_read_events_invalidate_barrier(events);
++        return 0;
++    }
++    record_start = lseek(events->sink_fd, 0, SEEK_END);
++    if (record_start < 0 ||
++        !nfs4_read_events_write_all(events, line, (size_t) length) ||
++        events->fdatasync_fn(events->sink_fd) != 0) {
++        if (record_start >= 0) {
++            if (events->ftruncate_fn(events->sink_fd, record_start) != 0 ||
++                events->fdatasync_fn(events->sink_fd) != 0) {
++                atomic_fetch_add_explicit(&events->dropped_rollback, 1,
++                                          memory_order_relaxed);
++                nfs4_read_events_invalidate_barrier(events);
++            }
++        }
++        close(events->sink_fd);
++        events->sink_fd = -1;
++        return 0;
++    }
++    events->sink_bytes += (uint64_t) length;
++    return 1;
++} /* nfs4_read_events_write_sink */
++
++static void *
++nfs4_read_events_worker(void *arg)
++{
++    struct nfs4_read_events *events = arg;
++    struct nfs4_read_queued_event event;
++    struct timespec          deadline;
++    uuid_t                   uuid;
++    char                     id[37];
++    int                      have_event, stop;
++
++    for ( ;; ) {
++        pthread_mutex_lock(&events->lock);
++        if (!events->count && !events->stopping) {
++            clock_gettime(CLOCK_REALTIME, &deadline);
++            deadline.tv_sec++;
++            pthread_cond_timedwait(&events->wake, &events->lock, &deadline);
++        }
++        have_event = events->count != 0;
++        if (have_event) {
++            event        = events->queue[events->head];
++            events->head = (events->head + 1) % NFS4_READ_EVENT_QUEUE_SIZE;
++            events->count--;
++            atomic_store_explicit(&events->queue_depth, events->count,
++                                  memory_order_release);
++            atomic_store_explicit(&events->worker_in_flight, 1,
++                                  memory_order_release);
++            nfs4_read_events_publish_state_locked(events);
++        }
++        stop = events->stopping && !events->count && !have_event;
++        pthread_mutex_unlock(&events->lock);
++
++        nfs4_read_events_update_metrics(events);
++        if (stop) {
++            return NULL;
++        }
++        if (!have_event) {
++            continue;
++        }
++
++        uuid_generate_random(uuid);
++        uuid_unparse_lower(uuid, id);
++        const struct nfs4_read_event *read = &event.event;
++        const char *origin_trust;
++        const char *origin_claim =
++            nfs4_read_events_origin_claim(read->compound_tag,
++                                          read->compound_tag_len,
++                                          &origin_trust);
++        char file_id[65], volume_id[33], tag_id[65], operation_id[65];
++        char client_ref[65], session_ref[65];
++        char target_fh[172], export_name[87], compound_tag[343];
++        char file_size[32];
++        int  encode_ok = 1;
++
++        if (read->target_fh_len > sizeof(read->target_fh) ||
++            read->compound_tag_len > NFS4_READ_EVENT_TAG_SIZE) {
++            atomic_fetch_add_explicit(&events->dropped_encode, 1,
++                                      memory_order_relaxed);
++            nfs4_read_events_invalidate_barrier(events);
++            nfs4_read_events_finish(events, event.sequence, false);
++            continue;
++        }
++        nfs4_read_events_hex(read->file_id, sizeof(read->file_id), file_id);
++        nfs4_read_events_hex(read->volume_id, sizeof(read->volume_id), volume_id);
++        nfs4_read_events_hex(read->compound_tag_id,
++                             sizeof(read->compound_tag_id), tag_id);
++        nfs4_read_events_hex(read->operation_id,
++                             sizeof(read->operation_id), operation_id);
++        nfs4_read_events_hex(read->client_ref,
++                             sizeof(read->client_ref), client_ref);
++        nfs4_read_events_hex(read->session_ref,
++                             sizeof(read->session_ref), session_ref);
++        if (read->target_fh_len) {
++            encode_ok = nfs4_read_events_base64url(
++                read->target_fh, read->target_fh_len,
++                target_fh, sizeof(target_fh)) != 0;
++        }
++        if (encode_ok && read->compound_tag_len) {
++            encode_ok = nfs4_read_events_base64url(
++                (const uint8_t *) read->compound_tag,
++                read->compound_tag_len,
++                compound_tag, sizeof(compound_tag)) != 0;
++        }
++        if (encode_ok && read->export_name[0]) {
++            encode_ok = nfs4_read_events_base64url(
++                (const uint8_t *) read->export_name,
++                strnlen(read->export_name, sizeof(read->export_name)),
++                export_name, sizeof(export_name)) != 0;
++        }
++        if (!encode_ok) {
++            atomic_fetch_add_explicit(&events->dropped_encode, 1,
++                                      memory_order_relaxed);
++            nfs4_read_events_invalidate_barrier(events);
++            nfs4_read_events_finish(events, event.sequence, false);
++            continue;
++        }
++        if (!read->target_fh_len) {
++            target_fh[0] = '\0';
++        }
++        if (!read->compound_tag_len) {
++            compound_tag[0] = '\0';
++        }
++        if (!read->export_name[0]) {
++            export_name[0] = '\0';
++        }
++        if (read->file_size_valid) {
++            snprintf(file_size, sizeof(file_size), "%" PRIu64, read->file_size);
++        } else {
++            memcpy(file_size, "unknown", sizeof("unknown"));
++        }
++        int sink_ok = nfs4_read_events_write_sink(
++            events, read, &event, id, volume_id, file_id, export_name,
++            target_fh, operation_id, client_ref, session_ref, compound_tag,
++            tag_id, origin_claim, origin_trust);
++        if (!sink_ok) {
++            if (events->sink_enabled) {
++                atomic_fetch_add_explicit(&events->dropped_sink, 1,
++                                          memory_order_relaxed);
++                nfs4_read_events_invalidate_barrier(events);
++            }
++        }
++        nfs4_read_events_finish(events, event.sequence,
++                                sink_ok && events->sink_enabled);
++        if (!chimera_log_try_info("nfs", __FILE__, __LINE__,
++                                  "schema=nfs4_read_v2 local_id=%s"
++                                  " producer_epoch=%s producer_sequence=%" PRIu64
++                                  " event_time_ns=%" PRIu64
++                                  " target_created_ns=%" PRIu64
++                                  " volume_id=%s file_id=%s identity_valid=%s"
++                                  " export_name_b64=%s export_id=%u"
++                                  " target_fh=%s operation_id=%s"
++                                  " client_ref=%s session_ref=%s"
++                                  " compound_op_index=%" PRIu32
++                                  " slot_id=%" PRIu32
++                                  " sequence_id=%" PRIu32
++                                  " compound_tag_b64=%s"
++                                  " compound_tag_original_length=%" PRIu32
++                                  " compound_tag_truncated=%s"
++                                  " compound_tag_id=%s origin_claim=%s"
++                                  " origin_trust=%s"
++                                  " requested_offset=%" PRIu64
++                                  " requested_count=%" PRIu32
++                                  " returned_bytes=%" PRIu32
++                                  " nfs_status=%" PRIu32 " outcome=%s"
++                                  " eof=%s file_size_valid=%s file_size=%s",
++                                  id, events->producer_epoch, event.sequence,
++                                  event.timestamp_ns, read->target_created_ns,
++                                  volume_id, file_id,
++                                  read->identity_valid ? "true" : "false",
++                                  export_name, read->export_id, target_fh,
++                                  operation_id, client_ref,
++                                  read->session_valid ? session_ref : "",
++                                  read->compound_op_index, read->slot_id,
++                                  read->sequence_id, compound_tag,
++                                  read->compound_tag_original_len,
++                                  read->compound_tag_truncated ? "true" : "false",
++                                  tag_id, origin_claim,
++                                  origin_trust, read->offset, read->requested,
++                                  read->bytes, read->status,
++                                  read->status == 0 ? "success" : "error",
++                                  read->status == 0 && read->eof ? "true" : "false",
++                                  read->file_size_valid ? "true" : "false",
++                                  file_size)) {
++            atomic_fetch_add_explicit(&events->dropped_log, 1, memory_order_relaxed);
++        }
++    }
++} /* nfs4_read_events_worker */
++
++struct nfs4_read_events *
++nfs4_read_events_create(
++    struct prometheus_metrics *metrics,
++    const char                *sink_path)
++{
++    struct nfs4_read_events *events = calloc(1, sizeof(*events));
++    uuid_t                   epoch;
++    int                      rc;
++
++    chimera_nfs_abort_if(!events, "Failed to allocate NFSv4 READ event queue");
++    atomic_init(&events->next_sequence, 1);
++    atomic_init(&events->dropped_queue, 0);
++    atomic_init(&events->dropped_encode, 0);
++    atomic_init(&events->dropped_log, 0);
++    atomic_init(&events->dropped_sink, 0);
++    atomic_init(&events->dropped_rollback, 0);
++    atomic_init(&events->dropped_rotation, 0);
++    atomic_init(&events->delivery_clean, 1);
++    atomic_init(&events->last_enqueued_sequence, 0);
++    atomic_init(&events->last_synced_sequence, 0);
++    atomic_init(&events->synced_count, 0);
++    atomic_init(&events->queue_depth, 0);
++    atomic_init(&events->worker_in_flight, 0);
++    events->sink_fd = -1;
++    events->sink_dir_fd = -1;
++    events->sink_max_bytes = NFS4_READ_EVENT_SINK_MAX_BYTES;
++    events->write_fn = write;
++    events->fdatasync_fn = fdatasync;
++    events->ftruncate_fn = ftruncate;
++    events->fsync_fn = fsync;
++    if (!nfs4_read_events_configure_sink(events, sink_path)) {
++        atomic_fetch_add_explicit(&events->dropped_sink, 1,
++                                  memory_order_relaxed);
++        nfs4_read_events_invalidate_barrier(events);
++    }
++    uuid_generate_random(epoch);
++    uuid_unparse_lower(epoch, events->producer_epoch);
++    events->metrics = metrics;
++    events->drops   = prometheus_metrics_create_counter(
++        metrics, "chimera_nfs4_read_events_dropped",
++        "NFSv4 READ decision events dropped by stage");
++    chimera_nfs_abort_if(!events->drops, "Failed to create READ event drop metric");
++    events->queue_series = prometheus_counter_create_series(
++        events->drops, (const char *[]) { "stage" }, (const char *[]) { "queue" }, 1);
++    events->log_series = prometheus_counter_create_series(
++        events->drops, (const char *[]) { "stage" }, (const char *[]) { "log" }, 1);
++    events->encode_series = prometheus_counter_create_series(
++        events->drops, (const char *[]) { "stage" }, (const char *[]) { "encode" }, 1);
++    events->sink_series = prometheus_counter_create_series(
++        events->drops, (const char *[]) { "stage" }, (const char *[]) { "sink" }, 1);
++    events->rollback_series = prometheus_counter_create_series(
++        events->drops, (const char *[]) { "stage" }, (const char *[]) { "rollback" }, 1);
++    events->rotation_series = prometheus_counter_create_series(
++        events->drops, (const char *[]) { "stage" }, (const char *[]) { "rotation" }, 1);
++    chimera_nfs_abort_if(!events->queue_series || !events->encode_series ||
++                         !events->log_series ||
++                         !events->sink_series || !events->rollback_series ||
++                         !events->rotation_series,
++                         "Failed to create READ event drop metric series");
++    events->queue_instance = prometheus_counter_series_create_instance(events->queue_series);
++    events->encode_instance =
++        prometheus_counter_series_create_instance(events->encode_series);
++    events->log_instance   = prometheus_counter_series_create_instance(events->log_series);
++    events->sink_instance =
++        prometheus_counter_series_create_instance(events->sink_series);
++    events->rollback_instance =
++        prometheus_counter_series_create_instance(events->rollback_series);
++    events->rotation_instance =
++        prometheus_counter_series_create_instance(events->rotation_series);
++    chimera_nfs_abort_if(!events->queue_instance || !events->encode_instance ||
++                         !events->log_instance ||
++                         !events->sink_instance || !events->rollback_instance ||
++                         !events->rotation_instance,
++                         "Failed to create READ event drop metric instances");
++    events->state_gauge = prometheus_metrics_create_gauge(
++        metrics, "chimera_nfs4_read_event_state",
++        "NFSv4 READ event delivery state");
++    chimera_nfs_abort_if(!events->state_gauge,
++                         "Failed to create READ event state gauge");
++    events->producer_info_gauge = prometheus_metrics_create_gauge(
++        metrics, "chimera_nfs4_read_event_producer_info",
++        "NFSv4 READ event producer lifetime identity");
++    chimera_nfs_abort_if(!events->producer_info_gauge,
++                         "Failed to create READ event producer info gauge");
++    events->producer_info_series = prometheus_gauge_create_series(
++        events->producer_info_gauge,
++        (const char *[]) { "producer_epoch" },
++        (const char *[]) { events->producer_epoch }, 1);
++    chimera_nfs_abort_if(!events->producer_info_series,
++                         "Failed to create READ event producer info series");
++    events->producer_info_instance =
++        prometheus_gauge_series_create_instance(events->producer_info_series);
++    chimera_nfs_abort_if(!events->producer_info_instance,
++                         "Failed to create READ event producer info instance");
++    prometheus_gauge_set(events->producer_info_instance, 1);
++    events->last_enqueued_series = prometheus_gauge_create_series(
++        events->state_gauge, (const char *[]) { "state" },
++        (const char *[]) { "last_enqueued_sequence" }, 1);
++    events->last_synced_series = prometheus_gauge_create_series(
++        events->state_gauge, (const char *[]) { "state" },
++        (const char *[]) { "last_synced_sequence" }, 1);
++    events->synced_count_series = prometheus_gauge_create_series(
++        events->state_gauge, (const char *[]) { "state" },
++        (const char *[]) { "synced_count" }, 1);
++    events->queue_depth_series = prometheus_gauge_create_series(
++        events->state_gauge, (const char *[]) { "state" },
++        (const char *[]) { "queue_depth" }, 1);
++    events->worker_in_flight_series = prometheus_gauge_create_series(
++        events->state_gauge, (const char *[]) { "state" },
++        (const char *[]) { "worker_in_flight" }, 1);
++    events->barrier_ready_series = prometheus_gauge_create_series(
++        events->state_gauge, (const char *[]) { "state" },
++        (const char *[]) { "barrier_ready" }, 1);
++    events->delivery_clean_series = prometheus_gauge_create_series(
++        events->state_gauge, (const char *[]) { "state" },
++        (const char *[]) { "delivery_clean" }, 1);
++    chimera_nfs_abort_if(!events->last_enqueued_series ||
++                         !events->last_synced_series ||
++                         !events->synced_count_series ||
++                         !events->queue_depth_series ||
++                         !events->worker_in_flight_series ||
++                         !events->barrier_ready_series ||
++                         !events->delivery_clean_series,
++                         "Failed to create READ event state series");
++    events->last_enqueued_instance =
++        prometheus_gauge_series_create_instance(events->last_enqueued_series);
++    events->last_synced_instance =
++        prometheus_gauge_series_create_instance(events->last_synced_series);
++    events->synced_count_instance =
++        prometheus_gauge_series_create_instance(events->synced_count_series);
++    events->queue_depth_instance =
++        prometheus_gauge_series_create_instance(events->queue_depth_series);
++    events->worker_in_flight_instance =
++        prometheus_gauge_series_create_instance(
++            events->worker_in_flight_series);
++    events->barrier_ready_instance =
++        prometheus_gauge_series_create_instance(events->barrier_ready_series);
++    events->delivery_clean_instance =
++        prometheus_gauge_series_create_instance(events->delivery_clean_series);
++    chimera_nfs_abort_if(!events->last_enqueued_instance ||
++                         !events->last_synced_instance ||
++                         !events->synced_count_instance ||
++                         !events->queue_depth_instance ||
++                         !events->worker_in_flight_instance ||
++                         !events->barrier_ready_instance ||
++                         !events->delivery_clean_instance,
++                         "Failed to create READ event state instances");
++    prometheus_gauge_set(events->delivery_clean_instance,
++                         atomic_load_explicit(&events->delivery_clean,
++                                              memory_order_acquire));
++    nfs4_read_events_publish_state_locked(events);
++    rc = pthread_mutex_init(&events->lock, NULL);
++    chimera_nfs_abort_if(rc, "Failed to initialize READ event mutex: %d", rc);
++    rc = pthread_cond_init(&events->wake, NULL);
++    chimera_nfs_abort_if(rc, "Failed to initialize READ event condition: %d", rc);
++    rc = pthread_create(&events->worker, NULL, nfs4_read_events_worker, events);
++    chimera_nfs_abort_if(rc, "Failed to start READ event worker: %d", rc);
++    return events;
++} /* nfs4_read_events_create */
++
++void
++nfs4_read_events_destroy(struct nfs4_read_events *events)
++{
++    if (!events) {
++        return;
++    }
++    pthread_mutex_lock(&events->lock);
++    events->stopping = 1;
++    pthread_cond_signal(&events->wake);
++    pthread_mutex_unlock(&events->lock);
++    pthread_join(events->worker, NULL);
++    if (events->sink_fd >= 0) {
++        events->fdatasync_fn(events->sink_fd);
++        close(events->sink_fd);
++    }
++    if (events->sink_dir_fd >= 0) {
++        close(events->sink_dir_fd);
++    }
++    pthread_cond_destroy(&events->wake);
++    pthread_mutex_destroy(&events->lock);
++    prometheus_counter_series_destroy_instance(events->queue_series, events->queue_instance);
++    prometheus_counter_series_destroy_instance(events->encode_series,
++                                                events->encode_instance);
++    prometheus_counter_series_destroy_instance(events->log_series, events->log_instance);
++    prometheus_counter_series_destroy_instance(events->sink_series,
++                                                events->sink_instance);
++    prometheus_counter_series_destroy_instance(events->rollback_series,
++                                                events->rollback_instance);
++    prometheus_counter_series_destroy_instance(events->rotation_series,
++                                                events->rotation_instance);
++    prometheus_counter_destroy_series(events->drops, events->queue_series);
++    prometheus_counter_destroy_series(events->drops, events->encode_series);
++    prometheus_counter_destroy_series(events->drops, events->log_series);
++    prometheus_counter_destroy_series(events->drops, events->sink_series);
++    prometheus_counter_destroy_series(events->drops, events->rollback_series);
++    prometheus_counter_destroy_series(events->drops, events->rotation_series);
++    prometheus_counter_destroy(events->metrics, events->drops);
++    prometheus_gauge_series_destroy_instance(
++        events->last_enqueued_series, events->last_enqueued_instance);
++    prometheus_gauge_series_destroy_instance(
++        events->last_synced_series, events->last_synced_instance);
++    prometheus_gauge_series_destroy_instance(
++        events->synced_count_series, events->synced_count_instance);
++    prometheus_gauge_series_destroy_instance(
++        events->queue_depth_series, events->queue_depth_instance);
++    prometheus_gauge_series_destroy_instance(
++        events->worker_in_flight_series, events->worker_in_flight_instance);
++    prometheus_gauge_series_destroy_instance(
++        events->barrier_ready_series, events->barrier_ready_instance);
++    prometheus_gauge_series_destroy_instance(
++        events->delivery_clean_series, events->delivery_clean_instance);
++    prometheus_gauge_destroy_series(events->state_gauge,
++                                    events->last_enqueued_series);
++    prometheus_gauge_destroy_series(events->state_gauge,
++                                    events->last_synced_series);
++    prometheus_gauge_destroy_series(events->state_gauge,
++                                    events->synced_count_series);
++    prometheus_gauge_destroy_series(events->state_gauge,
++                                    events->queue_depth_series);
++    prometheus_gauge_destroy_series(events->state_gauge,
++                                    events->worker_in_flight_series);
++    prometheus_gauge_destroy_series(events->state_gauge,
++                                    events->barrier_ready_series);
++    prometheus_gauge_destroy_series(events->state_gauge,
++                                    events->delivery_clean_series);
++    prometheus_gauge_destroy(events->metrics, events->state_gauge);
++    prometheus_gauge_series_destroy_instance(
++        events->producer_info_series, events->producer_info_instance);
++    prometheus_gauge_destroy_series(events->producer_info_gauge,
++                                    events->producer_info_series);
++    prometheus_gauge_destroy(events->metrics, events->producer_info_gauge);
++    free(events);
++} /* nfs4_read_events_destroy */
++
++int
++nfs4_read_events_digest(
++    const void *data,
++    size_t      length,
++    uint8_t     digest[NFS4_READ_EVENT_DIGEST_SIZE])
++{
++    size_t digest_length = NFS4_READ_EVENT_DIGEST_SIZE;
++
++    return EVP_Q_digest(NULL, "SHA256", NULL, data, length,
++                        digest, &digest_length) == 1 &&
++           digest_length == NFS4_READ_EVENT_DIGEST_SIZE;
++} /* nfs4_read_events_digest */
++
++static void
++nfs4_read_events_put_be32(
++    uint8_t  output[4],
++    uint32_t value)
++{
++    output[0] = (uint8_t) (value >> 24);
++    output[1] = (uint8_t) (value >> 16);
++    output[2] = (uint8_t) (value >> 8);
++    output[3] = (uint8_t) value;
++} /* nfs4_read_events_put_be32 */
++
++int
++nfs4_read_events_file_id(
++    const uint8_t volume_id[NFS4_READ_EVENT_MOUNT_ID_SIZE],
++    const uint8_t *inner_fh,
++    uint16_t       inner_fh_len,
++    uint8_t        digest[NFS4_READ_EVENT_DIGEST_SIZE])
++{
++    static const char domain[] = "chimera-read-v2";
++    uint8_t input[sizeof(domain) + NFS4_READ_EVENT_MOUNT_ID_SIZE + 2 +
++                  NFS4_READ_EVENT_TARGET_FH_SIZE];
++    size_t  offset = 0;
++
++    if (inner_fh_len > NFS4_READ_EVENT_TARGET_FH_SIZE) {
++        return 0;
++    }
++    memcpy(input + offset, domain, sizeof(domain));
++    offset += sizeof(domain);
++    memcpy(input + offset, volume_id, NFS4_READ_EVENT_MOUNT_ID_SIZE);
++    offset += NFS4_READ_EVENT_MOUNT_ID_SIZE;
++    input[offset++] = (uint8_t) (inner_fh_len >> 8);
++    input[offset++] = (uint8_t) inner_fh_len;
++    memcpy(input + offset, inner_fh, inner_fh_len);
++    offset += inner_fh_len;
++    return nfs4_read_events_digest(input, offset, digest);
++} /* nfs4_read_events_file_id */
++
++int
++nfs4_read_events_operation_id(
++    const uint8_t session_id[NFS4_READ_EVENT_SESSION_ID_SIZE],
++    uint32_t      slot_id,
++    uint32_t      sequence_id,
++    uint32_t      operation_index,
++    uint8_t       digest[NFS4_READ_EVENT_DIGEST_SIZE])
++{
++    static const char domain[] = "chimera-read-op-v2";
++    uint8_t input[sizeof(domain) + NFS4_READ_EVENT_SESSION_ID_SIZE + 12];
++    size_t  offset = 0;
++
++    memcpy(input + offset, domain, sizeof(domain));
++    offset += sizeof(domain);
++    memcpy(input + offset, session_id, NFS4_READ_EVENT_SESSION_ID_SIZE);
++    offset += NFS4_READ_EVENT_SESSION_ID_SIZE;
++    nfs4_read_events_put_be32(input + offset, slot_id);
++    offset += 4;
++    nfs4_read_events_put_be32(input + offset, sequence_id);
++    offset += 4;
++    nfs4_read_events_put_be32(input + offset, operation_index);
++    offset += 4;
++    return nfs4_read_events_digest(input, offset, digest);
++} /* nfs4_read_events_operation_id */
++
++int
++nfs4_read_events_client_ref(
++    uint64_t client_id,
++    uint8_t  digest[NFS4_READ_EVENT_DIGEST_SIZE])
++{
++    static const char domain[] = "chimera-read-client-v2";
++    uint8_t input[sizeof(domain) + 8];
++
++    memcpy(input, domain, sizeof(domain));
++    for (size_t i = 0; i < 8; i++) {
++        input[sizeof(domain) + i] = (uint8_t) (client_id >> (56 - i * 8));
++    }
++    return nfs4_read_events_digest(input, sizeof(input), digest);
++} /* nfs4_read_events_client_ref */
++
++SYMBOL_EXPORT int
++nfs4_read_events_emit(
++    struct nfs4_read_events      *events,
++    const struct nfs4_read_event *event)
++{
++    struct nfs4_read_queued_event queued = {
++        .event = *event,
++    };
++
++    return nfs4_read_events_enqueue(events, &queued);
++} /* nfs4_read_events_emit */
+diff --git a/src/server/nfs/nfs4_read_events.h b/src/server/nfs/nfs4_read_events.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e2496b58530d330b0631b68078b06f4c743cbb36
+--- /dev/null
++++ b/src/server/nfs/nfs4_read_events.h
+@@ -0,0 +1,89 @@
++// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
++//
++// SPDX-License-Identifier: LGPL-2.1-only
++
++#pragma once
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define NFS4_READ_EVENT_DIGEST_SIZE 32
++#define NFS4_READ_EVENT_MOUNT_ID_SIZE 16
++#define NFS4_READ_EVENT_SESSION_ID_SIZE 16
++#define NFS4_READ_EVENT_TARGET_FH_SIZE 128
++#define NFS4_READ_EVENT_EXPORT_NAME_SIZE 64
++#define NFS4_READ_EVENT_TAG_SIZE 256
++
++struct nfs4_read_events;
++struct prometheus_metrics;
++
++struct nfs4_read_event {
++    uint64_t offset;
++    uint64_t file_size;
++    uint64_t target_created_ns;
++    uint32_t requested;
++    uint32_t status;
++    uint32_t bytes;
++    uint32_t eof;
++    uint32_t compound_op_index;
++    uint32_t slot_id;
++    uint32_t sequence_id;
++    uint32_t compound_tag_original_len;
++    uint16_t export_id;
++    uint16_t target_fh_len;
++    uint16_t compound_tag_len;
++    bool     file_size_valid;
++    bool     identity_valid;
++    bool     session_valid;
++    bool     compound_tag_truncated;
++    uint8_t  volume_id[NFS4_READ_EVENT_MOUNT_ID_SIZE];
++    uint8_t  file_id[NFS4_READ_EVENT_DIGEST_SIZE];
++    uint8_t  operation_id[NFS4_READ_EVENT_DIGEST_SIZE];
++    uint8_t  client_ref[NFS4_READ_EVENT_DIGEST_SIZE];
++    uint8_t  session_ref[NFS4_READ_EVENT_DIGEST_SIZE];
++    uint8_t  compound_tag_id[NFS4_READ_EVENT_DIGEST_SIZE];
++    uint8_t  target_fh[NFS4_READ_EVENT_TARGET_FH_SIZE];
++    char     export_name[NFS4_READ_EVENT_EXPORT_NAME_SIZE];
++    char     compound_tag[NFS4_READ_EVENT_TAG_SIZE + 1];
++};
++
++struct nfs4_read_events *
++nfs4_read_events_create(
++    struct prometheus_metrics *metrics,
++    const char                *sink_path);
++
++void
++nfs4_read_events_destroy(
++    struct nfs4_read_events *events);
++
++int
++nfs4_read_events_digest(
++    const void *data,
++    size_t      length,
++    uint8_t     digest[NFS4_READ_EVENT_DIGEST_SIZE]);
++
++int
++nfs4_read_events_file_id(
++    const uint8_t volume_id[NFS4_READ_EVENT_MOUNT_ID_SIZE],
++    const uint8_t *inner_fh,
++    uint16_t       inner_fh_len,
++    uint8_t        digest[NFS4_READ_EVENT_DIGEST_SIZE]);
++
++int
++nfs4_read_events_operation_id(
++    const uint8_t session_id[NFS4_READ_EVENT_SESSION_ID_SIZE],
++    uint32_t      slot_id,
++    uint32_t      sequence_id,
++    uint32_t      operation_index,
++    uint8_t       digest[NFS4_READ_EVENT_DIGEST_SIZE]);
++
++int
++nfs4_read_events_client_ref(
++    uint64_t client_id,
++    uint8_t  digest[NFS4_READ_EVENT_DIGEST_SIZE]);
++
++int
++nfs4_read_events_emit(
++    struct nfs4_read_events      *events,
++    const struct nfs4_read_event *event);
+diff --git a/src/server/nfs/nfs_common.h b/src/server/nfs/nfs_common.h
+index 22ac7467abab830502a2ad9e244d20a3c61d2aa0..aa3af3c8eb387bfec66e50fa98dcb2b35e7417bd 100644
+--- a/src/server/nfs/nfs_common.h
++++ b/src/server/nfs/nfs_common.h
+@@ -21,6 +21,7 @@
+ #include "nfs4_state.h"
+ #include "nfs4_layout_table.h"
+ #include "nfs4_recovery.h"
++#include "nfs4_read_events.h"
+ #include "nfs_fh_keyring.h"
+ #include "nfs3_drc.h"
+ #include "nfs_nlm_state.h"
+@@ -78,6 +79,8 @@ struct nfs_request {
+     struct nfs4_session              *session;
+     struct otel_span                  otel;        /* compound (aggregate) span */
+     struct otel_span                  op_otel;     /* current op span, child of otel */
++    bool                              read_event_active;
++    struct nfs4_read_event            read_event;
+     uint8_t                           op_span_active;
+     struct chimera_vfs_cred           cred;
+     /* The caller's credential as mapped from the RPC auth, before any export
+@@ -318,6 +321,7 @@ struct chimera_server_nfs_shared {
+ 
+     const struct chimera_server_config *config;
+     struct chimera_vfs                 *vfs;
++    struct nfs4_read_events            *read_events;
+ 
+     char                                portmap_hostname[16];
+ 
+@@ -494,7 +498,9 @@ nfs_request_alloc(
+     req->replay_slot    = NULL;
+     req->replay_slot_id = 0;
+     req->replay_prev_seqid = 0;
+-    req->replay_action  = NFS4_REPLAY_ACTION_NONE;
++    req->replay_action     = NFS4_REPLAY_ACTION_NONE;
++    req->read_event_active = false;
++    memset(&req->read_event, 0, sizeof(req->read_event));
+ 
+     /* Root span for this NFS request (a single NFSv3 op, or a whole NFSv4
+      * COMPOUND).  Parent the VFS ops it issues under it; propagation in
+diff --git a/src/server/nfs/tests/CMakeLists.txt b/src/server/nfs/tests/CMakeLists.txt
+index 1530192df0ae1edea9b6905b528bb42ded50ee03..645ae2c212fffb1dc9c106de907a0dbb3feba620 100644
+--- a/src/server/nfs/tests/CMakeLists.txt
++++ b/src/server/nfs/tests/CMakeLists.txt
+@@ -2,6 +2,21 @@
+ #
+ # SPDX-License-Identifier: LGPL-2.1-only
+ 
++add_executable(test_read_events test_read_events.c)
++target_include_directories(test_read_events PRIVATE
++    ${CMAKE_SOURCE_DIR}/src
++    ${CMAKE_CURRENT_SOURCE_DIR}/..)
++target_link_libraries(test_read_events chimera_common evpl pthread uuid crypto jansson)
++add_test(NAME chimera/server/nfs/read_events COMMAND test_read_events)
++
++add_executable(test_nfs4_read_decision test_nfs4_read_decision.c)
++target_include_directories(test_nfs4_read_decision PRIVATE
++    ${CMAKE_SOURCE_DIR}/src
++    ${CMAKE_CURRENT_SOURCE_DIR}/..
++    ${NFS_COMMON_INCLUDE_DIR})
++target_link_libraries(test_nfs4_read_decision chimera_nfs chimera_server chimera_vfs chimera_nfs_common chimera_common evpl evpl_rpc2 pthread uuid urcu-qsbr urcu-common)
++add_test(NAME chimera/server/nfs/read_decision COMMAND test_nfs4_read_decision)
++
+ # Unit test for the unified NFSv4 state model (Phases 1-4).
+ add_executable(test_state_table test_state_table.c)
+ target_link_libraries(test_state_table chimera_nfs chimera_server chimera_vfs chimera_nfs_common chimera_common evpl evpl_rpc2 pthread uuid urcu-qsbr urcu-common)
+diff --git a/src/server/nfs/tests/test_nfs4_read_decision.c b/src/server/nfs/tests/test_nfs4_read_decision.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..d5b66b94c8aa4a5f8e310abe84ede5ae724174a1
+--- /dev/null
++++ b/src/server/nfs/tests/test_nfs4_read_decision.c
+@@ -0,0 +1,166 @@
++// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
++//
++// SPDX-License-Identifier: LGPL-2.1-only
++
++#undef NDEBUG
++#include <assert.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "nfs4_procs.h"
++#include "nfs4_compound_cleanup.h"
++
++static unsigned int calls;
++static struct nfs4_read_event captured;
++
++int
++nfs4_read_events_emit(
++    struct nfs4_read_events      *events,
++    const struct nfs4_read_event *event)
++{
++    assert(events);
++    calls++;
++    captured = *event;
++    return 1;
++} /* nfs4_read_events_emit */
++
++void
++chimera_nfs4_compound_process(
++    struct nfs_request *req,
++    nfsstat4            status)
++{
++    (void) req;
++    (void) status;
++    abort();
++} /* chimera_nfs4_compound_process */
++
++struct fixture {
++    struct chimera_server_nfs_shared shared;
++    struct chimera_server_nfs_thread thread;
++    struct nfs_request req;
++    struct COMPOUND4args args;
++    struct nfs_argop4 argops[2];
++    struct nfs_resop4 resops[2];
++};
++
++static void
++fixture_reset(struct fixture *f)
++{
++    memset(&f->req, 0, sizeof(f->req));
++    memset(&f->args, 0, sizeof(f->args));
++    memset(f->argops, 0, sizeof(f->argops));
++    memset(f->resops, 0, sizeof(f->resops));
++    f->thread.active = 1;
++    f->thread.again = 0;
++    f->thread.shared = &f->shared;
++    f->req.thread = &f->thread;
++    f->req.args_compound = &f->args;
++    f->req.res_compound.resarray = f->resops;
++    f->req.res_compound.num_resarray = 2;
++    f->args.argarray = f->argops;
++    f->args.num_argarray = 2;
++} /* fixture_reset */
++
++static void
++complete_read(
++    struct fixture *f,
++    uint32_t        index,
++    uint64_t        offset,
++    uint32_t        requested,
++    uint32_t        returned,
++    nfsstat4        status)
++{
++    f->req.index = index;
++    f->argops[index].argop = OP_READ;
++    f->argops[index].opread.offset = offset;
++    f->argops[index].opread.count = requested;
++    f->resops[index].opread.resok4.data.length = returned;
++    f->req.read_event.offset = offset;
++    f->req.read_event.requested = requested;
++    f->req.read_event_active = true;
++    chimera_nfs4_compound_complete(&f->req, status);
++    assert(!f->req.read_event_active);
++    f->thread.again = 0;
++} /* complete_read */
++
++int
++main(void)
++{
++    struct fixture *f = calloc(1, sizeof(*f));
++
++    assert(f);
++    f->shared.read_events = malloc(1);
++    assert(f->shared.read_events);
++
++    fixture_reset(f);
++    assert(!f->req.read_event_active);
++    f->req.minorversion = 0;
++    f->req.seen_sequence = true;
++    f->req.session = (struct nfs4_session *) 1;
++    chimera_nfs4_read_event_set_active(&f->req, OP_READ);
++    assert(!f->req.read_event_active);
++    f->req.minorversion = 1;
++    f->req.seen_sequence = false;
++    chimera_nfs4_read_event_set_active(&f->req, OP_READ);
++    assert(!f->req.read_event_active);
++    f->req.seen_sequence = true;
++    chimera_nfs4_read_event_set_active(&f->req, OP_GETATTR);
++    assert(!f->req.read_event_active);
++    chimera_nfs4_read_event_set_active(&f->req, OP_READ);
++    assert(f->req.read_event_active);
++    f->req.read_event_active = false;
++    chimera_nfs4_compound_complete(&f->req, NFS4_OK);
++    assert(calls == 0);
++    fixture_reset(f);
++    f->req.read_event.eof = 0;
++    f->req.read_event.file_size = 1000;
++    f->req.read_event.file_size_valid = true;
++    complete_read(f, 0, 1234567890123ULL, 4096, 99, NFS4_OK);
++    assert(calls == 1 && captured.offset == 1234567890123ULL);
++    assert(captured.requested == 4096 && captured.status == NFS4_OK &&
++           captured.bytes == 99);
++    assert(!captured.eof && captured.file_size_valid &&
++           captured.file_size == 1000);
++
++    f->req.read_event.eof = 1;
++    f->req.read_event.file_size = 42;
++    f->req.read_event.file_size_valid = true;
++    complete_read(f, 1, 42, 512, 7, NFS4_OK);
++    assert(calls == 2 && captured.offset == 42);
++    assert(captured.requested == 512 && captured.status == NFS4_OK &&
++           captured.bytes == 7);
++    assert(captured.eof && captured.file_size == 42);
++
++    chimera_nfs4_compound_complete(&f->req, NFS4ERR_REP_TOO_BIG);
++    assert(calls == 2);
++
++    fixture_reset(f);
++    f->req.read_event.eof = 1;
++    complete_read(f, 0, 1000, 4096, 0, NFS4_OK);
++    assert(calls == 3 && captured.bytes == 0 && captured.eof);
++
++    fixture_reset(f);
++    complete_read(f, 0, 9, 64, 17, NFS4ERR_ACCESS);
++    assert(calls == 4 && captured.status == NFS4ERR_ACCESS &&
++           captured.bytes == 0);
++    assert(f->resops[0].opread.status == NFS4ERR_ACCESS);
++    chimera_nfs4_compound_complete(&f->req, NFS4ERR_ACCESS);
++    assert(calls == 4);
++
++    fixture_reset(f);
++    f->argops[0].argop = OP_READ;
++    f->argops[0].opread.offset = 77;
++    f->argops[0].opread.count = 128;
++    f->req.read_event.offset = 77;
++    f->req.read_event.requested = 128;
++    f->req.read_event_active = true;
++    nfs4_reject_undispatched_op(&f->req, &f->argops[0],
++                                &f->resops[0], NFS4ERR_RESOURCE);
++    assert(calls == 5 && captured.offset == 77 && captured.requested == 128);
++    assert(captured.status == NFS4ERR_RESOURCE && captured.bytes == 0);
++    assert(f->resops[0].opread.status == NFS4ERR_RESOURCE);
++
++    free(f->shared.read_events);
++    free(f);
++    return 0;
++} /* main */
+diff --git a/src/server/nfs/tests/test_nfs4_undispatched.c b/src/server/nfs/tests/test_nfs4_undispatched.c
+index a24d739207588fb3a0c788f1e97644ab3fcdf59f..fb0bc761d6ddd9e5b64e2ca32ab9126b9c81aec7 100644
+--- a/src/server/nfs/tests/test_nfs4_undispatched.c
++++ b/src/server/nfs/tests/test_nfs4_undispatched.c
+@@ -19,6 +19,17 @@ void test_iovecs_release(
+ #undef NFS4_IOVECS_RELEASE
+ #undef chimera_nfs4_compound_process
+ 
++int
++nfs4_read_events_emit(
++    struct nfs4_read_events      *events,
++    const struct nfs4_read_event *event)
++{
++    (void) events;
++    (void) event;
++    abort();
++    return 0;
++} /* nfs4_read_events_emit */
++
+ #define CHECK(cond)                                                      \
+         do {                                                             \
+             if (!(cond)) {                                               \
+diff --git a/src/server/nfs/tests/test_read_events.c b/src/server/nfs/tests/test_read_events.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..5523c6eda600adc70113918418e2200cf3e8f8f6
+--- /dev/null
++++ b/src/server/nfs/tests/test_read_events.c
+@@ -0,0 +1,1023 @@
++// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
++//
++// SPDX-License-Identifier: LGPL-2.1-only
++
++#undef NDEBUG
++#include <assert.h>
++#include <jansson.h>
++#include <sched.h>
++#include <stdarg.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "../nfs_fh_wrap.h"
++#include "../nfs4_read_events.c"
++
++static char                 lines[64][2048];
++static unsigned int         line_count;
++static _Atomic int          reject_log;
++static _Atomic unsigned int rejected;
++static pthread_mutex_t      test_lock    = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t       test_wake    = PTHREAD_COND_INITIALIZER;
++static int                  block_worker = 1;
++static int                  worker_blocked;
++static int                  sync_blocked;
++static int                  sync_entered;
++static int                  sync_fail;
++static int                  partial_write_calls;
++static int                  fsync_calls;
++static int                  fsync_fail_on;
++static int                  first_producer_blocked;
++static int                  release_first_producer;
++static int                  barrier_publish_blocked;
++static int                  barrier_publish_entered;
++
++struct producer_ctx {
++    struct nfs4_read_events *events;
++    struct nfs4_read_event   event;
++};
++
++int
++chimera_log_try_info(
++    const char *mod,
++    const char *file,
++    int         line,
++    const char *fmt,
++    ...)
++{
++    va_list args;
++
++    pthread_mutex_lock(&test_lock);
++    if (block_worker) {
++        worker_blocked = 1;
++        pthread_cond_broadcast(&test_wake);
++        while (block_worker) {
++            pthread_cond_wait(&test_wake, &test_lock);
++        }
++    }
++    pthread_mutex_unlock(&test_lock);
++    if (atomic_load(&reject_log)) {
++        atomic_fetch_add(&rejected, 1);
++        return 0;
++    }
++    assert(line_count < 64);
++    va_start(args, fmt);
++    vsnprintf(lines[line_count++], sizeof(lines[0]), fmt, args);
++    va_end(args);
++    return 1;
++} /* chimera_log_try_info */
++
++static int
++test_fdatasync(int fd)
++{
++    pthread_mutex_lock(&test_lock);
++    if (sync_blocked) {
++        sync_entered = 1;
++        pthread_cond_broadcast(&test_wake);
++        while (sync_blocked) {
++            pthread_cond_wait(&test_wake, &test_lock);
++        }
++    }
++    pthread_mutex_unlock(&test_lock);
++    if (sync_fail) {
++        errno = EIO;
++        return -1;
++    }
++    return fdatasync(fd);
++} /* test_fdatasync */
++
++static ssize_t
++test_partial_write(
++    int         fd,
++    const void *buffer,
++    size_t      length)
++{
++    if (partial_write_calls++ == 0) {
++        return write(fd, buffer, length / 2);
++    }
++    errno = EIO;
++    return -1;
++} /* test_partial_write */
++
++static int
++test_ftruncate_fail(
++    int   fd,
++    off_t length)
++{
++    (void) fd;
++    (void) length;
++    errno = EIO;
++    return -1;
++} /* test_ftruncate_fail */
++
++static int
++test_fsync_fail(int fd)
++{
++    (void) fd;
++    errno = EIO;
++    return -1;
++} /* test_fsync_fail */
++
++static int
++test_fsync_nth(int fd)
++{
++    if (++fsync_calls == fsync_fail_on) {
++        errno = EIO;
++        return -1;
++    }
++    return fsync(fd);
++} /* test_fsync_nth */
++
++static void *
++test_producer(void *arg)
++{
++    struct producer_ctx *ctx = arg;
++
++    while (!nfs4_read_events_emit(ctx->events, &ctx->event)) {
++        sched_yield();
++    }
++    return NULL;
++} /* test_producer */
++
++static void
++test_reorder_before_lock(const struct nfs4_read_event *event)
++{
++    if (event->offset != 0) {
++        return;
++    }
++    pthread_mutex_lock(&test_lock);
++    first_producer_blocked = 1;
++    pthread_cond_broadcast(&test_wake);
++    while (!release_first_producer) {
++        pthread_cond_wait(&test_wake, &test_lock);
++    }
++    pthread_mutex_unlock(&test_lock);
++} /* test_reorder_before_lock */
++
++static void
++test_before_barrier_publish(void)
++{
++    pthread_mutex_lock(&test_lock);
++    barrier_publish_entered = 1;
++    pthread_cond_broadcast(&test_wake);
++    while (barrier_publish_blocked) {
++        pthread_cond_wait(&test_wake, &test_lock);
++    }
++    pthread_mutex_unlock(&test_lock);
++} /* test_before_barrier_publish */
++
++static void
++emit_without_queue_drop(
++    struct nfs4_read_events      *events,
++    const struct nfs4_read_event *event)
++{
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (nfs4_read_events_emit(events, event)) {
++            return;
++        }
++        sched_yield();
++    }
++    assert(0 && "could not enqueue a READ decision event");
++} /* emit_without_queue_drop */
++
++static void
++wait_for_worker(void)
++{
++    pthread_mutex_lock(&test_lock);
++    while (!worker_blocked) {
++        pthread_cond_wait(&test_wake, &test_lock);
++    }
++    pthread_mutex_unlock(&test_lock);
++} /* wait_for_worker */
++
++static void
++release_worker(void)
++{
++    pthread_mutex_lock(&test_lock);
++    block_worker = 0;
++    pthread_cond_broadcast(&test_wake);
++    pthread_mutex_unlock(&test_lock);
++} /* release_worker */
++
++static void
++make_sink_path(char path[64])
++{
++    int fd;
++
++    strcpy(path, "/tmp/chimera-read-events-XXXXXX");
++    fd = mkstemp(path);
++    assert(fd >= 0);
++    close(fd);
++    unlink(path);
++} /* make_sink_path */
++
++static unsigned int
++sink_line_count(const char *path)
++{
++    FILE        *file = fopen(path, "r");
++    char         line[4096];
++    unsigned int count = 0;
++
++    if (!file) {
++        return 0;
++    }
++    while (fgets(line, sizeof(line), file)) {
++        json_error_t error;
++        json_t      *record = json_loads(line, 0, &error);
++        const char  *event_time;
++        const char  *sink_time;
++
++        if (!record) {
++            fprintf(stderr, "invalid JSONL at %d:%d: %s\n%s",
++                    error.line, error.column, error.text, line);
++        }
++        assert(record);
++        assert(strcmp(json_string_value(json_object_get(record, "schema")),
++                      "nfs4_read_v2") == 0);
++        event_time = json_string_value(
++            json_object_get(record, "event_time_ns"));
++        sink_time = json_string_value(
++            json_object_get(record, "sink_time_ns"));
++        assert(event_time && sink_time);
++        assert(strtoull(sink_time, NULL, 10) >=
++               strtoull(event_time, NULL, 10));
++        json_decref(record);
++        count++;
++    }
++    fclose(file);
++    return count;
++} /* sink_line_count */
++
++static unsigned int
++sink_match_count(
++    const char *path,
++    const char *needle)
++{
++    FILE        *file = fopen(path, "r");
++    char         line[4096];
++    unsigned int count = 0;
++
++    assert(file);
++    while (fgets(line, sizeof(line), file)) {
++        if (strstr(line, needle)) {
++            count++;
++        }
++    }
++    fclose(file);
++    return count;
++} /* sink_match_count */
++
++static void
++assert_sink_sequences(
++    const char   *path,
++    unsigned int  expected)
++{
++    FILE        *file = fopen(path, "r");
++    char         line[4096];
++    unsigned int sequence = 0;
++
++    assert(file);
++    while (fgets(line, sizeof(line), file)) {
++        json_error_t error;
++        json_t      *record = json_loads(line, 0, &error);
++        const char  *value;
++
++        assert(record);
++        value = json_string_value(
++            json_object_get(record, "producer_sequence"));
++        assert(value);
++        assert(strtoull(value, NULL, 10) == ++sequence);
++        json_decref(record);
++    }
++    fclose(file);
++    assert(sequence == expected);
++} /* assert_sink_sequences */
++
++static void
++sink_first_epoch(
++    const char *path,
++    char        epoch[37])
++{
++    FILE         *file = fopen(path, "r");
++    char          line[4096];
++    json_error_t  error;
++    json_t       *record;
++    const char   *value;
++
++    assert(file);
++    assert(fgets(line, sizeof(line), file));
++    fclose(file);
++    record = json_loads(line, 0, &error);
++    assert(record);
++    value = json_string_value(json_object_get(record, "producer_epoch"));
++    assert(value && strlen(value) == 36);
++    memcpy(epoch, value, 37);
++    json_decref(record);
++} /* sink_first_epoch */
++
++static void
++test_identity_vectors(void)
++{
++    uint8_t volume[16], inner[16], session[16];
++    uint8_t file_id[32], operation_id[32], session_ref[32], client_ref[32];
++    uint8_t key1[16] = { 1 }, key2[16] = { 2 };
++    uint8_t wire1[CHIMERA_NFS_FH_MAX], wire2[CHIMERA_NFS_FH_MAX];
++    uint8_t decoded[CHIMERA_VFS_FH_SIZE], zero_digest[32];
++    uint16_t export_id;
++    int wire1_len, wire2_len, decoded_len;
++    char hex[65];
++
++    for (size_t i = 0; i < sizeof(volume); i++) {
++        volume[i] = (uint8_t) i;
++        inner[i]  = (uint8_t) (i + 16);
++        session[i] = (uint8_t) i;
++    }
++    assert(nfs4_read_events_file_id(volume, inner, sizeof(inner), file_id));
++    nfs4_read_events_hex(file_id, sizeof(file_id), hex);
++    assert(strcmp(hex,
++                  "336a5c3da93d04dab989509a4eb5c2f147a2cd4b0ff3098c"
++                  "3499e9f0f0a6921b") == 0);
++    assert(nfs4_read_events_operation_id(session, 4, 5, 3, operation_id));
++    nfs4_read_events_hex(operation_id, sizeof(operation_id), hex);
++    assert(strcmp(hex,
++                  "ccbf74fb9770465efae264496ca0a03a272f78e792194a9b"
++                  "41dcd042bcf1412c") == 0);
++    assert(nfs4_read_events_digest(session, sizeof(session), session_ref));
++    nfs4_read_events_hex(session_ref, sizeof(session_ref), hex);
++    assert(strcmp(hex,
++                  "be45cb2605bf36bebde684841a28f0fd43c69850a3dce5f"
++                  "edba69928ee3a8991") == 0);
++    assert(nfs4_read_events_client_ref(99, client_ref));
++    nfs4_read_events_hex(client_ref, sizeof(client_ref), hex);
++    assert(strcmp(hex,
++                  "b45232b489aed72eac1e713b4f1545827f7e91a2d98e709"
++                  "f4787aec66899a0cc") == 0);
++
++    assert(nfs4_read_events_file_id(volume, inner, 0, zero_digest));
++    assert(!nfs4_read_events_file_id(volume, inner,
++                                     NFS4_READ_EVENT_TARGET_FH_SIZE + 1,
++                                     zero_digest));
++
++    assert(chimera_nfs_fh_wrap(wire1, &wire1_len, 7, inner, sizeof(inner),
++                               key1, 1) == CHIMERA_NFS_FH_OK);
++    assert(chimera_nfs_fh_wrap(wire2, &wire2_len, 7, inner, sizeof(inner),
++                               key2, 1) == CHIMERA_NFS_FH_OK);
++    assert(wire1_len == wire2_len);
++    assert(memcmp(wire1, wire2, wire1_len) != 0);
++    assert(chimera_nfs_fh_unwrap(wire1, wire1_len, &export_id,
++                                 decoded, &decoded_len, key1, 1) ==
++           CHIMERA_NFS_FH_OK);
++    assert(export_id == 7 && decoded_len == (int) sizeof(inner));
++    assert(memcmp(decoded, inner, sizeof(inner)) == 0);
++    assert(chimera_nfs_fh_unwrap(wire2, wire2_len, &export_id,
++                                 decoded, &decoded_len, key2, 1) ==
++           CHIMERA_NFS_FH_OK);
++    assert(memcmp(decoded, inner, sizeof(inner)) == 0);
++    assert(nfs4_read_events_file_id(volume, decoded, (uint16_t) decoded_len,
++                                    zero_digest));
++    assert(memcmp(file_id, zero_digest, sizeof(file_id)) == 0);
++} /* test_identity_vectors */
++
++int
++main(void)
++{
++    struct prometheus_metrics *metrics = prometheus_metrics_create(NULL, NULL, 0);
++    struct nfs4_read_events   *events;
++    struct nfs4_read_event     event = { 0 };
++    char                       id1[37], id2[37];
++    char                       sink_path[64];
++    char                       first_epoch[37], next_epoch[37];
++    char                       metrics_buffer[8192];
++
++    test_identity_vectors();
++    assert(metrics);
++    event.offset          = UINT64_MAX;
++    event.requested       = UINT32_MAX;
++    event.bytes           = 7;
++    event.eof             = 1;
++    event.file_size       = UINT64_MAX;
++    event.file_size_valid = true;
++    event.identity_valid  = true;
++    event.export_id       = 7;
++    event.session_valid   = true;
++    event.compound_op_index = 3;
++    event.slot_id           = 4;
++    event.sequence_id       = 5;
++    event.target_created_ns = 1234;
++    event.target_fh_len   = sizeof(event.target_fh);
++    strcpy(event.export_name, "volume-7");
++    strcpy(event.compound_tag,
++           "pc1:d:0123456789abcdef0123456789abcdef:"
++           "11111111111111111111111111111111:"
++           "22222222222222222222222222222222");
++    event.compound_tag_len = strlen(event.compound_tag);
++    event.compound_tag_original_len = event.compound_tag_len;
++    assert(event.compound_tag_len == 104);
++    for (size_t i = 0; i < sizeof(event.volume_id); i++) {
++        event.volume_id[i] = (uint8_t) i;
++    }
++    for (size_t i = 0; i < sizeof(event.file_id); i++) {
++        event.file_id[i] = (uint8_t) (i + 1);
++        event.operation_id[i] = (uint8_t) (0x20 + i);
++        event.client_ref[i] = (uint8_t) (0x40 + i);
++        event.session_ref[i] = (uint8_t) (0x60 + i);
++        event.compound_tag_id[i] = (uint8_t) (0xff - i);
++    }
++    for (size_t i = 0; i < sizeof(event.target_fh); i++) {
++        event.target_fh[i] = (uint8_t) i;
++    }
++
++    make_sink_path(sink_path);
++    events = nfs4_read_events_create(metrics, sink_path);
++    memcpy(first_epoch, events->producer_epoch, sizeof(first_epoch));
++    assert(prometheus_metrics_scrape(metrics, metrics_buffer,
++                                     sizeof(metrics_buffer)) > 0);
++    assert(strstr(metrics_buffer, first_epoch));
++    struct stat sink_stat;
++    assert(stat(sink_path, &sink_stat) == 0);
++    assert((sink_stat.st_mode & 0777) == 0600);
++    emit_without_queue_drop(events, &event);
++    wait_for_worker();
++    event.offset          = 42;
++    event.requested       = 4096;
++    event.status          = 13;
++    event.bytes           = 0;
++    event.file_size_valid = false;
++    memset(event.compound_tag, 'x', NFS4_READ_EVENT_TAG_SIZE);
++    event.compound_tag[NFS4_READ_EVENT_TAG_SIZE] = '\0';
++    event.compound_tag_len = NFS4_READ_EVENT_TAG_SIZE;
++    event.compound_tag_original_len = 4096;
++    event.compound_tag_truncated = true;
++    event.operation_id[0] = 0x99;
++    emit_without_queue_drop(events, &event);
++    event.offset = 43;
++    event.compound_tag[0] = '\0';
++    event.compound_tag_len = 0;
++    event.compound_tag_original_len = 0;
++    event.compound_tag_truncated = false;
++    emit_without_queue_drop(events, &event);
++    release_worker();
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (sink_line_count(sink_path) == 3) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(sink_line_count(sink_path) == 3);
++    assert(sink_match_count(
++               sink_path,
++               "\"operation_id\":\"202122232425262728292a2b2c2d2e2f"
++               "303132333435363738393a3b3c3d3e3f\"") == 1);
++    sink_first_epoch(sink_path, next_epoch);
++    assert(strcmp(first_epoch, next_epoch) == 0);
++    assert(atomic_load(&events->dropped_queue) == 0);
++    assert(atomic_load(&events->dropped_encode) == 0);
++    assert(atomic_load(&events->dropped_sink) == 0);
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++
++    assert(line_count == 3);
++    assert(strstr(lines[0], "schema=nfs4_read_v2 local_id="));
++    assert(strstr(lines[0], "producer_epoch="));
++    assert(strstr(lines[0], "producer_sequence=1 event_time_ns="));
++    assert(strstr(lines[0], "target_created_ns=1234"));
++    assert(strstr(lines[0],
++                  "volume_id=000102030405060708090a0b0c0d0e0f"));
++    assert(strstr(lines[0],
++                  "file_id=0102030405060708090a0b0c0d0e0f10"
++                  "1112131415161718191a1b1c1d1e1f20"));
++    assert(strstr(lines[0], "export_name_b64=dm9sdW1lLTc export_id=7"));
++    assert(strstr(lines[0], "target_fh=AAECAwQFBgcICQoLDA0ODx"));
++    assert(strstr(lines[0],
++                  "operation_id=202122232425262728292a2b2c2d2e2f"
++                  "303132333435363738393a3b3c3d3e3f"));
++    assert(strstr(lines[0],
++                  "client_ref=404142434445464748494a4b4c4d4e4f"
++                  "505152535455565758595a5b5c5d5e5f"));
++    assert(strstr(lines[0],
++                  "session_ref=606162636465666768696a6b6c6d6e6f"
++                  "707172737475767778797a7b7c7d7e7f"));
++    assert(strstr(lines[0],
++                  "compound_op_index=3 slot_id=4 sequence_id=5"));
++    assert(strstr(lines[0],
++                  "origin_claim=controlled_demand"
++                  " origin_trust=client_asserted"));
++    assert(strstr(lines[0],
++                  "requested_offset=18446744073709551615"
++                  " requested_count=4294967295 returned_bytes=7"
++                  " nfs_status=0 outcome=success eof=true"
++                  " file_size_valid=true file_size=18446744073709551615"));
++    assert(strstr(lines[1],
++                  "producer_sequence=2"));
++    assert(strstr(lines[1],
++                  "compound_tag_b64=eHh4eHh4eHh4"));
++    assert(strstr(lines[1],
++                  "compound_tag_original_length=4096"
++                  " compound_tag_truncated=true"));
++    assert(strstr(lines[1],
++                  "origin_claim=unknown origin_trust=client_asserted"));
++    assert(strstr(lines[1],
++                  "requested_offset=42 requested_count=4096"
++                  " returned_bytes=0 nfs_status=13 outcome=error"
++                  " eof=false file_size_valid=false file_size=unknown"));
++    assert(sscanf(lines[0], "schema=nfs4_read_v2 local_id=%36s", id1) == 1);
++    assert(sscanf(lines[1], "schema=nfs4_read_v2 local_id=%36s", id2) == 1);
++    assert(strcmp(id1, id2) != 0);
++    assert(strstr(lines[2], "compound_tag_b64="));
++    assert(strstr(lines[2], " compound_tag_original_length=0"));
++    assert(strstr(lines[2], "origin_claim=unknown origin_trust=client_asserted"));
++
++    make_sink_path(sink_path);
++    events = nfs4_read_events_create(metrics, sink_path);
++    memcpy(next_epoch, events->producer_epoch, sizeof(next_epoch));
++    assert(strcmp(first_epoch, next_epoch) != 0);
++    assert(prometheus_metrics_scrape(metrics, metrics_buffer,
++                                     sizeof(metrics_buffer)) > 0);
++    assert(strstr(metrics_buffer, next_epoch));
++    pthread_mutex_lock(&events->lock);
++    nfs4_read_events_emit(events, &event);
++    assert(atomic_load(&events->dropped_queue) == 1);
++    assert(events->barrier_ready_instance->value == 0);
++    assert(prometheus_metrics_scrape(metrics, metrics_buffer,
++                                     sizeof(metrics_buffer)) > 0);
++    assert(strstr(metrics_buffer,
++                  "chimera_nfs4_read_events_dropped{stage=\"queue\"} 1"));
++    assert(strstr(metrics_buffer,
++                  "chimera_nfs4_read_event_state{state=\"barrier_ready\"} 0"));
++    pthread_mutex_unlock(&events->lock);
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++
++    atomic_store(&reject_log, 1);
++    pthread_mutex_lock(&test_lock);
++    block_worker   = 1;
++    worker_blocked = 0;
++    pthread_mutex_unlock(&test_lock);
++    events = nfs4_read_events_create(metrics, sink_path);
++    emit_without_queue_drop(events, &event);
++    wait_for_worker();
++    release_worker();
++    nfs4_read_events_destroy(events);
++    assert(atomic_load(&rejected) == 1);
++    assert(sink_line_count(sink_path) == 1);
++    unlink(sink_path);
++
++    atomic_store(&rejected, 0);
++    pthread_mutex_lock(&test_lock);
++    block_worker   = 1;
++    worker_blocked = 0;
++    pthread_mutex_unlock(&test_lock);
++    events = nfs4_read_events_create(metrics, NULL);
++    emit_without_queue_drop(events, &event);
++    wait_for_worker();
++    for (unsigned int i = 0; i < NFS4_READ_EVENT_QUEUE_SIZE; i++) {
++        event.offset = i;
++        emit_without_queue_drop(events, &event);
++    }
++    nfs4_read_events_emit(events, &event);
++    assert(atomic_load(&events->dropped_queue) == 1);
++    release_worker();
++    nfs4_read_events_destroy(events);
++    assert(atomic_load(&rejected) == NFS4_READ_EVENT_QUEUE_SIZE + 1);
++
++    atomic_store(&reject_log, 0);
++    make_sink_path(sink_path);
++    events = nfs4_read_events_create(metrics, sink_path);
++    event.target_fh_len = NFS4_READ_EVENT_TARGET_FH_SIZE + 1;
++    emit_without_queue_drop(events, &event);
++    release_worker();
++    uint64_t encode_drops;
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        encode_drops = atomic_load(&events->dropped_encode);
++        if (encode_drops) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(encode_drops == 1);
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++
++    make_sink_path(sink_path);
++    events = nfs4_read_events_create(metrics, sink_path);
++    event.target_fh_len = sizeof(event.target_fh);
++    pthread_mutex_lock(&test_lock);
++    sync_blocked = 1;
++    sync_entered = 0;
++    barrier_publish_blocked = 1;
++    barrier_publish_entered = 0;
++    pthread_mutex_unlock(&test_lock);
++    events->fdatasync_fn = test_fdatasync;
++    emit_without_queue_drop(events, &event);
++    pthread_mutex_lock(&test_lock);
++    while (!sync_entered) {
++        pthread_cond_wait(&test_wake, &test_lock);
++    }
++    events->before_barrier_publish_fn = test_before_barrier_publish;
++    sync_blocked = 0;
++    pthread_cond_broadcast(&test_wake);
++    while (!barrier_publish_entered) {
++        pthread_cond_wait(&test_wake, &test_lock);
++    }
++    pthread_mutex_unlock(&test_lock);
++    assert(!nfs4_read_events_emit(events, &event));
++    assert(atomic_load(&events->dropped_queue) == 1);
++    assert(atomic_load_explicit(&events->delivery_clean,
++                                memory_order_acquire) == 0);
++    assert(events->delivery_clean_instance->value == 0);
++    assert(events->barrier_ready_instance->value == 0);
++    pthread_mutex_lock(&test_lock);
++    barrier_publish_blocked = 0;
++    pthread_cond_broadcast(&test_wake);
++    pthread_mutex_unlock(&test_lock);
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (atomic_load(&events->worker_in_flight) == 0) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(events->barrier_ready_instance->value == 0);
++    assert(prometheus_metrics_scrape(metrics, metrics_buffer,
++                                     sizeof(metrics_buffer)) > 0);
++    assert(strstr(metrics_buffer,
++                  "chimera_nfs4_read_events_dropped{stage=\"queue\"} 1"));
++    assert(strstr(metrics_buffer,
++                  "chimera_nfs4_read_event_state{state=\"delivery_clean\"} 0"));
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++
++    make_sink_path(sink_path);
++    events = nfs4_read_events_create(metrics, sink_path);
++    event.target_fh_len = sizeof(event.target_fh);
++    pthread_mutex_lock(&test_lock);
++    sync_blocked = 1;
++    sync_entered = 0;
++    pthread_mutex_unlock(&test_lock);
++    events->fdatasync_fn = test_fdatasync;
++    enum { PRODUCER_COUNT = 2 };
++    struct producer_ctx producers[PRODUCER_COUNT];
++    pthread_t producer_threads[PRODUCER_COUNT];
++    first_producer_blocked = 0;
++    release_first_producer = 0;
++    events->before_enqueue_lock_fn = test_reorder_before_lock;
++    producers[0].events = events;
++    producers[0].event  = event;
++    producers[0].event.offset = 0;
++    assert(pthread_create(&producer_threads[0], NULL,
++                          test_producer, &producers[0]) == 0);
++    pthread_mutex_lock(&test_lock);
++    while (!first_producer_blocked) {
++        pthread_cond_wait(&test_wake, &test_lock);
++    }
++    pthread_mutex_unlock(&test_lock);
++    producers[1].events = events;
++    producers[1].event  = event;
++    producers[1].event.offset = 1;
++    assert(pthread_create(&producer_threads[1], NULL,
++                          test_producer, &producers[1]) == 0);
++    assert(pthread_join(producer_threads[1], NULL) == 0);
++    pthread_mutex_lock(&test_lock);
++    while (!sync_entered) {
++        pthread_cond_wait(&test_wake, &test_lock);
++    }
++    release_first_producer = 1;
++    pthread_cond_broadcast(&test_wake);
++    pthread_mutex_unlock(&test_lock);
++    assert(pthread_join(producer_threads[0], NULL) == 0);
++    events->before_enqueue_lock_fn = NULL;
++    assert(atomic_load(&events->last_enqueued_sequence) == PRODUCER_COUNT);
++    assert(atomic_load(&events->last_synced_sequence) == 0);
++    assert(atomic_load(&events->worker_in_flight) == 1);
++    assert(atomic_load(&events->queue_depth) == PRODUCER_COUNT - 1);
++    assert(events->barrier_ready_instance->value == 0);
++    pthread_mutex_lock(&test_lock);
++    sync_blocked = 0;
++    pthread_cond_broadcast(&test_wake);
++    pthread_mutex_unlock(&test_lock);
++    for (unsigned int attempt = 0; attempt < 100000; attempt++) {
++        if (events->barrier_ready_instance->value == 1) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(atomic_load(&events->last_enqueued_sequence) == PRODUCER_COUNT);
++    assert(atomic_load(&events->last_synced_sequence) == PRODUCER_COUNT);
++    assert(atomic_load(&events->queue_depth) == 0);
++    assert(atomic_load(&events->worker_in_flight) == 0);
++    assert(events->barrier_ready_instance->value == 1);
++    assert_sink_sequences(sink_path, PRODUCER_COUNT);
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++
++    make_sink_path(sink_path);
++    events = nfs4_read_events_create(metrics, sink_path);
++    close(events->sink_fd);
++    events->sink_fd = open("/dev/full", O_WRONLY);
++    assert(events->sink_fd >= 0);
++    event.target_fh_len = sizeof(event.target_fh);
++    pthread_mutex_lock(&test_lock);
++    block_worker = 1;
++    worker_blocked = 0;
++    pthread_mutex_unlock(&test_lock);
++    emit_without_queue_drop(events, &event);
++    wait_for_worker();
++    assert(atomic_load(&events->dropped_sink) == 1);
++    assert(events->barrier_ready_instance->value == 0);
++    assert(prometheus_metrics_scrape(metrics, metrics_buffer,
++                                     sizeof(metrics_buffer)) > 0);
++    assert(strstr(metrics_buffer,
++                  "chimera_nfs4_read_events_dropped{stage=\"sink\"} 1"));
++    assert(strstr(metrics_buffer,
++                  "chimera_nfs4_read_event_state{state=\"barrier_ready\"} 0"));
++    release_worker();
++    event.offset++;
++    emit_without_queue_drop(events, &event);
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (sink_line_count(sink_path) == 1) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(sink_line_count(sink_path) == 1);
++    assert(atomic_load(&events->dropped_sink) == 1);
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++
++    make_sink_path(sink_path);
++    char rotated_path[80];
++    snprintf(rotated_path, sizeof(rotated_path), "%s.1", sink_path);
++    events = nfs4_read_events_create(metrics, sink_path);
++    events->sink_max_bytes = 1;
++    events->sink_bytes = 1;
++    event.target_fh_len = sizeof(event.target_fh);
++    emit_without_queue_drop(events, &event);
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (sink_line_count(sink_path) == 1) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(sink_line_count(sink_path) == 1);
++    assert(access(rotated_path, F_OK) == 0);
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++    unlink(rotated_path);
++
++    events = nfs4_read_events_create(
++        metrics, "/no/such/chimera-read-events/events.jsonl");
++    assert(atomic_load(&events->dropped_sink) == 1);
++    emit_without_queue_drop(events, &event);
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (atomic_load(&events->dropped_sink) == 2) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(atomic_load(&events->dropped_sink) == 2);
++    nfs4_read_events_destroy(events);
++
++    events = nfs4_read_events_create(metrics, "");
++    assert(atomic_load(&events->dropped_sink) == 1);
++    nfs4_read_events_destroy(events);
++    char overlong_path[300];
++    memset(overlong_path, 'x', sizeof(overlong_path) - 1);
++    overlong_path[sizeof(overlong_path) - 1] = '\0';
++    events = nfs4_read_events_create(metrics, overlong_path);
++    assert(atomic_load(&events->dropped_sink) == 1);
++    nfs4_read_events_destroy(events);
++
++    char target_path[64], link_path[80];
++    make_sink_path(target_path);
++    snprintf(link_path, sizeof(link_path), "%s-link", target_path);
++    assert(symlink(target_path, link_path) == 0);
++    events = nfs4_read_events_create(metrics, link_path);
++    assert(atomic_load(&events->dropped_sink) == 1);
++    emit_without_queue_drop(events, &event);
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (atomic_load(&events->dropped_sink) == 2) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(atomic_load(&events->dropped_sink) == 2);
++    nfs4_read_events_destroy(events);
++    assert(sink_line_count(target_path) == 0);
++    unlink(link_path);
++    unlink(target_path);
++
++    make_sink_path(sink_path);
++    events = nfs4_read_events_create(metrics, sink_path);
++    pthread_mutex_lock(&test_lock);
++    block_worker = 0;
++    sync_blocked = 1;
++    sync_entered = 0;
++    pthread_mutex_unlock(&test_lock);
++    events->fdatasync_fn = test_fdatasync;
++    emit_without_queue_drop(events, &event);
++    pthread_mutex_lock(&test_lock);
++    while (!sync_entered) {
++        pthread_cond_wait(&test_wake, &test_lock);
++    }
++    pthread_mutex_unlock(&test_lock);
++    assert(sink_line_count(sink_path) == 1);
++    assert(atomic_load(&events->last_synced_sequence) == 0);
++    assert(atomic_load(&events->synced_count) == 0);
++    assert(atomic_load(&events->queue_depth) == 0);
++    assert(atomic_load(&events->last_enqueued_sequence) == 1);
++    assert(atomic_load(&events->worker_in_flight) == 1);
++    assert(events->last_synced_instance->value == 0);
++    assert(events->queue_depth_instance->value == 0);
++    assert(events->worker_in_flight_instance->value == 1);
++    pthread_mutex_lock(&test_lock);
++    sync_blocked = 0;
++    pthread_cond_broadcast(&test_wake);
++    pthread_mutex_unlock(&test_lock);
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (atomic_load(&events->last_synced_sequence) == 1 &&
++            events->last_synced_instance->value == 1 &&
++            events->synced_count_instance->value == 1) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(atomic_load(&events->last_synced_sequence) == 1);
++    assert(atomic_load(&events->last_enqueued_sequence) ==
++           atomic_load(&events->last_synced_sequence));
++    assert(atomic_load(&events->synced_count) == 1);
++    assert(atomic_load(&events->worker_in_flight) == 0);
++    assert(events->last_synced_instance->value == 1);
++    assert(events->synced_count_instance->value == 1);
++    assert(events->worker_in_flight_instance->value == 0);
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++
++    make_sink_path(sink_path);
++    events = nfs4_read_events_create(metrics, sink_path);
++    events->fdatasync_fn = test_fdatasync;
++    sync_fail = 1;
++    emit_without_queue_drop(events, &event);
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (atomic_load(&events->dropped_sink)) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(atomic_load(&events->dropped_sink) == 1);
++    assert(atomic_load(&events->last_synced_sequence) == 0);
++    assert(sink_line_count(sink_path) == 0);
++    sync_fail = 0;
++    emit_without_queue_drop(events, &event);
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (atomic_load(&events->last_synced_sequence) == 2) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(atomic_load(&events->last_synced_sequence) == 2);
++    assert(atomic_load(&events->synced_count) == 1);
++    assert(sink_line_count(sink_path) == 1);
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++
++    make_sink_path(sink_path);
++    events = nfs4_read_events_create(metrics, sink_path);
++    partial_write_calls = 0;
++    events->write_fn = test_partial_write;
++    emit_without_queue_drop(events, &event);
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (atomic_load(&events->dropped_sink)) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(atomic_load(&events->dropped_sink) == 1);
++    assert(atomic_load(&events->dropped_rollback) == 0);
++    assert(sink_line_count(sink_path) == 0);
++    events->write_fn = write;
++    emit_without_queue_drop(events, &event);
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (atomic_load(&events->last_synced_sequence) == 2) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(sink_line_count(sink_path) == 1);
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++
++    make_sink_path(sink_path);
++    events = nfs4_read_events_create(metrics, sink_path);
++    partial_write_calls = 0;
++    events->write_fn = test_partial_write;
++    events->ftruncate_fn = test_ftruncate_fail;
++    emit_without_queue_drop(events, &event);
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (atomic_load(&events->dropped_rollback) &&
++            atomic_load(&events->dropped_sink)) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(atomic_load(&events->dropped_sink) == 1);
++    assert(atomic_load(&events->dropped_rollback) == 1);
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++
++    make_sink_path(sink_path);
++    assert(mkfifo(sink_path, 0600) == 0);
++    events = nfs4_read_events_create(metrics, sink_path);
++    assert(atomic_load(&events->dropped_sink) == 1);
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++
++    struct stat null_before, null_after;
++    assert(stat("/dev/null", &null_before) == 0);
++    events = nfs4_read_events_create(metrics, "/dev/null");
++    assert(atomic_load(&events->dropped_sink) == 1);
++    nfs4_read_events_destroy(events);
++    assert(stat("/dev/null", &null_after) == 0);
++    assert((null_before.st_mode & 07777) == (null_after.st_mode & 07777));
++
++    if (geteuid() == 0) {
++        strcpy(sink_path, "/tmp/chimera-read-events-owner-XXXXXX");
++        int owner_fd = mkstemp(sink_path);
++        assert(owner_fd >= 0);
++        close(owner_fd);
++        assert(chmod(sink_path, 0644) == 0);
++        assert(chown(sink_path, 65534, 65534) == 0);
++        events = nfs4_read_events_create(metrics, sink_path);
++        assert(atomic_load(&events->dropped_sink) == 1);
++        nfs4_read_events_destroy(events);
++        assert(stat(sink_path, &sink_stat) == 0);
++        assert((sink_stat.st_mode & 0777) == 0644);
++        unlink(sink_path);
++    }
++
++    make_sink_path(sink_path);
++    events = nfs4_read_events_create(metrics, sink_path);
++    events->sink_max_bytes = 1;
++    events->sink_bytes = 1;
++    events->fsync_fn = test_fsync_fail;
++    emit_without_queue_drop(events, &event);
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (atomic_load(&events->dropped_rotation)) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(atomic_load(&events->dropped_rotation) == 1);
++    assert(atomic_load(&events->last_synced_sequence) == 0);
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++
++    make_sink_path(sink_path);
++    events = nfs4_read_events_create(metrics, sink_path);
++    events->sink_max_bytes = 1;
++    events->sink_bytes = 1;
++    fsync_calls = 0;
++    fsync_fail_on = 3;
++    events->fsync_fn = test_fsync_nth;
++    emit_without_queue_drop(events, &event);
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (atomic_load(&events->dropped_rotation)) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(atomic_load(&events->dropped_rotation) == 1);
++    assert(atomic_load(&events->last_synced_sequence) == 0);
++    assert(sink_line_count(sink_path) == 0);
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++    snprintf(rotated_path, sizeof(rotated_path), "%s.1", sink_path);
++    unlink(rotated_path);
++
++    make_sink_path(sink_path);
++    int restart_fd = open(sink_path, O_WRONLY | O_CREAT, 0600);
++    assert(restart_fd >= 0);
++    assert(write(restart_fd, "x", 1) == 1);
++    close(restart_fd);
++    snprintf(rotated_path, sizeof(rotated_path), "%s.1", sink_path);
++    events = nfs4_read_events_create(metrics, sink_path);
++    events->sink_max_bytes = 1;
++    emit_without_queue_drop(events, &event);
++    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
++        if (atomic_load(&events->last_synced_sequence) == 1) {
++            break;
++        }
++        sched_yield();
++    }
++    assert(atomic_load(&events->last_synced_sequence) == 1);
++    assert(sink_line_count(sink_path) == 1);
++    assert(stat(rotated_path, &sink_stat) == 0);
++    assert(sink_stat.st_size == 1);
++    nfs4_read_events_destroy(events);
++    unlink(sink_path);
++    unlink(rotated_path);
++
++    prometheus_metrics_destroy(metrics);
++    return 0;
++} /* main */
+diff --git a/src/server/server.c b/src/server/server.c
+index 3f7ee9540a2687d55b64e0115392da8f2bae0943..1d1ccfa72554d1b2c31ed8e42e2117d9477c88fe 100644
+--- a/src/server/server.c
++++ b/src/server/server.c
+@@ -76,6 +76,8 @@ struct chimera_server_config {
+     int                                   nfs4_session_slots;
+     int                                   nfs4_delegations;
+     int                                   nfs4_drc;
++    int                                   nfs4_read_correlation;
++    char                                  nfs4_read_event_path[256];
+     /* when true, force per-session persistence
+      * regardless of whether the client set CREATE_SESSION4_FLAG_PERSIST.
+      * This is what enables cross-pod NFSv4.1 failover behind a load
+@@ -714,6 +716,38 @@ chimera_server_config_get_nfs4_drc(const struct chimera_server_config *config)
+     return config->nfs4_drc;
+ } /* chimera_server_config_get_nfs4_drc */
+ 
++SYMBOL_EXPORT void
++chimera_server_config_set_nfs4_read_correlation(
++    struct chimera_server_config *config,
++    int                           enable)
++{
++    config->nfs4_read_correlation = enable;
++} /* chimera_server_config_set_nfs4_read_correlation */
++
++SYMBOL_EXPORT int
++chimera_server_config_get_nfs4_read_correlation(const struct chimera_server_config *config)
++{
++    return config->nfs4_read_correlation;
++} /* chimera_server_config_get_nfs4_read_correlation */
++
++SYMBOL_EXPORT void
++chimera_server_config_set_nfs4_read_event_path(
++    struct chimera_server_config *config,
++    const char                   *path)
++{
++    strncpy(config->nfs4_read_event_path, path,
++            sizeof(config->nfs4_read_event_path) - 1);
++    config->nfs4_read_event_path[sizeof(config->nfs4_read_event_path) - 1] = '\0';
++} /* chimera_server_config_set_nfs4_read_event_path */
++
++SYMBOL_EXPORT const char *
++chimera_server_config_get_nfs4_read_event_path(
++    const struct chimera_server_config *config)
++{
++    return config->nfs4_read_event_path[0] ?
++           config->nfs4_read_event_path : NULL;
++} /* chimera_server_config_get_nfs4_read_event_path */
++
+ SYMBOL_EXPORT void
+ chimera_server_config_set_nfs4_force_session_persist(
+     struct chimera_server_config *config,
+diff --git a/src/server/server.h b/src/server/server.h
+index bd28a421fb84572fc4897274c11f7ce68a02fb6f..02a27ae314a455e0010e077383ca64a511d0dc70 100644
+--- a/src/server/server.h
++++ b/src/server/server.h
+@@ -224,6 +224,24 @@ int
+ chimera_server_config_get_nfs4_drc(
+     const struct chimera_server_config *config);
+ 
++void
++chimera_server_config_set_nfs4_read_correlation(
++    struct chimera_server_config *config,
++    int                           enable);
++
++int
++chimera_server_config_get_nfs4_read_correlation(
++    const struct chimera_server_config *config);
++
++void
++chimera_server_config_set_nfs4_read_event_path(
++    struct chimera_server_config *config,
++    const char                   *path);
++
++const char *
++chimera_server_config_get_nfs4_read_event_path(
++    const struct chimera_server_config *config);
++
+ /*
+  * force NFSv4.1 session persistence on for
+  * every client, regardless of CREATE_SESSION4_FLAG_PERSIST.  Requires
