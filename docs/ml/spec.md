@@ -49,10 +49,13 @@ Every baseline and model implements one protocol:
 ```python
 class Scorer(Protocol):
     model_type: ClassVar[str]                  # e.g. "logreg-v1", "baseline-mru"
+    @property
+    def feature_columns(self) -> tuple[str, ...]: ...   # ordered; becomes package.json feature_columns
     def fit(self, train: pa.Table, val: pa.Table | None, cfg: dict) -> None: ...
     def score(self, rows: pa.Table) -> np.ndarray: ...     # float64, same order/length as rows; higher = more likely
     def explain(self, rows: pa.Table, k: int = 2) -> list[list[str]]: ...   # top-k reason strings per row
-    def to_payload(self) -> dict: ...          # JSON-serialisable; becomes model.json
+    def to_payload(self) -> dict: ...          # JSON-serialisable; becomes model.json (written with sorted
+                                               # keys: encode ordering in lists, never dict key order)
     @classmethod
     def from_payload(cls, payload: dict, feature_schema: dict) -> "Scorer": ...
 ```
@@ -93,6 +96,14 @@ feature_schema.json   # copied from the snapshots used for training (data-prep �
 coaccess.parquet      # copied from snapshots artifacts/coaccess.parquet (frozen val/test table, data-prep §8.2)
 smoke.parquet         # ≤ 50 feature rows from val + expected scores, for load-time verification
 ```
+
+- **`feature_schema.json`** needs at least
+  `{"feature_version": "fv1", "features": [{"name": …, "dtype": …, "group": …, "definition": …, "available": …}]}`.
+  The loader relies only on `feature_version` and the feature `name`s.
+- **`coaccess.parquet`** has the columns `from_file_id`, `to_file_id`,
+  `support`, `n_from`, `conf` and `lift` (data-prep §5.4). It may be empty.
+- **`smoke.parquet`** holds the key columns, the feature columns and
+  `expected_score`.
 
 `package.json`:
 
@@ -142,7 +153,14 @@ the first failure:
 
 1. All files exist, and every sha256 matches.
 2. `package_id` recomputes correctly.
-3. `package_version` and `model_type` are known.
+3. `package_version` and `model_type` are known, and `serving_policy` is
+   servable:
+   - all keys are present;
+   - `target` ∈ {demand, cold_open};
+   - `lead_s = 0`;
+   - positive integer horizon, tick and limits;
+   - `range_cap` ≤ 16 MiB;
+   - `min_score` is `null` (no threshold) or a finite number.
 4. `feature_version` equals the expected version.
 5. The `serving_contract.sha256` recomputes from its `config`. If an
    expected hash is given, it must match.
@@ -214,7 +232,8 @@ pcache-train --snapshots DIR --out DIR [--config FILE] [--models logreg-v1,basel
 - **Serving-policy selection on val:** candidate thresholds are
   **quantiles of this model's val scores** at
   `{0, 0.5, 0.8, 0.9, 0.95}`. Quantile 0 means no threshold
-  (`min_score = −∞`), so negative-score baselines such as MRU still plan.
+  (`min_score: null` in the package; JSON has no −∞), so negative-score
+  baselines such as MRU still plan.
   - For each threshold, compute the primary metric on val with the §7.1
     selector applied only to rows with `score ≥ min_score`.
   - Choose the **highest** threshold whose primary value is ≥
@@ -771,8 +790,11 @@ def feature_matrix(rows: pa.Table, columns: Sequence[str]) -> pa.Table: ...
 # src/predictive_cache/ml/package.py          (#54)
 @dataclass(frozen=True)
 class LoadedPackage:
-    package_id: str; model_type: str; model_version: str; feature_version: str
-    scorer: Scorer; coaccess: "CoAccessTable"; manifest: dict
+    root: Path; package_id: str; model_type: str; model_version: str; feature_version: str
+    feature_columns: tuple[str, ...]; scorer: Scorer; serving_policy: dict
+    serving_contract_sha256: str; coaccess_path: Path; manifest: dict
+    def coaccess(self) -> pa.Table: ...        # wrap with prep's CoAccessTable.from_parquet once it exists
+    def score(self, rows: pa.Table) -> np.ndarray: ...   # checks key + feature columns, then scorer.score
 class PackageError(Exception): reason: str
 def write_package(scorer: Scorer, feature_schema: dict, coaccess_path: Path, smoke_rows: pa.Table,
                   meta: dict, out_dir: Path) -> Path: ...      # returns zip path
@@ -857,6 +879,7 @@ pcache-eval freeze --snapshots DIR --packages ... --out freeze.json [--config FI
 pcache-eval run --snapshots DIR --split val|test --out DIR [--freeze FILE] [--packages ...] [--rerun-reason TEXT] [--no-track]
 pcache-eval policy --plans DIR --clean CLEAN_DIR --from T0 --to T1 --out DIR [--freeze FILE]
 pcache-model inspect|verify PACKAGE_ZIP                           # prints manifest; runs load_package
+pcache-model dummy --out DIR [--value 0.5]                         # constant-score fixture package (data_kind: fixture)
 pcache-controller run --config FILE [--reset-memory]               # live (http source)
 pcache-controller replay --config FILE --dataset DIR [--speed 60] [--from T0 --to T1]   # replay source + clock
 pcache-dispatcher run --config FILE                                # plan-file dispatcher (§8.10)
