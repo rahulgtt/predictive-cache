@@ -163,7 +163,7 @@ class Intent:
     cause: str
     workflow_run_id: str | None = None
     job_run_id: str | None = None
-    operation: Literal["open", "create", "write"] = "open"
+    operation: Literal["open", "create", "write", "rename", "delete", "replace"] = "open"
 
 
 @dataclass(frozen=True)

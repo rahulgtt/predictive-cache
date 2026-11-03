@@ -215,6 +215,7 @@ def test_recency_uses_past_writes_and_lifecycle_can_amplify():
     cfg, world = setup()
     start, end = window(world)
     cfg.patterns.project_lifecycle.enabled = False
+    cfg.patterns.popularity.working_set_share = cfg.patterns.popularity.revisit_share = 0
     cfg.patterns.popularity.zipf_s = 0.00001
     cfg.patterns.popularity.rate_per_user_hour = 40
     first = next(f for f in world.files if f.project_id is not None and f.created_at < start)

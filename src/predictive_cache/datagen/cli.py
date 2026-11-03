@@ -9,7 +9,7 @@ from .config import load_config
 
 @click.group()
 def main():
-    """Generate synthetic access events (foundation fixture implementation)."""
+    """Generate fictional access workloads and telemetry events."""
 
 
 @main.command()
@@ -22,7 +22,7 @@ def main():
 @click.option("--format", "output_format", type=click.Choice(["parquet", "jsonl"]))
 @click.option("--overwrite", is_flag=True, help="Replace only a verified generator-owned dataset.")
 def generate(preset, config_path, out, seed, output_format, overwrite):
-    """Write a synthetic foundation fixture, not production workload evidence."""
+    """Write a synthetic access dataset for pipeline development."""
     if (preset is None) == (config_path is None):
         raise click.UsageError("provide exactly one of --preset or --config")
     try:
@@ -33,7 +33,7 @@ def generate(preset, config_path, out, seed, output_format, overwrite):
     except (ValueError, OSError, TypeError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(
-        f"Generated {manifest.dataset_id} at {out}; world catalogs with foundation event stubs."
+        f"Generated {manifest.dataset_id} at {out}; synthetic workloads, operations and telemetry faults."
     )
 
 
@@ -56,7 +56,7 @@ def validate(directory):
 @main.command()
 @click.argument("directory", type=click.Path(exists=True, file_okay=False, path_type=Path))
 def describe(directory):
-    """Display manifest summary and foundation report."""
+    """Display the synthetic dataset manifest and report."""
     from .schema import Manifest
 
     try:

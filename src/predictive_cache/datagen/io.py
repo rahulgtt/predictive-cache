@@ -202,6 +202,7 @@ def write_dataset(
     known_gaps: list[dict],
     *,
     overwrite: bool = False,
+    report_updates: dict | None = None,
 ) -> Manifest:
     out = Path(out_dir).absolute()
     _safe_destination(out, overwrite)
@@ -262,25 +263,22 @@ def write_dataset(
         )
         register("config.resolved.yaml")
         report = {
-            "implementation": "patterns_15_with_fixture_realization",
-            "validation_scope": "schema_only",
+            "implementation": "synthetic_workloads_events_and_faults",
+            "validation_scope": "schema_and_artifact_integrity",
             "data_kind": "synthetic",
             "events": len(tables["events"]),
-            "not_implemented": [
-                "P2/P3/P5/P6/P9, working sets and revisits",
-                "full event realization and sessions",
-                "fault injection",
-                "pattern recovery",
-                "scale/runtime preset targets",
-            ],
+            "not_implemented": ["full recovery reports and preset scale/runtime targets (#19)"],
+            **(report_updates or {}),
         }
         (stage / "report").mkdir()
         (stage / "report/quality.json").write_text(canonical_json(report) + "\n")
         register("report/quality.json")
         (stage / "report/summary.md").write_text(
-            "# Synthetic P1/P4/P7/P8 patterns with foundation realization\n\nFictional metadata and access patterns; one-byte fixture reads.\n"
-            "Remaining patterns, full read/session realization, faults, recovery reports and scale targets await #16–#19.\n"
-            f"\nEvents: {len(tables['events'])}. Validation scope: schema only.\n"
+            "# Synthetic access dataset\n\n"
+            "Fictional workloads, complete read operations and configured telemetry faults.\n"
+            "No modeled contents or measured latency/cache outcomes.\n"
+            f"\nEvents: {len(tables['events'])}. Validation: schema/artifact integrity.\n"
+            "Fault-stage counts are in quality.json. Full recovery reports and scale tuning await #19.\n"
         )
         register("report/summary.md")
         digest = config_hash(cfg)
@@ -325,7 +323,9 @@ def write_dataset(
             "files": sorted(entries, key=lambda item: item["path"]),
             "created_at": datetime.now(UTC),
             "limitations": [
-                "P1/P4/P7/P8 implemented; foundation realization emits one-byte reads and per-open sessions. P2/P3/P5/P6/P9, working sets/revisits, full realization, faults, recovery reports and preset scale targets remain #16-19. Output is buffered in memory; synthetic pattern checks do not establish real-workload quality."
+                "synthetic only; not evidence of real-workload model quality",
+                "buffered generation; preset scale/runtime targets and full recovery reports await #19",
+                "P9 writes update catalog history but do not feed back into already generated P1 choices",
             ],
         }
         manifest = Manifest.model_validate(manifest_data)
