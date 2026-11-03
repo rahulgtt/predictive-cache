@@ -6,16 +6,21 @@ These procedures remain applicable; this move changes organization, not policy.
 
 ## Project in one paragraph
 
-Hackathon Team 32: **Predictive Cache** for Strider. A Strider cluster serves
-SMB/NFS clients through the Chimera protocol gateway, backed by CUFS. CUFS
-caches data locally and faults cold data in from the cloud/S3 backend over
+Hackathon Team 32: **Predictive Cache** for Strider. Chimera receives
+SMB/NFS file requests from clients and passes them to CUFS. CUFS
+caches data locally and fetches missing data from the cloud/S3 backend over
 the WAN. This project predicts which files/ranges will be hot from historical
 access patterns and pre-warms them on the cluster, so first opens do not wait
 on the backend. The MVP has two deployables:
 
-- **Predictive Cache Controller** handles ingestion, features, models,
-  planning and feedback.
+- **Predictive Cache Controller** receives read records, builds model
+  inputs, scores files, chooses warming tasks and checks later demand.
 - **Cache Warmer** performs bounded, read-only NFS reads that execute plans.
+
+Use the [README glossary](../../README.md#basic-terms) for shared terminology.
+Its examples explain the concepts; the [data-preparation spec](../data-prep/spec.md)
+and [ML spec](../ml/spec.md) define the detailed v1 data and runtime contracts
+within the README's design rules.
 
 Our team owns the ML side: event memory/state, feature extraction, model
 training, inference and evaluation. We also work with the protocol (CUFS),

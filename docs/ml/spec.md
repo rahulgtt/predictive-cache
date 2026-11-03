@@ -11,6 +11,35 @@
 
 ## 1. Purpose and decisions
 
+Start with the [README glossary](../../README.md#basic-terms) and
+[file-B example](../../README.md#example-a-feature-row-and-a-label).
+The README teaches the system concepts. The [data-preparation spec](../data-prep/spec.md)
+defines the input tables; this spec defines the detailed v1 model package,
+scoring, evaluation and Controller runtime contracts within the README's design rules.
+
+### Training and running predictions are different steps
+
+1. **Train outside the live read path.** Use historical feature rows and
+   their later labels to fit a model. Choose settings on validation data,
+   freeze them before test evaluation, and save the model package.
+2. **Receive current read records.** The Controller collects events for its
+   scheduled processing loop. A user's SMB/NFS read does not wait for the
+   Controller, a prediction or model training.
+3. **Predict on a tick.** A tick is a scheduled prediction time. The proposed
+   v1 loop uses the loaded model to score eligible files at each tick, then
+   the planner chooses reads within the limits. The package's `tick_s`
+   controls this cadence (initially 60 seconds; §8.3). An event can change
+   inputs for a later tick; it does not trigger model retraining.
+4. **Check what happened later.** The Warmer reports its reads; independent
+   user demand supplies the later answers used for demand labels. A
+   completed warm read alone does not prove usefulness or saved latency.
+   Training a replacement model is a separate step.
+
+The historical snapshot interval and the live prediction interval are
+separate settings: data-prep's `snapshots.tick_s` initially uses 900 seconds,
+while the live package's `serving_policy.tick_s` initially uses 60 seconds.
+Both use the same feature rules at their respective prediction times.
+
 This spec covers everything after the [data-prep](../data-prep/spec.md)
 snapshots: training a first model, judging it fairly, and running it live
 inside the Controller.

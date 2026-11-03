@@ -3,6 +3,11 @@
 For a short team briefing, use the [quick glance](plan/team-quick-glance.md)
 or the [three-page PDF](../artifacts/pdf/predictive-cache-48-hour-team-plan.pdf).
 This document keeps the full setup, contracts, ML and test details.
+Start with the [README glossary](../README.md#basic-terms) and
+[file-B example](../README.md#example-a-feature-row-and-a-label) for the basic terms.
+The README explains the system using teaching examples. The
+[data-preparation spec](data-prep/spec.md) and [ML spec](ml/spec.md) define
+the detailed v1 data and runtime contracts within the README's design rules.
 
 48-hour hackathon team plan | November 3-4, 2026 | Demo November 5
 
@@ -95,7 +100,7 @@ Name a technical lead to decide scope and gates, not to implement every integrat
 
 ### Keep the implementation small
 
-Keep ingestion, features, inference, planning and feedback in one Controller deployable. Keep the Warmer separately stoppable.
+Keep these steps in one Controller deployable: receive read records, build model inputs, score eligible files, choose warming tasks within the limits, and check later demand. These steps are called ingestion, feature building, inference, planning and feedback. Keep the Warmer separately stoppable.
 
 Use fixture plan/result files so streams can work independently from the start. Event and plan files are an interface harness, not proof of a production queue.
 
