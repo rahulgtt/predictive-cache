@@ -320,19 +320,28 @@ Micro-aggregated over the ticks of a split, per volume and overall:
 ### 7.4 Freeze
 
 ```text
-pcache-eval freeze --snapshots DIR --packages P1 P2 ... --out freeze.json [--primary recall@bytes_256MiB]
+pcache-eval freeze (--snapshots DIR | --snapshots-dataset ID) --packages P1 --packages P2 ... --out freeze.json [--config FILE]
 ```
 
+A package reference is a local zip/dir or `clearml://<model_id>` (fetched
+from the model registry). The freeze needs at least one `baseline-*`
+package, and every package must match the snapshots' serving contract.
+A freeze record is never overwritten.
+
 `freeze.json` records:
-- package paths, `package_id`s and sha256s (the exact set: no more, no
-  fewer may be evaluated on test);
+- package references, `package_id`s and the sha256 of each package's
+  `package.json` (the exact set: no more, no fewer may be evaluated on
+  test). `package.json` lists every payload hash and the loader verifies
+  them, so this digest pins the whole package whether it is stored as a zip
+  or a directory;
 - each package's `serving_policy` and `serving_contract.sha256`;
 - the best baseline (by val primary);
 - the primary metric and budgets;
 - the eval config hash;
 - **the test data binding:**
   - the snapshots manifest sha256;
-  - every manifest-listed file's sha256 for the test split and `universe`;
+  - the sha256 of every file under `snapshots/split=test/` and `universe/`,
+    computed from disk;
   - the split boundaries;
   - the label config;
 - the git sha and creation time;
@@ -340,16 +349,21 @@ pcache-eval freeze --snapshots DIR --packages P1 P2 ... --out freeze.json [--pri
   JSON (sorted keys, no whitespace) **with the `freeze_id` field
   omitted**. Verification recomputes it the same way.
 
-With tracking, packages are tagged `frozen`, and the freeze record is
-uploaded as an artifact of an `eval:freeze-<freeze_id>` task. After
+With tracking, `clearml://` packages are tagged `frozen` and
+`freeze:<freeze_id>`, and the freeze record is uploaded as an artifact of
+an `eval:freeze` task tagged `freeze:<freeze_id>`. After
 freezing, any package, policy, config or data change needs a **new** freeze
 record, and earlier test results stay recorded.
 
 ### 7.5 Run
 
 ```text
-pcache-eval run --snapshots DIR --split val|test --out DIR [--freeze freeze.json] [--packages ...]
+pcache-eval run (--snapshots DIR | --snapshots-dataset ID) --split val|test --out DIR
+                [--freeze freeze.json] [--packages ...] [--rerun-reason TEXT] [--config FILE]
 ```
+
+A run with `--freeze` reuses the frozen evaluation config unless `--config`
+is given. A test run must then match it exactly.
 
 - **`val`:** free to run, for development and selection.
 - **`test`:** requires `--freeze`. **Before reading any test row**, it
@@ -361,21 +375,31 @@ pcache-eval run --snapshots DIR --split val|test --out DIR [--freeze freeze.json
     printed in the report header.
   - **Ledger:** each test run is appended to a ledger, both locally
     (`<freeze dir>/test_runs.jsonl`) and, with tracking, as a ClearML task
-    in `predictive-cache/eval`. The ClearML task is the authoritative
-    record, because a local file can be deleted. The report states the run
-    count.
+    in `predictive-cache/eval` tagged `freeze:<freeze_id>` and `split:test`.
+    Prior runs are counted from both (completed tasks carrying both tags).
+    ClearML is the authoritative record, because a local file can be
+    deleted. Even `--no-track` runs query it when a server is configured.
+    An untracked run is recorded only in the local ledger. The report
+    states the run number.
   - **Limitation:** this is lab-grade enforcement, not access control. The
     report says so.
-- **Output:** `metrics.json`, `report.md` and `curves/*.png`:
-  - recall vs K and vs bytes;
-  - precision vs recall;
-  - reliability.
+- **Output:** `metrics.json` and `report.md`:
+  - per model: overall and per-volume metrics, the primary at the
+    package's `min_score`, and the difference vs the best baseline with a
+    95% CI;
+  - recall per budget (the curve);
+  - reliability bins and ECE where scores are in [0, 1].
+
+  Curves are stored as data in `metrics.json` and, with tracking, plotted
+  as ClearML scalars. PNG files are not written, to avoid a plotting
+  dependency.
 
   The report's header states `data_kind`. For synthetic data it reads
   "plumbing / planted-pattern evidence only".
 - **With tracking:** a task `eval:<split>-<freeze id>` in
-  `predictive-cache/eval`; packages are tagged `evaluated` after a test
-  run.
+  `predictive-cache/eval`; `clearml://` packages are tagged `evaluated`
+  after a test run. A refused run is marked `failed` with the reason.
+- **Policy replay** (§7.7) is tracked separately in #77.
 
 ### 7.6 Decisions made through evaluation
 
@@ -907,8 +931,8 @@ def load_state(state_dir: Path, cfg) -> ControllerState | None: ...    # raises 
 
 ```text
 pcache-train --snapshots DIR --out DIR [--config FILE] [--models ...] [--no-track]
-pcache-eval freeze --snapshots DIR --packages ... --out freeze.json [--config FILE]
-pcache-eval run --snapshots DIR --split val|test --out DIR [--freeze FILE] [--packages ...] [--rerun-reason TEXT] [--no-track]
+pcache-eval freeze (--snapshots DIR | --snapshots-dataset ID) --packages REF ... --out freeze.json [--config FILE] [--no-track]
+pcache-eval run (--snapshots DIR | --snapshots-dataset ID) --split val|test --out DIR [--freeze FILE] [--packages REF ...] [--rerun-reason TEXT] [--no-track]
 pcache-eval policy --plans DIR --clean CLEAN_DIR --from T0 --to T1 --out DIR [--freeze FILE]
 pcache-model inspect|verify PACKAGE_ZIP                           # prints manifest; runs load_package
 pcache-model dummy --out DIR [--value 0.5]                         # constant-score fixture package (data_kind: fixture)
@@ -1106,7 +1130,8 @@ tests/ml/  tests/controller/
 | [#55](https://github.com/rahulgtt/predictive-cache/issues/55) | #49 | Baselines | §4 |
 | [#56](https://github.com/rahulgtt/predictive-cache/issues/56) | #49 | Logreg v1, `pcache-train`, tracking wrapper | §6, §9, §11, §12 |
 | [#57](https://github.com/rahulgtt/predictive-cache/issues/57) | #50 | Metrics | §7.1–7.3 |
-| [#58](https://github.com/rahulgtt/predictive-cache/issues/58) | #50 | `pcache-eval`, freeze, reports | §7.4–7.6, §11 |
+| [#58](https://github.com/rahulgtt/predictive-cache/issues/58) | #50 | `pcache-eval`, freeze, val/test runs, ledger, reports | §7.4–7.6, §11 |
+| [#77](https://github.com/rahulgtt/predictive-cache/issues/77) | #50 | `pcache-eval policy` replay (blocked on #60, #28) | §7.7 |
 | [#59](https://github.com/rahulgtt/predictive-cache/issues/59) | #51 | Event sources, streaming cleaning | §8.1–8.2 |
 | [#60](https://github.com/rahulgtt/predictive-cache/issues/60) | #51 | Tick loop, planner, resolver, sinks | §8.3–8.5 |
 | [#61](https://github.com/rahulgtt/predictive-cache/issues/61) | #51 | Model pointer and hot swap | §8.6 |

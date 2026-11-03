@@ -18,6 +18,7 @@ pcache-clearml-datagen = "predictive_cache.clearml.datagen:main"
 pcache-datagen = "predictive_cache.datagen.cli:main"
 pcache-model = "predictive_cache.ml.cli:main"
 pcache-train = "predictive_cache.ml.train_cli:main"
+pcache-eval = "predictive_cache.ml.eval_cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
