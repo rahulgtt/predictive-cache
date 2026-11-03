@@ -14,8 +14,8 @@ import pyarrow as pa
 import yaml
 
 from predictive_cache.datagen.io import canonical_json, config_hash, read_table
+from predictive_cache.datagen.schema import DataOnlyManifest, normalize_rows
 from predictive_cache.datagen.schema import Manifest as SourceManifest
-from predictive_cache.datagen.schema import normalize_rows
 from predictive_cache.prep.clean.handles import HandleTracker
 from predictive_cache.prep.clean.io import read_rows, sha256, write_rows
 from predictive_cache.prep.clean.report import build_report, render_summary
@@ -187,7 +187,13 @@ def run_clean(
     if source == out or out.is_relative_to(source):
         raise ValueError("output must be outside the input dataset")
     parent_path = source / "manifest.json"
-    parent = SourceManifest.model_validate_json(parent_path.read_text()).model_dump(mode="python")
+    source_document = json.loads(parent_path.read_text())
+    source_model = (
+        DataOnlyManifest
+        if source_document.get("publication_kind") == "data_only"
+        else SourceManifest
+    )
+    parent = source_model.model_validate(source_document).model_dump(mode="python")
     if parent["event_schema_version"] != 1:
         raise ValueError("unsupported input event schema")
     records, counters, catalog_paths = _source_rows(source, parent)

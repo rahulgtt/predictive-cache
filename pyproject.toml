@@ -18,6 +18,7 @@ warmer = [
 
 [project.scripts]
 pcache-clearml-datagen = "predictive_cache.clearml.datagen:main"
+pcache-clearml-clean = "predictive_cache.clearml.clean:main"
 pcache-datagen = "predictive_cache.datagen.cli:main"
 pcache-chimera-import = "predictive_cache.sources.chimera.cli:main"
 pcache-collect = "predictive_cache.collection.cli:main"

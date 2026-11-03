@@ -186,6 +186,30 @@ Start with `tiny`; larger preset row and runtime targets are not verified.
 Check the task console, validation result, artifact, code revision and resolved
 scenario before treating a run as complete.
 
+### Cleanup task
+
+The clean worker consumes the immutable, truth-free
+`outputs.synthetic_dataset_id` from a completed datagen task. It downloads
+that ClearML Dataset on the worker, checks its manifest, file hashes and
+absence of truth, runs the existing `pcache-prep clean` code, then publishes a
+finalized child Dataset in `predictive-cache/datasets/clean`. Use the exact
+Dataset ID, not a submitting machine path or a test-only ZIP:
+
+```bash
+CLEARML_FILES_HOST=http://clearml.team32.internal:8081 \
+  uv run --extra clearml python src/predictive_cache/clearml/clean.py \
+  --input-dataset <synthetic-dataset-id> --queue default
+```
+
+`--config clean.yaml` resolves the optional `clean:` section on the submitting
+machine and records it in the task. The worker records
+`outputs.clean_dataset_id`, keeps the source Dataset as its ClearML parent,
+and includes the clean manifest and report in the child Dataset. Repeated
+runs can create another version with the same manifest name; downstream jobs
+must pin the immutable ClearML ID. This cleaned Dataset is **not** a training
+input. The snapshot builder in #30–#32 must produce train/validation/test
+snapshots and a feature schema before `pcache-train` can run on it.
+
 ### Training task
 
 `pcache-train` (ML spec §6.3) trains logistic regression and the baselines
