@@ -439,6 +439,7 @@ class DataOnlyManifest(StrictModel):
     period: Period
     volumes: list[str]
     counts: DataOnlyCounts
+    known_gaps: list[KnownGap] = Field(default_factory=list)
     files: list[FileEntry]
     created_at: datetime
     limitations: list[str] = Field(default_factory=list)

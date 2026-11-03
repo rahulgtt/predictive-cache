@@ -52,6 +52,7 @@ def project_data_manifest(manifest: Manifest) -> DataOnlyManifest:
             "by_operation": manifest.counts.by_operation,
             "by_origin": manifest.counts.by_origin,
         },
+        known_gaps=manifest.known_gaps,
         files=safe_entries,
         created_at=manifest.created_at,
         limitations=[*manifest.limitations, "data-only projection; truth and reports omitted"],
