@@ -93,18 +93,24 @@ class StubRealizer:
         self.cfg = cfg
 
     def realize(self, world, intents, window, rng):
+        files = {f.file_id: f for f in world.files}
+        paths = {p.file_id: p for p in world.file_paths}
+        actors = {a.actor_id: a for a in world.actors}
         for intent in intents:
             if not window[0] <= intent.at < window[1]:
                 continue
-            file = next(f for f in world.files if f.file_id == intent.file_id)
-            path = next(p for p in world.file_paths if p.file_id == file.file_id)
-            actor = next(a for a in world.actors if a.actor_id == intent.actor_id)
+            file = files[intent.file_id]
+            path = paths[file.file_id]
+            actor = actors[intent.actor_id]
             handle, session = opaque_id("hdl", rng), opaque_id("ses", rng)
-            operations = ["open", "read", "close"]
-            if self.cfg.realize.read_events == "none":
+            metadata = intent.operation != "open"
+            operations = [intent.operation] if metadata else ["open", "read", "close"]
+            if not metadata and self.cfg.realize.read_events == "none":
                 operations.remove("read")
             for operation in operations:
-                at = intent.at + timedelta(seconds={"open": 0, "read": 1, "close": 2}[operation])
+                at = intent.at + timedelta(
+                    seconds={"open": 0, "read": 1, "close": 2, "create": 0, "write": 0}[operation]
+                )
                 row = dict.fromkeys(SCHEMAS["events"].names)
                 row.update(
                     schema_version=1,
@@ -115,8 +121,8 @@ class StubRealizer:
                     file_id=file.file_id,
                     dir_id=path.dir_id,
                     operation=operation,
-                    handle_id=handle,
-                    file_size=file.size_at(at),
+                    handle_id=None if metadata else handle,
+                    file_size=file.size_at(intent.at),
                     result="ok",
                     origin="foreground",
                     app=intent.app,

@@ -262,12 +262,13 @@ def write_dataset(
         )
         register("config.resolved.yaml")
         report = {
-            "implementation": "world_with_fixture_events",
+            "implementation": "patterns_15_with_fixture_realization",
             "validation_scope": "schema_only",
             "data_kind": "synthetic",
             "events": len(tables["events"]),
             "not_implemented": [
-                "P1-P9 workload patterns",
+                "P2/P3/P5/P6/P9, working sets and revisits",
+                "full event realization and sessions",
                 "fault injection",
                 "pattern recovery",
                 "scale/runtime preset targets",
@@ -277,8 +278,8 @@ def write_dataset(
         (stage / "report/quality.json").write_text(canonical_json(report) + "\n")
         register("report/quality.json")
         (stage / "report/summary.md").write_text(
-            "# World catalog with foundation event fixtures\n\nSynthetic world metadata; event stubs for plumbing only.\n"
-            "Workload patterns, fault injection, recovery and preset scale targets await #14–#19.\n"
+            "# Synthetic P1/P4/P7/P8 patterns with foundation realization\n\nFictional metadata and access patterns; one-byte fixture reads.\n"
+            "Remaining patterns, full read/session realization, faults, recovery reports and scale targets await #16–#19.\n"
             f"\nEvents: {len(tables['events'])}. Validation scope: schema only.\n"
         )
         register("report/summary.md")
@@ -324,7 +325,7 @@ def write_dataset(
             "files": sorted(entries, key=lambda item: item["path"]),
             "created_at": datetime.now(UTC),
             "limitations": [
-                "world catalog implemented; foundation event stubs: workload patterns, fault injection and event scale targets are not implemented"
+                "P1/P4/P7/P8 implemented; foundation realization emits one-byte reads and per-open sessions. P2/P3/P5/P6/P9, working sets/revisits, full realization, faults, recovery reports and preset scale targets remain #16-19. Output is buffered in memory; synthetic pattern checks do not establish real-workload quality."
             ],
         }
         manifest = Manifest.model_validate(manifest_data)

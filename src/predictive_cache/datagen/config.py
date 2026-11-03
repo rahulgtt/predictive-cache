@@ -211,6 +211,26 @@ class Popularity(Enabled):
     rate_per_user_hour: NonNegative = 6
     zipf_s: Positive = 1.1
     recency_boost_half_life_days: NonNegative = 3
+    diurnal_curve: list[tuple[Annotated[float, Field(ge=0, le=24)], NonNegative]] = Field(
+        default_factory=lambda: [
+            (0.0, 0.0),
+            (8.0, 0.3),
+            (10.0, 1.0),
+            (12.0, 0.55),
+            (14.0, 1.0),
+            (17.0, 0.6),
+            (19.0, 0.0),
+            (24.0, 0.0),
+        ]
+    )
+
+    @field_validator("diurnal_curve")
+    @classmethod
+    def ordered_curve(cls, value):
+        if len(value) < 2 or any(a[0] >= b[0] for a, b in zip(value, value[1:])):
+            raise ValueError("diurnal_curve needs at least two strictly increasing hours")
+        return value
+
     working_set_size: PositiveCount = 20
     working_set_share: Probability = 0.7
     revisit_share: Probability = 0.2
@@ -276,6 +296,7 @@ class BatchJob(Enabled):
 class NewFile(Enabled):
     new_files_per_project_week: NonNegative = 5
     open_decay_half_life_days: Positive = 2
+    initial_opens_per_day: NonNegative = 12
 
 
 class Churn(Enabled):

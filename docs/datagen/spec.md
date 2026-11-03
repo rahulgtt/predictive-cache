@@ -621,6 +621,7 @@ class Intent:
     cause: str                             # pattern_id | "background" | "noise"
     workflow_run_id: str | None = None      # private context, never event columns
     job_run_id: str | None = None           # one service session per run
+    operation: Literal["open", "create", "write"] = "open"  # P7 metadata bridge
 
 @dataclass(frozen=True)
 class PatternRecord:                       # one line of truth/patterns.jsonl (§5.4)
@@ -636,7 +637,7 @@ Events are Arrow record batches (or dicts) matching §5.1. Truth rows match §5.
 ```python
 class PatternGenerator(Protocol):
     kind: ClassVar[str]
-    def plan(self, world: World, cfg: PatternConfig, rng: np.random.Generator) -> list[PatternRecord]: ...
+    def plan(self, world: World, cfg: Config, rng: np.random.Generator) -> list[PatternRecord]: ...
     def intents(self, world: World, window: tuple[datetime, datetime],
                 rng: np.random.Generator) -> Iterator[Intent]: ...    # time-ordered within window
 
@@ -902,3 +903,57 @@ The old stub world remains solely for small contract tests.
 Names come from a packaged fictional word list. No modeled contents, personal
 paths or real read measurements are collected. These internal/config choices
 are called out in the PR description; event and catalog schemas remain v1.
+
+## 19. Patterns I implementation choices (issue #15)
+
+P1/P4/P7/P8 now run through the existing CLI. Event/catalog schemas remain v1.
+PatternGenerator.plan receives the full Config to read global randomness
+and calendar controls. Intent.operation adds create/write with default open;
+only the P7 metadata bridge consumes it. Full realization remains #17.
+
+- **P1:** fixed seeded Zipf ranks within each project; each user's configured
+  hourly rate is divided equally among assigned projects, then multiplied by
+  P4 activity, local schedule and a linear diurnal curve. Activity above one
+  amplifies rates. Disabling P4 gives existing projects multiplier one.
+  popularity.diurnal_curve is an ordered list of local-hour/multiplier pairs;
+  defaults are (0,0),(8,.3),(10,1),(12,.55),(14,1),(17,.6),(19,0),(24,0).
+  Weekends and vacations suppress opens; holidays use holiday_activity.
+  Recency weights multiply by 1 + 2**(-age_days / half_life), using creation
+  or latest past size-history timestamp. Half-life zero disables the boost.
+  Working sets and revisits remain #16.
+- **P4:** truth records preserve project phase times/multipliers. Its only
+  demand effect here is on P1; it emits no independent opens.
+- **P7:** Poisson new-file arrivals add to the initial files.target_count.
+  Arrivals start no earlier than project existence and end before period end.
+  Existing file-kind/size sampling is reused; unique fictional paths and
+  identities join the catalogs. Each file has create plus initial write
+  metadata, then team opens with exponential decay. New control
+  new_file.initial_opens_per_day: 12 is the initial proposal rate; working
+  calendars/holidays can reduce observed opens. No assigned users means no
+  team opens; metadata uses an available same-volume actor, or stays catalog
+  only if the volume has no actor. Truth records that choice.
+- **P8:** for each base open, an independent Bernoulli noise_share decision
+  replaces its target and actor with a uniformly selected live file and user
+  in the same volume. Archived projects are eligible. This preserves total
+  opens and reduces non-noise amplitudes; create/write metadata is untouched.
+  Noise actor selection is independent of the selected user's calendar.
+  Share zero changes nothing and share one replaces every base open. If both
+  P1 and P7 are disabled, standalone noise uses P1's configured hourly rate
+  and local user calendars; noise_share thins proposals and all emitted
+  opens are noise. With no base demand there is no meaningful mixed fraction.
+  Truth explicitly identifies this standalone denominator.
+- rate_scale scales open rates, not file births or create/write metadata.
+  jitter_scale scales uniform offsets about canonical hourly midpoints:
+  zero fixes the midpoint, one spans the hour, larger values clip within the
+  hour. P1/P7 evaluate availability/calendars at the resulting timestamp.
+  P7 births stay uniform; mixed P8 retains base timing. Independent hourly
+  streams make requested window boundaries reproducible; P8 decisions are
+  keyed by opaque intent ID. Planning runs once per world, P7 before others.
+
+The runner buffers intents and output; scale targets remain #19. Fixture
+realization still emits one-byte reads, fixed synthetic handle duration and
+per-open sessions. No actual files are read or created, and cache/latency
+fields stay null. Validation remains schema/artifact validation; controlled
+small-preset tests compute #15 recovery from open events and catalog metadata,
+with truth only supplying planted parameters/instance selection. Mixed
+scenarios are not required to retain the isolated Zipf exponent.
