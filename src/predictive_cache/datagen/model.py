@@ -35,7 +35,30 @@ class Project:
     # Effective-time activity points allow later lifecycle implementations.
     activity_history: list[tuple[datetime, float]] = field(default_factory=list)
 
+    started_at: datetime | None = None
+    ramp_end: datetime | None = None
+    active_end: datetime | None = None
+    cooldown_end: datetime | None = None
+    phase_activity: tuple[float, float, float, float] = (0.3, 1.0, 0.3, 0.02)
+
     def activity(self, t: datetime) -> float:
+        # Legacy activity_history remains a step function for old fixtures.
+        if all(
+            x is not None
+            for x in (self.started_at, self.ramp_end, self.active_end, self.cooldown_end)
+        ):
+            ramp, active, cooldown, archived = self.phase_activity
+            if t < self.started_at:
+                return 0.0
+            if t < self.ramp_end:
+                fraction = (t - self.started_at) / (self.ramp_end - self.started_at)
+                return ramp + fraction * (active - ramp)
+            if t < self.active_end:
+                return active
+            if t < self.cooldown_end:
+                fraction = (t - self.active_end) / (self.cooldown_end - self.active_end)
+                return active + fraction * (cooldown - active)
+            return archived
         points = [point for point in self.activity_history if point[0] <= t]
         return max(points, key=lambda point: point[0])[1] if points else 0.0
 
@@ -61,6 +84,8 @@ class File:
     replaced_by_file_id: str | None = None
     project_id: str | None = None
     size_history: list[tuple[datetime, int]] = field(default_factory=list)
+
+    read_profile: Literal["full", "head", "ranges"] = "full"
 
     def size_at(self, t: datetime) -> int:
         if t < self.created_at or (self.deleted_at is not None and t >= self.deleted_at):
@@ -92,6 +117,9 @@ class Actor:
     timezone: str = "UTC"
     holidays: list[date] = field(default_factory=list)
     vacations: list[tuple[datetime, datetime]] = field(default_factory=list)
+
+    working_set_file_ids: list[str] = field(default_factory=list)
+    app_weights: dict[str, float] = field(default_factory=dict)
 
     def is_working(self, t: datetime) -> bool:
         local = t.astimezone(ZoneInfo(self.timezone))

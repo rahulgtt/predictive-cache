@@ -7,9 +7,11 @@ from pathlib import Path
 
 import numpy as np
 
+from .catalog import catalog_rows
 from .config import Config
 from .schema import Manifest
-from .stubs import NoFaults, StubPatternGenerator, StubRealizer, build_world, catalog_rows
+from .stubs import NoFaults, StubPatternGenerator, StubRealizer
+from .world import build_world
 
 # Stable numeric keys, independent of which components are enabled.
 COMPONENT_KEYS = {

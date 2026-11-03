@@ -262,12 +262,11 @@ def write_dataset(
         )
         register("config.resolved.yaml")
         report = {
-            "implementation": "foundation_stub",
+            "implementation": "world_with_fixture_events",
             "validation_scope": "schema_only",
             "data_kind": "synthetic",
             "events": len(tables["events"]),
             "not_implemented": [
-                "world distributions",
                 "P1-P9 workload patterns",
                 "fault injection",
                 "pattern recovery",
@@ -278,7 +277,7 @@ def write_dataset(
         (stage / "report/quality.json").write_text(canonical_json(report) + "\n")
         register("report/quality.json")
         (stage / "report/summary.md").write_text(
-            "# Foundation fixture\n\nSynthetic stub data for issue #13 plumbing only.\n"
+            "# World catalog with foundation event fixtures\n\nSynthetic world metadata; event stubs for plumbing only.\n"
             "Workload patterns, fault injection, recovery and preset scale targets await #14–#19.\n"
             f"\nEvents: {len(tables['events'])}. Validation scope: schema only.\n"
         )
@@ -325,7 +324,7 @@ def write_dataset(
             "files": sorted(entries, key=lambda item: item["path"]),
             "created_at": datetime.now(UTC),
             "limitations": [
-                "foundation_stub: workload patterns, fault injection and scale targets are not implemented"
+                "world catalog implemented; foundation event stubs: workload patterns, fault injection and event scale targets are not implemented"
             ],
         }
         manifest = Manifest.model_validate(manifest_data)

@@ -1,7 +1,7 @@
 # Predictive cache warming
 
 > **Status: design proposal, not an implemented service.** This repository
-> includes the synthetic datagen foundation with fixture stubs, not the
+> includes the synthetic datagen world builder with event fixture stubs, not the
 > Controller, Warmer, complete workload generator, or benchmark described below.
 > Feasibility and data gates must be resolved before performance claims.
 
@@ -28,12 +28,16 @@ of Parquet. `--config scenario.yaml` selects a YAML config instead of `--preset`
 `--seed` and `--format` override it. `--overwrite` replaces only an intact,
 verified generator-owned dataset without unrelated files.
 
-Issue #13 provides schemas, config, writers, manifests, interfaces and a small
-nonempty fixture per configured volume. It does **not** implement workload
-patterns, fault injection, or the preset's scale targets (#14–#19). `validate`
+Issues #13–#14 provide schemas, config, writers, manifests, interfaces and
+seeded world catalogs: volumes, project lifecycles, directories, file sizes,
+actors and team assignments. Event generation remains a small fixture per eligible
+volume. Workload patterns, fault injection and event-scale targets remain
+#15–#19. `validate`
 checks schemas and artifact integrity; it does not claim pattern recovery or
 model quality. [Foundation handoff](docs/datagen/issue-13-handoff.md) records
-acceptance evidence and implementation boundaries.
+acceptance evidence and implementation boundaries. The
+[world-builder handoff](docs/datagen/issue-14-handoff.md) records issue #14
+validation and PR review notes.
 
 ## What we are trying to prove
 

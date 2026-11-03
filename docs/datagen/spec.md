@@ -405,7 +405,7 @@ truth. Probabilities are in [0, 1]; counts are positive; time spans are bounded.
 
 | Configuration key (default) | Behavior | Owner / deterministic check |
 | --- | --- | --- |
-| `patterns.popularity.working_set_size: 20`, `working_set_share: 0.7`, `revisit_share: 0.2`, `revisit_history: 10` | Each actor has a stable subset of live files in assigned projects. For each P1 selection, first choose a prior file with revisit probability; otherwise choose the personal subset with working-set probability, else the project population. Use Zipf weights within the selected pool. Empty pools fall back to live project files; empty projects emit no intent. | #14 assigns sets, #15 selects reads. Controlled fixtures verify that share=1 stays within the set and revisit=1 selects from available history. |
+| `patterns.popularity.working_set_size: 20`, `working_set_share: 0.7`, `revisit_share: 0.2`, `revisit_history: 10` | Each actor has a stable subset of live files in assigned projects. For each P1 selection, first choose a prior file with revisit probability; otherwise choose the personal subset with working-set probability, else the project population. Use Zipf weights within the selected pool. Empty pools fall back to live project files; empty projects emit no intent. | #14 preserves actor/project interfaces; #16 implements personal working sets and revisits. Controlled fixtures in that issue verify set membership and history selection. |
 | `patterns.workflow_chain.context_order: 1` (1 or 2), `max_steps: 20` | Order 1 uses current file; order 2 uses (previous, current) within the same workflow run. Missing order-2 transitions fall back to order 1. `continue_p` controls continuation; stopping represents task abandonment. Bound loops by max_steps. | #16: A→B→C and D→B→E remain distinguishable with interleaved actors. |
 | `patterns.workflow_chain.interruption_p: 0.05` | Before each continuation, optionally insert one unrelated live project-file open, then resume saved chain context. If no unrelated file exists, skip the interruption. Inserted opens do not trigger another chain. | #16: probability 0 inserts nothing; probability 1 inserts one interruption per continuation when possible. |
 | `patterns.burst.participation: 0.7`, `shared_file_share: 0.6`, `arrival_spread_s: 3600`, `duration_s: 10800` | Review burst: independently select team participants. Partition the selected directory's live files into a common subset and a remainder. Each participant reads the common subset plus an independently sampled half of the remainder. Starts are uniform within arrival_spread_s; reads are uniform over the remaining time to the burst's duration_s deadline, then sorted. Scans retain their single-actor behavior. | #16: controlled fixtures force multiple participants and verify shared and actor-specific reads; zero participation emits none. |
@@ -860,3 +860,45 @@ RNG component keys avoid changing the world when a component is disabled.
 
 This section clarifies draft interfaces and manifest metadata for reviewer
 attention; it does not change the acceptance requirements of #14–#19.
+
+## 18. World-builder implementation choices (issue #14)
+
+`world.build_world(cfg, rng)` creates metadata only. `catalog.catalog_rows`
+projects it onto unchanged §5.2 schemas. The pipeline uses this world while
+access patterns, event realization and faults remain fixtures (#15–#18).
+The old stub world remains solely for small contract tests.
+
+- File/user/team/service targets are global, split across volumes by
+  quotient/remainder. Initial projects and new_per_month are per volume.
+  A volume without teams has unteamed users (null cohort) assigned local
+  projects; teams without users are implicit. Membership can include future
+  projects, but future access patterns must check file/project availability.
+- Volume root depth is 0, project root depth is 1, and max_depth bounds levels
+  below project roots (global limit max_depth+1). Shared directories have depth
+  2. Poisson branching has an occupancy-derived directory cap. Poisson weights
+  followed by multinomial file placement give the exact global file target;
+  these final occupancies are conditioned, not independent Poisson samples.
+- `files.size_distributions.<kind>` adds median_bytes, sigma, min_bytes and
+  max_bytes. Defaults follow §6.3 with natural-log sigma 1.0; sample lognormal
+  then clip to positive ordered bounds. Sigma 0 supports fixed-size fixtures.
+  Small-preset checks use 0.03 absolute share, 25% median and 35% q10/q90
+  tolerances against clipped theoretical values. These are sampling tolerances,
+  not real-workload calibration.
+- Internal File.read_profile records §6.3 profile defaults; no reads are
+  executed. Actor.app_weights records application preferences. The empty
+  Actor.working_set_file_ids interface is reserved for #16; this issue does not
+  select working sets, implement revisits, chains, bursts or demand timing.
+  Private fields are excluded from catalog/event wire schemas.
+- Project phase times started_at/ramp_end/active_end/cooldown_end and
+  phase_activity support linear ramp/cooldown, active plateau and archival.
+  Legacy activity_history keeps its step semantics when phases are absent.
+  This is project state; demand-rate lifecycle effects belong to #15.
+- Local HH:MM user schedules use IANA timezone conversion across DST. Holiday
+  and vacation checks suppress working status. Vacation configuration means
+  expected weeks per 13-week quarter, sampled as 1–2 local-calendar-week blocks.
+  Service actors have no user vacations. Holiday demand-rate effects, batch
+  scheduling and actual read timing remain in subsequent pattern issues.
+
+Names come from a packaged fictional word list. No modeled contents, personal
+paths or real read measurements are collected. These internal/config choices
+are called out in the PR description; event and catalog schemas remain v1.

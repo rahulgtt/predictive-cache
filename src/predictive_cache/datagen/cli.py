@@ -32,7 +32,9 @@ def generate(preset, config_path, out, seed, output_format, overwrite):
         manifest = run(cfg, out, overwrite=overwrite)
     except (ValueError, OSError, TypeError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Generated {manifest.dataset_id} at {out}; foundation stubs only.")
+    click.echo(
+        f"Generated {manifest.dataset_id} at {out}; world catalogs with foundation event stubs."
+    )
 
 
 @main.command()

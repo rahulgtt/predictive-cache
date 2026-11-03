@@ -1,10 +1,10 @@
 """Small plumbing fixtures, deliberately not the #14–#18 workloads."""
 
-from dataclasses import asdict
 from datetime import UTC, datetime, time, timedelta
 
 import numpy as np
 
+from .catalog import catalog_rows as catalog_rows
 from .model import Actor, Directory, File, FilePath, Intent, Volume, World
 from .schema import SCHEMAS
 
@@ -59,20 +59,22 @@ def build_world(cfg, rng: np.random.Generator) -> World:
     return World(volumes, [], directories, files, actors, paths)
 
 
-def catalog_rows(world: World):
-    tables = {}
-    for name in ("volumes", "directories", "files", "file_paths", "actors"):
-        tables[name] = [
-            {key: value for key, value in asdict(obj).items() if key in SCHEMAS[name].names}
-            for obj in getattr(world, name)
-        ]
-    return tables
-
-
 def fixture_intents(world, rng):
     for volume in world.volumes:
-        actor = next(a for a in world.actors if a.volume_id == volume.volume_id)
-        file = next(f for f in world.files if f.volume_id == volume.volume_id)
+        at = volume.period_start + timedelta(seconds=1)
+        actor = next((a for a in world.actors if a.volume_id == volume.volume_id), None)
+        file = next(
+            (
+                f
+                for f in world.files
+                if f.volume_id == volume.volume_id
+                and f.created_at <= at
+                and (f.deleted_at is None or at < f.deleted_at)
+            ),
+            None,
+        )
+        if actor is None or file is None:
+            continue
         yield Intent(
             opaque_id("int", rng),
             volume.period_start + timedelta(seconds=1),
