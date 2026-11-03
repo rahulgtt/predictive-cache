@@ -3,6 +3,7 @@
 import json
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, time, timedelta
+from itertools import islice
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -92,7 +93,7 @@ class Faults:
                 rng.shuffle(ranked)
                 at = volume.period_start
                 while at < volume.period_end:
-                    selected = [fid for fid in ranked if live(files[fid], at)][:3]
+                    selected = list(islice((fid for fid in ranked if live(files[fid], at)), 3))
                     run = opaque_id("job", rng)
                     for fid in selected:
                         intents.append(

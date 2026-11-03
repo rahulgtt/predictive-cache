@@ -989,4 +989,44 @@ original values retained. known_gaps includes loss/sampling coverage; counters
 use true UTC hours and satisfy offered = emitted + dropped + sampled_out.
 quality.json contains eligible/affected/expected fault-stage counts. Sampling
 counts removals, and skew outliers use source/client groups as their denominator.
-Full validation/recovery reports and preset scale targets remain #19.
+Validation and recovery reporting are described in §21; preset measurements
+and remaining scale limits are recorded in [the issue #19 handoff](issue-19-handoff.md).
+
+## 21. Validation and reporting (issue #19)
+
+validate now verifies artifact integrity and restored event semantics. It joins
+one truth row per unique ID, validates duplicate/removal/mutation claims and
+restores original fields before checking references, path lifetimes, handles,
+ranges and exact true-hour loss accounting. Tagged expected faults remain
+diagnostics; unexplained invalid records fail. Summary-mode byte totals are
+covered by realizer plan-parity tests because individual read rows are absent.
+
+quality.json and summary.md include observed counts, per-volume local-hour
+histograms, restored foreground popularity/byte/session statistics, file sizes,
+fault-stage rates and P1–P8 recovery diagnostics. The report's semantic checks
+run on generated rows; validate independently checks the serialized artifacts.
+Recovery statuses are passed/failed only for supported controlled cases;
+mixed scenarios are diagnostic, small samples insufficient_data, and absent or
+constant signals not_applicable. Noise attribution explicitly uses truth for
+accounting and is not an independent noise-detection score.
+
+Recovery failures are distinct from structural corruption: the command checks
+the dataset contract while reports expose planted-pattern results. Controlled
+positive/negative fixtures and sufficiently populated fault-rate tests gate
+the report formulas in CI. Production consumers must never read recovery
+truth as features or use simulated restoration as their cleaner.
+
+Parquet timestamp conversion and schema checks use exact typed paths; JSONL
+retains strict value validation. Wire schemas and deterministic data-file
+guarantees remain unchanged. The tiny CI job measures generation plus semantic
+validation after environment setup, including Python package imports, and
+checks both runtime and the 10k–50k observed-row range.
+
+[Downstream guide](downstream-guide.md) provides commands, loading/filtering
+examples, dataset sharing, origin semantics, gap handling and as-of catalog
+rules. The generator remains buffered; runtime measurements describe the
+tested host/config/revision rather than a universal hardware guarantee.
+
+Current acceptance evidence and the open small/medium preset gaps are recorded
+in [the issue #19 handoff](issue-19-handoff.md). The preset table remains a
+target, not a claim that every preset meets it.

@@ -37,9 +37,11 @@ Use YAML with `--config` to adjust existing controls. For smaller ingestion
 fixtures, lower `files.target_count`, `actors.users`, `period.weeks`, and
 `randomness.rate_scale`; `realize.read_events: none` keeps open/close totals
 while omitting per-range rows. No modeled file contents are created.
-`validate` checks schemas and artifact integrity. Fault-stage denominators
-are included in `report/quality.json`; full recovery reports and scale tuning
-remain #19. Generation is buffered in memory, and writes do not feed back
+`validate` checks hashes, schemas, references, restored handles/ranges, loss
+accounting and fault/truth consistency. `report/quality.json` and
+`report/summary.md` contain descriptive statistics and supported recovery
+diagnostics. [The downstream guide](docs/datagen/downstream-guide.md) explains
+loading, filtering, gaps, history and dataset sharing. Generation is buffered in memory, and writes do not feed back
 into previously generated access choices. See [spec §20](docs/datagen/spec.md#20-combined-workloads-realization-and-faults-issues-1618).
 
 ## What we are trying to prove

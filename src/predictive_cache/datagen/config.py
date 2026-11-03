@@ -434,6 +434,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "period": {"weeks": 2},
         "files": {"target_count": 300},
         "actors": {"users": 10},
+        "randomness": {"rate_scale": 0.5},
+        "faults": {"warmer_origin": {"top_n": 10}},
+        "realize": {"max_read_event_bytes": 64 * 2**20},
     },
     "medium": {
         "period": {"weeks": 12},

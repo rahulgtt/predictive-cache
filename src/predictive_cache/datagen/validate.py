@@ -1,14 +1,16 @@
-"""Foundation schema and artifact integrity checks; recovery belongs to issue #19."""
+"""Artifact, schema and restored-clean semantic validation."""
 
 from __future__ import annotations
 
 import json
 import re
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from .config import load_config
-from .io import PARTITIONED, TABLE_PATHS, config_hash, read_table, sha256
+from .io import PARTITIONED, TABLE_PATHS, config_hash, read_table, sha256, table_rows
 from .schema import Manifest
+from .semantic import validate_semantics
 
 
 def validate_dataset(directory: Path) -> dict:
@@ -32,6 +34,8 @@ def validate_dataset(directory: Path) -> dict:
     }
     seen = set()
     row_counts = {}
+    tables = defaultdict(list)
+    patterns = []
     partition_counts = dict.fromkeys(PARTITIONED, 0)
     for entry in manifest.files:
         if entry.path in seen:
@@ -60,11 +64,24 @@ def validate_dataset(directory: Path) -> dict:
             if table.num_rows != entry.rows:
                 raise ValueError(f"row-count mismatch: {entry.path}")
             row_counts[name] = row_counts.get(name, 0) + table.num_rows
+            rows = table_rows(table)
+            tables[name].extend(rows)
+            if name in PARTITIONED:
+                order = [(row["ingest_time"], row["event_id"]) for row in rows]
+                if order != sorted(order):
+                    raise ValueError("partition replay order mismatch")
+                if any(
+                    row["volume_id"] != match[1]
+                    or row["ingest_time"].date().isoformat() != match[2]
+                    for row in rows
+                ):
+                    raise ValueError("partition identity/date mismatch")
         elif entry.path == "truth/patterns.jsonl":
             table = read_table(path, "patterns")
             if table.num_rows != entry.rows:
                 raise ValueError("pattern row-count mismatch")
             row_counts["patterns"] = table.num_rows
+            patterns = table_rows(table)
         elif entry.path in {"config.resolved.yaml", "report/quality.json", "report/summary.md"}:
             if entry.rows is not None:
                 raise ValueError("non-tabular artifact rows must be null")
@@ -82,8 +99,24 @@ def validate_dataset(directory: Path) -> dict:
     for name in ("events", "dropped_events", "files", "actors", "patterns"):
         if row_counts.get(name, 0) != getattr(manifest.counts, name):
             raise ValueError(f"manifest count mismatch: {name}")
+    if dict(Counter(e["operation"] for e in tables["events"])) != manifest.counts.by_operation:
+        raise ValueError("manifest operation counts mismatch")
+    if (
+        dict(Counter(e["origin"] or "unknown" for e in tables["events"]))
+        != manifest.counts.by_origin
+    ):
+        raise ValueError("manifest origin counts mismatch")
+    if (
+        dict(Counter(f for t in tables["event_truth"] for f in t["faults"]))
+        != manifest.counts.by_fault
+    ):
+        raise ValueError("manifest fault counts mismatch")
+    result = validate_semantics(
+        tables, cfg, patterns, [g.model_dump() for g in manifest.known_gaps]
+    )
     return {
-        "scope": "schema_and_artifact_integrity",
+        **result,
+        "scope": "schema_artifact_and_semantic",
         "files": len(seen),
         "events": manifest.counts.events,
         "data_kind": manifest.data_kind,

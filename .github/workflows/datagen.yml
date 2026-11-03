@@ -1,0 +1,54 @@
+name: Datagen checks
+
+on:
+  pull_request:
+    paths:
+      - "src/predictive_cache/datagen/**"
+      - "tests/datagen/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/datagen.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/predictive_cache/datagen/**"
+      - "tests/datagen/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/datagen.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tiny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Tiny generation and semantic validation under 10 seconds
+        run: |
+          uv run python - <<'PY'
+          import os
+          import time
+          from pathlib import Path
+          started = time.perf_counter()
+          from predictive_cache.datagen.config import load_config
+          from predictive_cache.datagen.pipeline import run
+          from predictive_cache.datagen.validate import validate_dataset
+          output = Path(os.environ["RUNNER_TEMP"]) / "pcache-tiny"
+          manifest = run(load_config(preset="tiny"), output)
+          result = validate_dataset(output)
+          elapsed = time.perf_counter() - started
+          print(f"{manifest.counts.events} events; {elapsed:.3f}s; {result['scope']}")
+          assert 10_000 <= manifest.counts.events <= 50_000
+          assert elapsed < 10, f"Tiny exceeded 10 seconds: {elapsed:.3f}s"
+          PY
+      - name: Focused validation and controlled recovery checks
+        run: uv run pytest -q tests/datagen/test_validation.py tests/datagen/test_report.py tests/datagen/test_pattern_recovery.py tests/datagen/test_workloads.py tests/datagen/test_faults.py
