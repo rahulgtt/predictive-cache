@@ -5,6 +5,11 @@
 > data pipeline, or benchmark described below. The implementation plan is a
 > draft; feasibility and data gates must be resolved before performance claims.
 
+For agent-assisted development, start with [AGENTS.md](AGENTS.md), invoke
+`$pc-milestone`, and follow the [execution and review workflow](docs/ai/workflow.md).
+The [milestone map](docs/plan/milestones.md) connects agent tasks to the design
+gates below. These development tools do not add an agent runtime to the product.
+
 ## What we are trying to prove
 
 Cold first opens can wait on data fetched over the WAN. The idea is to predict
@@ -464,7 +469,13 @@ results are not final evidence. A fifth integration/data engineer can own
 replay, deployment, and cross-service integration if available.
 
 For the concise assignment handout, see
-[Day 1: Four parallel assignments](docs/day-one-assignments.pdf).
+[Day 1: Four parallel assignments](artifacts/pdf/day-one-assignments.pdf).
+
+For a quick team briefing, use the
+[three-page PDF](artifacts/pdf/predictive-cache-48-hour-team-plan.pdf)
+or its [Markdown source](docs/plan/team-quick-glance.md). The
+[detailed 48-hour plan](docs/predictive-cache-48-hour-team-plan.md)
+covers setup, contracts, ML, testing and fallback decisions.
 
 | Owner | Day 1 | Handoff and next work |
 | --- | --- | --- |
@@ -573,7 +584,7 @@ tests that normally skip in PR CI.
 
 ## Sources
 
-- [Day 1: Four parallel assignments](docs/day-one-assignments.pdf): the
+- [Day 1: Four parallel assignments](artifacts/pdf/day-one-assignments.pdf): the
   supplied one-page ownership, tasks, and handoff summary.
 - [Private design conversation export](https://gist.github.com/arawat-nasuni/e028801f06bc780a80e04a316532e909):
   user decisions and the 2026-10-09 Kind inventory; earlier five-service and
