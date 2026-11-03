@@ -51,8 +51,9 @@ def publish_data_only(root: Path, manifest: Manifest, output_uri: str) -> str:
         count = dataset.add_files(path=str(stage))
         if count != len(files) + 1:
             raise RuntimeError(f"ClearML registered {count} files; expected {len(files) + 1}")
-        if not dataset.upload(show_progress=False):
-            raise RuntimeError("ClearML data-only Dataset upload failed")
+        # ClearML 2.1 returns None after a successful upload; finalization
+        # verifies that all files are uploaded before sealing the Dataset.
+        dataset.upload(show_progress=False)
         if not dataset.finalize():
             raise RuntimeError("ClearML data-only Dataset finalization failed")
         return dataset.id
