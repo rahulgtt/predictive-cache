@@ -1,7 +1,9 @@
-"""``pcache-model``: inspect, verify and create model packages."""
+"""``pcache-model``: download, inspect, verify, score and create model packages."""
 
 import hashlib
+import json
 import subprocess
+import zipfile
 from pathlib import Path
 
 import click
@@ -35,6 +37,35 @@ from .snapshots import (
 )
 
 
+def _package_manifest(package: Path) -> dict:
+    if package.is_dir():
+        return json.loads((package / "package.json").read_text())
+    with zipfile.ZipFile(package) as archive:
+        return json.loads(archive.read("package.json"))
+
+
+def open_package(package: Path, feature_version: str | None = None, contract_sha256=None,
+                 available: set[str] | None = None):
+    """Load with the checks the package's own semantic view requires."""
+    try:
+        manifest = _package_manifest(package)
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile) as exc:
+        raise PackageError("bad_json", f"package.json: {exc}") from exc
+    if manifest.get("semantic_view_id") == SEMANTIC_VIEW_ID:
+        from .read_demand import READ_DEMAND_FEATURES
+
+        return load_package(
+            package,
+            READ_DEMAND_FEATURE_VERSION,
+            contract_sha256 or READ_DEMAND_SERVING_CONTRACT_SHA256,
+            expected_semantic_view_id=SEMANTIC_VIEW_ID,
+            expected_semantic_view_sha256=SEMANTIC_VIEW_SHA256,
+            expected_feature_schema_sha256=READ_DEMAND_FEATURE_SCHEMA_SHA256,
+            available_feature_names=available if available is not None else set(READ_DEMAND_FEATURES),
+        )
+    return load_package(package, feature_version or "fv1", contract_sha256)
+
+
 @click.group()
 def main():
     """Inspect and verify model packages (docs/ml/spec.md §5)."""
@@ -42,7 +73,7 @@ def main():
 
 @main.command()
 @click.argument("package", type=click.Path(exists=True, path_type=Path))
-@click.option("--feature-version", default="fv1", show_default=True)
+@click.option("--feature-version", default=None, help="Default: from the package (fv1 if unset).")
 @click.option("--contract-sha256", default=None, help="Require this serving-contract hash.")
 @click.option(
     "--snapshot",
@@ -53,11 +84,16 @@ def main():
 def verify(package, feature_version, contract_sha256, snapshot_root):
     """Run every load-time check; exit non-zero on the first failure."""
     try:
-        kwargs = _snapshot_expectations(snapshot_root)
         if snapshot_root:
-            feature_version = READ_DEMAND_FEATURE_VERSION
-            contract_sha256 = READ_DEMAND_SERVING_CONTRACT_SHA256
-        loaded = load_package(package, feature_version, contract_sha256, **kwargs)
+            kwargs = _snapshot_expectations(snapshot_root)
+            loaded = load_package(
+                package,
+                READ_DEMAND_FEATURE_VERSION,
+                READ_DEMAND_SERVING_CONTRACT_SHA256,
+                **kwargs,
+            )
+        else:
+            loaded = open_package(package, feature_version, contract_sha256)
     except PackageError as exc:
         raise click.ClickException(
             f"invalid package ({exc.reason}): {exc.detail}"
@@ -70,7 +106,7 @@ def verify(package, feature_version, contract_sha256, snapshot_root):
 
 @main.command()
 @click.argument("package", type=click.Path(exists=True, path_type=Path))
-@click.option("--feature-version", default="fv1", show_default=True)
+@click.option("--feature-version", default=None, help="Default: from the package (fv1 if unset).")
 @click.option(
     "--snapshot",
     "snapshot_root",
@@ -80,10 +116,11 @@ def verify(package, feature_version, contract_sha256, snapshot_root):
 def inspect(package, feature_version, snapshot_root):
     """Verify, then print the package manifest summary."""
     try:
-        kwargs = _snapshot_expectations(snapshot_root)
         if snapshot_root:
-            feature_version = READ_DEMAND_FEATURE_VERSION
-        loaded = load_package(package, feature_version, **kwargs)
+            kwargs = _snapshot_expectations(snapshot_root)
+            loaded = load_package(package, READ_DEMAND_FEATURE_VERSION, **kwargs)
+        else:
+            loaded = open_package(package, feature_version)
     except PackageError as exc:
         raise click.ClickException(
             f"invalid package ({exc.reason}): {exc.detail}"
@@ -99,6 +136,95 @@ def inspect(package, feature_version, snapshot_root):
     click.echo(f"serving_policy:  {m['serving_policy']}")
     click.echo(f"data:            {m.get('data', {})}")
     click.echo(f"created_at:      {m.get('created_at')}")
+    if m.get("semantic_view_id"):
+        click.echo(f"semantic_view:   {m['semantic_view_id']}")
+
+
+@main.command()
+@click.argument("model_id")
+@click.option("--out", default=".", show_default=True, type=click.Path(file_okay=False, path_type=Path))
+def download(model_id, out):
+    """Download a registered model package from ClearML (needs SDK credentials)."""
+    import shutil
+
+    from predictive_cache.tracking import NullTracker
+
+    try:
+        local = NullTracker().get_model_copy(model_id)
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    out.mkdir(parents=True, exist_ok=True)
+    target = out / f"{model_id}.zip"
+    shutil.copyfile(local, target)
+    try:
+        with open_package(target) as loaded:
+            click.echo(f"{target}  {loaded.model_version} ({len(loaded.feature_columns)} features)")
+    except PackageError as exc:
+        raise click.ClickException(f"downloaded package is invalid ({exc.reason}): {exc.detail}") from exc
+
+
+def _read_rows(path: Path):
+    import pyarrow as pa
+    import pyarrow.csv as pcsv
+    import pyarrow.json as pjson
+    import pyarrow.parquet as pq
+
+    if path.is_dir():
+        parts = sorted(path.rglob("*.parquet"))
+        if not parts:
+            raise click.ClickException(f"{path} has no parquet files")
+        return pa.concat_tables([pq.ParquetFile(p).read() for p in parts], promote_options="default")
+    if path.suffix == ".parquet":
+        return pq.ParquetFile(path).read()
+    if path.suffix in (".jsonl", ".ndjson", ".json"):
+        return pjson.read_json(path)
+    if path.suffix == ".csv":
+        return pcsv.read_csv(path)
+    raise click.ClickException("rows must be .parquet, .jsonl or .csv (or a parquet directory)")
+
+
+@main.command()
+@click.argument("package", type=click.Path(exists=True, path_type=Path))
+@click.option("--rows", "rows_path", required=True, type=click.Path(exists=True, path_type=Path),
+              help="Feature rows: .parquet/.jsonl/.csv or a snapshot split directory.")
+@click.option("--out", type=click.Path(dir_okay=False, path_type=Path),
+              help="Write scored rows (.parquet or .csv); default prints the top rows.")
+@click.option("--top-k", default=20, show_default=True, type=int)
+def score(package, rows_path, out, top_k):
+    """Score feature rows locally with a model package (no server needed)."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    rows = _read_rows(rows_path)
+    try:
+        with open_package(package, available=set(rows.column_names)) as loaded:
+            scores = loaded.score(rows)
+            model = loaded.model_version
+    except PackageError as exc:
+        raise click.ClickException(f"invalid package ({exc.reason}): {exc.detail}") from exc
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    keys = [c for c in ("snapshot_id", "t", "volume_id", "file_id", "label") if c in rows.column_names]
+    result = rows.select(keys).append_column("score", pa.array(scores, pa.float64()))
+    result = result.sort_by([("score", "descending")])
+    if out:
+        if out.suffix == ".csv":
+            import pyarrow.csv as pcsv
+
+            pcsv.write_csv(result, out)
+        else:
+            import pyarrow.parquet as pq
+
+            pq.write_table(result, out)
+        click.echo(f"scored {rows.num_rows} rows with {model} -> {out}")
+        return
+    click.echo(f"scored {rows.num_rows} rows with {model}; top {min(top_k, rows.num_rows)}:")
+    for row in result.slice(0, top_k).to_pylist():
+        click.echo("  " + "  ".join(f"{k}={row[k]}" for k in keys if k != "t") + f"  score={row['score']:.4f}")
+    if "label" in keys:
+        top = result.slice(0, top_k)
+        hits = pc.sum(pc.cast(top.column("label"), pa.int64())).as_py() or 0
+        click.echo(f"positives in top {top.num_rows}: {hits}")
 
 
 @main.command()

@@ -223,3 +223,25 @@ def test_pcache_train_accepts_output(built, tmp_path):
         rows = load_split(root, "val", ("val",))
         scores = package.score(rows)
     assert len(scores) == rows.num_rows and np.isfinite(scores).all()
+
+
+def test_pcache_model_cli_runs_read_package_locally(built, tmp_path):
+    from click.testing import CliRunner
+
+    from predictive_cache.ml.cli import main as model_cli
+    from predictive_cache.ml.train import TrainConfig, train
+
+    root, *_ = built
+    package = Path(train(root, TrainConfig(models=["logreg-v1"]), tmp_path / "out")["models"]["logreg-v1"]["package"])
+    runner = CliRunner()
+    for args in (["verify", str(package)], ["inspect", str(package)]):
+        result = runner.invoke(model_cli, args)
+        assert result.exit_code == 0, result.output
+    assert "read-demand-v1" in runner.invoke(model_cli, ["inspect", str(package)]).output
+    out = tmp_path / "scores.csv"
+    split = root / "snapshots" / "split=test"
+    result = runner.invoke(model_cli, ["score", str(package), "--rows", str(split), "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    assert out.read_text().splitlines()[0].startswith('"snapshot_id"')
+    result = runner.invoke(model_cli, ["score", str(package), "--rows", str(split), "--top-k", "5"])
+    assert result.exit_code == 0 and "positives in top 5" in result.output

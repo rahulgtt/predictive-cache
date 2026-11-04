@@ -281,7 +281,8 @@ def train(
         model_id = tracker.register_model(
             zip_path,
             model_type,
-            ["candidate", f"data:{data_kind}"],
+            ["candidate", f"data:{data_kind}"]
+            + ([manifest["semantic_view_id"]] if manifest.get("semantic_view_id") else []),
             {"package_id": package_json["package_id"]},
         )
         for name, value in metrics.items():
