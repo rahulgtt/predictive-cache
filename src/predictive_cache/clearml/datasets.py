@@ -59,8 +59,18 @@ def project_data_manifest(manifest: Manifest) -> DataOnlyManifest:
     )
 
 
-def publish_data_only(root: Path, manifest: Manifest, output_uri: str) -> str:
-    """Create a finalized ClearML Dataset with a truth-free projected manifest."""
+def publish_data_only(
+    root: Path,
+    manifest: Manifest,
+    output_uri: str,
+    version: str | None = None,
+    extra_tags: tuple[str, ...] = (),
+) -> str:
+    """Create a finalized ClearML Dataset with a truth-free projected manifest.
+
+    ``version`` sets the ClearML dataset version (None lets ClearML choose);
+    ``extra_tags`` are added to the standard ``data:synthetic``/``seed`` tags.
+    """
     from clearml import Dataset
 
     projected = project_data_manifest(manifest)
@@ -77,7 +87,8 @@ def publish_data_only(root: Path, manifest: Manifest, output_uri: str) -> str:
         dataset = Dataset.create(
             dataset_name=manifest.dataset_id,
             dataset_project="predictive-cache/datasets/synthetic",
-            dataset_tags=["data:synthetic", f"seed:{manifest.seed}", "#71"],
+            dataset_version=version or None,
+            dataset_tags=["data:synthetic", f"seed:{manifest.seed}", "#71", *extra_tags],
             output_uri=output_uri,
             description="Data-only synthetic events for cleaning; truth and reports excluded",
         )

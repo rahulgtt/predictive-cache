@@ -1,0 +1,10 @@
+# Synthetic size-ladder scenario 'medium' (#99). Generated data is never committed.
+preset: custom
+seed: 42
+period: {weeks: 8}
+volumes:
+  - {timezone: "America/New_York"}
+  - {timezone: "Europe/London", holidays: []}
+files: {target_count: 15000}
+actors: {users: 120, teams: 12}
+realize: {max_read_event_bytes: 67108864}
