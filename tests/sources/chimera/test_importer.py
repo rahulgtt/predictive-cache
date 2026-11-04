@@ -602,13 +602,22 @@ def test_tag_checkpoint_hash_and_permissions_are_enforced(tmp_path: Path):
         _import(paths, tmp_path / "restart-out")
 
     paths = _fixture(tmp_path / "late-checkpoint")
+    raw = [json.loads(line) for line in paths["raw"].read_text().splitlines()]
+    for index, row in enumerate(raw):
+        event_time = START + timedelta(seconds=40, minutes=index)
+        row["event_time_ns"] = str(int(event_time.timestamp() * 1_000_000_000))
+        row["sink_time_ns"] = str(
+            int((event_time + timedelta(milliseconds=10)).timestamp() * 1_000_000_000)
+        )
+    _jsonl(paths["raw"], raw)
+    _reseal_raw(paths)
     checkpoints = [json.loads(line) for line in paths["checkpoints"].read_text().splitlines()]
     checkpoints[0]["captured_at"] = checkpoints[0]["scheduled_at"].replace("Z", "+00:00")
     checkpoints[0]["captured_at"] = datetime.fromisoformat(
         checkpoints[0]["captured_at"]
     ) + timedelta(seconds=31)
     _jsonl(paths["checkpoints"], checkpoints)
-    with pytest.raises(ValueError, match="start checkpoint baseline|30-second tolerance"):
+    with pytest.raises(ValueError, match="30-second tolerance"):
         _import(paths, tmp_path / "late-checkpoint-out")
 
     paths = _fixture(tmp_path / "permissions")
@@ -634,6 +643,95 @@ def test_nonzero_start_checkpoint_sequence_baseline_is_preserved(tmp_path: Path)
     report = json.loads((out / "report/import.json").read_text())
     assert manifest.data_kind == "synthetic"
     assert report["event_quality"]["raw_events"][0]["producer_sequence"] == 64
+    clean = tmp_path / "clean"
+    clean_result = CliRunner().invoke(
+        prep_main,
+        ["clean", "--input", str(out), "--out", str(clean), "--format", "jsonl"],
+    )
+    assert clean_result.exit_code == 0, clean_result.output
+    cleaned = json.loads((clean / "manifest.json").read_text())
+    assert cleaned["counts"]["kept_events"] == 0
+    assert cleaned["counts"]["excluded_by_reason"] == {"origin_synthetic": 5}
+    assert cleaned["coverage"]["complete"] == 5
+
+
+def test_nonzero_baseline_uses_manifest_order_across_multiple_chunks(tmp_path: Path):
+    paths = _fixture(tmp_path)
+    _apply_sequence_baseline(paths, 65)
+    lines = paths["raw"].read_bytes().splitlines(keepends=True)
+    first = paths["raw"].with_name("events-00002.jsonl")
+    second = paths["raw"].with_name("events-00001.jsonl")
+    first.write_bytes(b"".join(lines[:2]))
+    second.write_bytes(b"".join(lines[2:]))
+    first.chmod(0o600)
+    second.chmod(0o600)
+    paths["raw"].unlink()
+    sources = json.loads(paths["event_sources"].read_text())
+    template = sources["files"][0]
+    sources["files"] = [
+        {
+            **template,
+            "raw_jsonl_path": path.relative_to(tmp_path).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in (first, second)
+    ]
+    _json(paths["event_sources"], sources)
+    checkpoints = [json.loads(line) for line in paths["checkpoints"].read_text().splitlines()]
+    for index, row in enumerate(checkpoints):
+        active = first if index == 0 else second
+        row["active_jsonl"] = {
+            "path": active.relative_to(tmp_path).as_posix(),
+            "size_bytes": active.stat().st_size,
+            "sha256": hashlib.sha256(active.read_bytes()).hexdigest(),
+        }
+        row["backup_jsonl"] = (
+            None
+            if index == 0
+            else {
+                "path": first.relative_to(tmp_path).as_posix(),
+                "size_bytes": first.stat().st_size,
+                "sha256": hashlib.sha256(first.read_bytes()).hexdigest(),
+            }
+        )
+    _jsonl(paths["checkpoints"], checkpoints)
+    _import(paths, tmp_path / "accepted-chunks")
+
+
+def test_multichunk_source_manifest_rejects_hardlink_alias(tmp_path: Path):
+    paths = _fixture(tmp_path)
+    alias = paths["raw"].with_name("events-alias.jsonl")
+    os.link(paths["raw"], alias)
+    sources = json.loads(paths["event_sources"].read_text())
+    sources["files"].append(
+        {
+            **sources["files"][0],
+            "raw_jsonl_path": alias.relative_to(tmp_path).as_posix(),
+        }
+    )
+    _json(paths["event_sources"], sources)
+    with pytest.raises(ValueError, match="aliases another chunk"):
+        _import(paths, tmp_path / "aliased-chunk")
+
+
+def test_source_manifest_rejects_duplicate_chunk_declaration(tmp_path: Path):
+    paths = _fixture(tmp_path)
+    sources = json.loads(paths["event_sources"].read_text())
+    sources["files"].append(dict(sources["files"][0]))
+    _json(paths["event_sources"], sources)
+    with pytest.raises(ValueError, match="duplicate source paths"):
+        _import(paths, tmp_path / "duplicate-chunk")
+
+
+def test_start_checkpoint_must_precede_every_run_scoped_raw_event(tmp_path: Path):
+    paths = _fixture(tmp_path)
+    _apply_sequence_baseline(paths, 63)
+    rows = [json.loads(line) for line in paths["raw"].read_text().splitlines()]
+    rows[1]["sink_time_ns"] = str(int((START - timedelta(seconds=1)).timestamp() * 1e9))
+    _jsonl(paths["raw"], rows)
+    _reseal_raw(paths)
+    with pytest.raises(ValueError, match="first event predates the start checkpoint baseline"):
+        _import(paths, tmp_path / "prebaseline-event")
 
 
 @pytest.mark.parametrize("first_sequence", [63, 65])
@@ -663,6 +761,26 @@ def test_final_checkpoint_must_equal_baseline_plus_run_rows(tmp_path: Path):
     _jsonl(paths["checkpoints"], checkpoints)
     with pytest.raises(ValueError, match="final checkpoint"):
         _import(paths, tmp_path / "bad-final")
+
+
+def test_nonzero_baseline_rejects_checkpoint_rollback_and_epoch_mismatch(tmp_path: Path):
+    paths = _fixture(tmp_path / "rollback")
+    _apply_sequence_baseline(paths, 63)
+    checkpoints = [json.loads(line) for line in paths["checkpoints"].read_text().splitlines()]
+    for field in ("last_enqueued_sequence", "last_synced_sequence", "synced_count"):
+        checkpoints[1][field] = 62
+    _jsonl(paths["checkpoints"], checkpoints)
+    with pytest.raises(ValueError, match="producer sequence reset"):
+        _import(paths, tmp_path / "rollback-out")
+
+    paths = _fixture(tmp_path / "epoch")
+    _apply_sequence_baseline(paths, 63)
+    raw = [json.loads(line) for line in paths["raw"].read_text().splitlines()]
+    raw[0]["producer_epoch"] = "22222222-2222-4222-8222-222222222222"
+    _jsonl(paths["raw"], raw)
+    _reseal_raw(paths)
+    with pytest.raises(ValueError, match="producer epoch differs"):
+        _import(paths, tmp_path / "epoch-out")
 
 
 def _full_validation_contract(tmp_path: Path):
@@ -778,7 +896,7 @@ def test_validation_permit_accepts_only_deterministic_prefix(tmp_path: Path, cou
         rows[:count],
         manifest,
         fixtures,
-        tuple(planned_operations(manifest, catalog)[:count]),
+        permit.operation_ids,
     )
     assert tuple(validated) == permit.operation_ids
 
@@ -834,7 +952,7 @@ def test_validation_permit_rejects_symlink_and_nonprefix_rows(tmp_path: Path):
         manifest_path.read_bytes(),
         catalog,
     )
-    expected_prefix = tuple(planned_operations(manifest, catalog)[:1])
+    expected_prefix = (rows[0].operation_id,)
     wrong_prefix = rows[1].model_copy(update={"operation_index": 0})
     with pytest.raises(ValueError, match="deterministic prefix"):
         _validate_ledger([wrong_prefix], manifest, fixtures, expected_prefix)

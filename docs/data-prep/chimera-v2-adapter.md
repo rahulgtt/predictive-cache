@@ -140,6 +140,10 @@ fail closed. Empty tags remain `origin=synthetic`.
   dispositions fail closed.
 - Hourly prep counters use offered time. Durable dispositions are `emitted`;
   approved exclusions are `dropped` and create an incomplete known-gap hour.
+- JSONL evidence rejects duplicate object keys. Imported and cleaned event
+  artifacts use canonical `volume_id=<id>/date=<UTC-date>/part-00000`
+  partitions; each row's volume, UTC ingest date and canonical order must
+  match its partition.
 
 ## Publication and privacy
 
@@ -152,3 +156,23 @@ The prep dataset contains opaque IDs and event metadata, not contents,
 credentials, target file handles, raw fixture paths, node names or export
 paths. Source-only diagnostics include sink-attempt time, producer sequence,
 pod UID, producer epoch, NFS operation ID and status.
+### Producer sequence baseline and raw-chunk boundary
+
+The authenticated run-start checkpoint defines a lifetime producer baseline
+for each exact `(pod_name, pod_uid, node_name, producer_epoch)`. Provider
+initialization records a drained checkpoint and copies only subsequently
+accepted events into the run's immutable source chunks. Chunks for one stream
+retain their authoritative `CollectorFileManifest.files` order and are merged
+before validation; filename sorting or per-chunk baseline reset is forbidden.
+their combined producer sequences must be exactly `baseline + 1` through
+`baseline + N`. The minimum raw `sink_time_ns` must be at or after the start
+checkpoint's actual `captured_at`.
+
+The final drained checkpoint must report
+`last_enqueued_sequence == last_synced_sequence == synced_count == baseline + N`.
+Every source chunk is hash-verified. Checkpoint active/backup references must
+name manifested chunks with exact hashes and sizes; the start and final active
+files must match the first and last manifest entries for the stream.
+Duplicate paths, hard-link aliases, sequence gaps, rollback, producer epoch,
+pod or node changes fail closed. A new producer epoch is a distinct stream
+and requires its own authenticated start checkpoint baseline.

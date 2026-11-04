@@ -6,11 +6,12 @@ import hashlib
 import re
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+GitObjectId = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 SafeId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
 ProducerEpoch = Annotated[
     str,
@@ -154,6 +155,549 @@ class AdapterValidationPermit(StrictModel):
         return self
 
 
+CleanupRootKind = Literal[
+    "bounded_harness_evidence",
+    "bounded_provider_evidence",
+    "bounded_adapter_dataset",
+    "bounded_clean_dataset",
+    "live_harness_evidence",
+    "live_provider_evidence",
+    "live_adapter_dataset",
+    "live_clean_dataset",
+]
+
+
+class CleanupFileEvidence(StrictModel):
+    sha256: Sha256
+    mode: int = Field(ge=0, le=0o777)
+
+
+class CleanupRootEvidence(StrictModel):
+    root_id: SafeId
+    kind: CleanupRootKind
+    canonical_path: str = Field(min_length=1)
+    path_sha256: Sha256
+    device: int = Field(ge=0)
+    inode: int = Field(gt=0)
+    root_manifest_sha256: Sha256
+    files: dict[str, CleanupFileEvidence]
+
+    @field_validator("files")
+    @classmethod
+    def safe_files(cls, value: dict[str, CleanupFileEvidence]):
+        if not value:
+            raise ValueError("cleanup root must contain evidence files")
+        for path in value:
+            _safe_relative(path)
+        return value
+
+
+class CleanupEvidenceReference(StrictModel):
+    root_id: SafeId
+    path: str
+    sha256: Sha256
+
+    _path = field_validator("path")(_safe_relative)
+
+
+class BoundedValidationAttestation(StrictModel):
+    bounded_validation_manifest_version: Literal[1] = 1
+    validation_run_id: SafeId
+    full_live_candidate_manifest: CleanupEvidenceReference
+    permit_id: CanonicalUuid
+    permit: CleanupEvidenceReference
+    offered_ledger: CleanupEvidenceReference
+    execution_ledger: CleanupEvidenceReference
+    observed: CleanupEvidenceReference
+    source_manifest: CleanupEvidenceReference
+    checkpoints: CleanupEvidenceReference
+    durable_sidecar: CleanupEvidenceReference
+    pre_read_health: CleanupEvidenceReference
+    provider_manifest: CleanupEvidenceReference
+    validation_operations: int = Field(ge=1, le=3)
+    operation_ids: tuple[Sha256, ...]
+    validated_code_head_sha256: GitObjectId
+    validated_merge_commit_sha256: GitObjectId
+    validated_tree_sha256: GitObjectId
+    executed_source_archive: CleanupEvidenceReference
+    provider_package: CleanupEvidenceReference
+    provider: CleanupEvidenceReference
+    collector: CleanupEvidenceReference
+    validator: CleanupEvidenceReference
+    runbook: CleanupEvidenceReference
+    adapter_wrapper: CleanupEvidenceReference
+    cleaner_wrapper: CleanupEvidenceReference
+    cluster_provenance: CleanupEvidenceReference
+    event_schema: CleanupEvidenceReference
+    budget_evidence: CleanupEvidenceReference
+    fixture_catalog: CleanupEvidenceReference
+    imported_manifest: CleanupEvidenceReference
+    imported_report: CleanupEvidenceReference
+    cleaned_manifest: CleanupEvidenceReference
+    cleaned_report: CleanupEvidenceReference
+    started_at: datetime
+    completed_at: datetime
+    scope: Literal["bounded_validation"]
+    data_kind: Literal["synthetic"]
+    representative_production_demand: Literal[False]
+    status: Literal["passed"]
+    cleanup_roots: tuple[CleanupRootEvidence, ...]
+
+    _started_utc = field_validator("started_at")(_utc)
+    _completed_utc = field_validator("completed_at")(_utc)
+
+    @model_validator(mode="after")
+    def exact_bounded_contract(self):
+        if len(self.operation_ids) != self.validation_operations:
+            raise ValueError("bounded operation IDs must match the validated count")
+        if self.completed_at < self.started_at:
+            raise ValueError("bounded validation completion predates its start")
+        kinds = {root.kind for root in self.cleanup_roots}
+        expected = {
+            "bounded_harness_evidence",
+            "bounded_provider_evidence",
+            "bounded_adapter_dataset",
+            "bounded_clean_dataset",
+        }
+        if len(self.cleanup_roots) != 4 or kinds != expected:
+            raise ValueError("bounded attestation must declare its four exact roots")
+        return self
+
+
+class ProviderInvocationRecord(StrictModel):
+    provider_invocation_version: Literal[1] = 1
+    run_id: SafeId
+    manifest_sha256: Sha256
+    provider_package_sha256: Sha256
+    provider_package_path: Literal[".approved-tools/provider-package.zip"]
+    provider_snapshot_path: Literal[".approved-tools/checkpoint-provider"]
+    provider_snapshot_sha256: Sha256
+    collector_sha256: Sha256
+    validator_sha256: Sha256
+    interpreter_path: str
+    interpreter_sha256: Sha256
+    argv_contract: tuple[str, ...]
+    actions: tuple[str, ...]
+    created_at: datetime
+
+    _created_utc = field_validator("created_at")(_utc)
+
+
+class LiveProviderDeclaration(StrictModel):
+    live_provider_declaration_version: Literal[1] = 1
+    run_id: SafeId
+    manifest_sha256: Sha256
+    provider_package_sha256: Sha256
+    provider_sha256: Sha256
+    collector_sha256: Sha256
+    validator_sha256: Sha256
+    provider_snapshot_sha256: Sha256
+    provider_package_artifact: CleanupEvidenceReference
+    collector_artifact: CleanupEvidenceReference
+    validator_artifact: CleanupEvidenceReference
+    invocation_record: CleanupEvidenceReference
+    interpreter_path: str
+    interpreter_sha256: Sha256
+    argv_contract: tuple[str, ...]
+    operation_count: int = Field(ge=1, le=300)
+    event_count: int = Field(ge=1, le=300)
+    content_sha256_by_operation: dict[Sha256, Sha256]
+    source_manifest: CleanupEvidenceReference
+    fixture_catalog: CleanupEvidenceReference
+    source_chunks: tuple[CleanupEvidenceReference, ...]
+    durable_sidecar: CleanupEvidenceReference
+    checkpoints: CleanupEvidenceReference
+    pre_read_health: CleanupEvidenceReference
+    execution_ledger: CleanupEvidenceReference
+    offered_ledger: CleanupEvidenceReference
+    observed: CleanupEvidenceReference
+    reconciliation: CleanupEvidenceReference
+    scope: Literal["live_collection"]
+
+    @field_validator("source_chunks")
+    @classmethod
+    def source_chunks_present(cls, value):
+        if not value:
+            raise ValueError("live provider declaration requires source chunks")
+        identities = [(item.root_id, item.path) for item in value]
+        if len(identities) != len(set(identities)):
+            raise ValueError("live provider declaration contains duplicate source chunks")
+        return value
+
+    @field_validator("content_sha256_by_operation")
+    @classmethod
+    def exact_content_count(cls, value):
+        if not value:
+            raise ValueError("provider content evidence must not be empty")
+        return value
+
+
+class DatasetArtifact(StrictModel):
+    path: str
+    rows: int | None = Field(default=None, ge=0)
+    sha256: Sha256
+
+    _path = field_validator("path")(_safe_relative)
+
+
+class DatasetPeriod(StrictModel):
+    start: datetime
+    end: datetime
+
+    _start_utc = field_validator("start")(_utc)
+    _end_utc = field_validator("end")(_utc)
+
+
+class LiveAdapterRuntime(StrictModel):
+    adapter: Literal["pcache-chimera-import"]
+    adapter_version: str
+    python: str
+    run_id: SafeId
+    chimera_image_sha256: Sha256
+    event_schema_sha256: Sha256
+    event_sources_sha256: Sha256
+    observed_sha256: Sha256
+    run_manifest_sha256: Sha256
+    offered_ledger_sha256: Sha256
+    fixture_catalog_sha256: Sha256
+    checkpoints_sha256: Sha256
+
+
+class LiveAdapterGenerator(StrictModel):
+    name: Literal["pcache-datagen"]
+    version: str
+    git_sha: str
+    runtime: LiveAdapterRuntime
+
+
+class LiveAdapterCounts(StrictModel):
+    events: Literal[300]
+    dropped_events: Literal[0]
+    files: int = Field(gt=0)
+    actors: int = Field(ge=0)
+    patterns: int = Field(ge=0)
+    by_operation: dict[str, int]
+    by_origin: dict[str, int]
+    by_fault: dict[str, int]
+
+
+class LiveAdapterManifest(StrictModel):
+    manifest_version: Literal[1]
+    dataset_id: str = Field(min_length=1)
+    data_kind: Literal["synthetic"]
+    generator: LiveAdapterGenerator
+    event_schema_version: Literal[1]
+    seed: Literal[0]
+    preset: Literal["custom"]
+    config_sha256: Sha256
+    period: DatasetPeriod
+    volumes: tuple[str, ...]
+    counts: LiveAdapterCounts
+    known_gaps: tuple[dict[str, Any], ...]
+    files: tuple[DatasetArtifact, ...]
+    created_at: datetime
+    limitations: tuple[str, ...]
+
+    _created_utc = field_validator("created_at")(_utc)
+
+    @field_validator("known_gaps")
+    @classmethod
+    def no_known_gaps(cls, value):
+        if value:
+            raise ValueError("live adapter manifest must not report known gaps")
+        return value
+
+
+class LiveAdapterInputHashes(StrictModel):
+    event_sources: Sha256
+    observed: Sha256
+    run_manifest: Sha256
+    offered_ledger: Sha256
+    fixture_catalog: Sha256
+    checkpoints: Sha256
+
+
+class LiveAdapterReportCounts(StrictModel):
+    event_sources: int = Field(gt=0)
+    raw_events: Literal[300]
+    durable_events: Literal[300]
+    approved_exclusions: Literal[0]
+    offered_operations: Literal[300]
+
+
+class LiveAdapterReport(StrictModel):
+    schema_name: Literal["chimera_import_report_v2"] = Field(alias="schema")
+    run_id: SafeId
+    counts: LiveAdapterReportCounts
+    event_quality: dict[str, Any]
+    approved_exclusions: tuple[dict[str, Any], ...]
+    known_gaps: tuple[dict[str, Any], ...]
+    input_sha256: LiveAdapterInputHashes
+    event_source_sha256: dict[str, Sha256]
+
+    @field_validator("approved_exclusions", "known_gaps")
+    @classmethod
+    def no_exclusions_or_gaps(cls, value):
+        if value:
+            raise ValueError("live adapter report must not contain exclusions or gaps")
+        return value
+
+
+class BoundedAdapterRuntime(LiveAdapterRuntime):
+    validation_permit_sha256: Sha256
+
+
+class BoundedAdapterCounts(StrictModel):
+    events: int = Field(ge=1, le=3)
+    dropped_events: Literal[0]
+    files: int = Field(gt=0)
+    actors: int = Field(ge=0)
+    patterns: int = Field(ge=0)
+    by_operation: dict[str, int]
+    by_origin: dict[str, int]
+    by_fault: dict[str, int]
+
+
+class BoundedAdapterGenerator(StrictModel):
+    name: Literal["pcache-datagen"]
+    version: str
+    git_sha: str
+    runtime: BoundedAdapterRuntime
+
+
+class BoundedAdapterManifest(LiveAdapterManifest):
+    generator: BoundedAdapterGenerator
+    counts: BoundedAdapterCounts
+
+
+class BoundedAdapterReportCounts(StrictModel):
+    event_sources: int = Field(gt=0)
+    raw_events: int = Field(ge=1, le=3)
+    durable_events: int = Field(ge=1, le=3)
+    approved_exclusions: Literal[0]
+    offered_operations: int = Field(ge=1, le=3)
+
+
+class BoundedAdapterInputHashes(LiveAdapterInputHashes):
+    validation_permit: Sha256
+
+
+class BoundedAdapterReport(LiveAdapterReport):
+    counts: BoundedAdapterReportCounts
+    input_sha256: BoundedAdapterInputHashes
+
+
+class CleanParent(StrictModel):
+    dataset_id: str = Field(min_length=1)
+    manifest_sha256: Sha256
+
+
+class CleanTool(StrictModel):
+    name: Literal["pcache-prep"]
+    version: str
+    git_sha: str
+
+
+class LiveCleanCounts(StrictModel):
+    input_events: Literal[300]
+    kept_events: Literal[0]
+    excluded_by_reason: dict[str, int]
+    open_ranges: Literal[0]
+    opens: Literal[0]
+    meta_events: Literal[0]
+    catalog_miss_events: Literal[0]
+    catalog_miss_files: Literal[0]
+    late_reads_after_completion: Literal[0]
+    opens_open_missing: Literal[0]
+    opens_close_missing: Literal[0]
+    opens_bytes_inconsistent: Literal[0]
+    unexpected_reads_in_summary_mode: Literal[0]
+
+    @model_validator(mode="after")
+    def exact_synthetic_exclusion(self):
+        if self.excluded_by_reason != {"origin_synthetic": 300}:
+            raise ValueError("live clean counts must exclude all synthetic events")
+        return self
+
+
+class LiveCleanCoverage(StrictModel):
+    hours: int = Field(gt=0)
+    complete: int = Field(gt=0)
+    incomplete: Literal[0]
+    no_counters: Literal[0]
+    skew_margin_s: int = Field(ge=0)
+    assume_complete_without_counters: Literal[False]
+
+    @model_validator(mode="after")
+    def all_complete(self):
+        if self.complete != self.hours:
+            raise ValueError("live clean coverage must be fully complete")
+        return self
+
+
+class LiveCleanManifest(StrictModel):
+    manifest_version: Literal[1]
+    dataset_id: str = Field(min_length=1)
+    data_kind: Literal["synthetic"]
+    stage: Literal["clean"]
+    parent: CleanParent
+    tool: CleanTool
+    config_sha256: Sha256
+    period: DatasetPeriod
+    counts: LiveCleanCounts
+    coverage: LiveCleanCoverage
+    files: tuple[DatasetArtifact, ...]
+    created_at: datetime
+
+    _created_utc = field_validator("created_at")(_utc)
+
+
+class BoundedCleanCounts(LiveCleanCounts):
+    input_events: int = Field(ge=1, le=3)
+
+    @model_validator(mode="after")
+    def exact_synthetic_exclusion(self):
+        if self.excluded_by_reason != {
+            "origin_synthetic": self.input_events
+        }:
+            raise ValueError("bounded clean counts must exclude all synthetic events")
+        return self
+
+
+class BoundedCleanManifest(LiveCleanManifest):
+    counts: BoundedCleanCounts
+
+
+class LiveCoverageRow(StrictModel):
+    volume_id: str
+    hour_start: datetime
+    offered: int = Field(ge=0)
+    emitted: int = Field(ge=0)
+    dropped: Literal[0]
+    sampled_out: Literal[0]
+    loss_fraction: Literal[0.0]
+    status: Literal["complete"]
+
+    _hour_utc = field_validator("hour_start")(_utc)
+
+    @model_validator(mode="after")
+    def zero_loss(self):
+        if self.offered != self.emitted:
+            raise ValueError("coverage offered and emitted counts must match")
+        return self
+
+
+class AdapterLossRow(StrictModel):
+    volume_id: str
+    hour_start: datetime
+    offered: int = Field(ge=0)
+    emitted: int = Field(ge=0)
+    dropped: Literal[0]
+    sampled_out: Literal[0]
+    duplicates: Literal[0]
+    late: Literal[0]
+
+    _hour_utc = field_validator("hour_start")(_utc)
+
+    @model_validator(mode="after")
+    def zero_loss(self):
+        if self.offered != self.emitted:
+            raise ValueError("adapter loss offered and emitted counts must match")
+        return self
+
+
+class LiveCleanReport(StrictModel):
+    counts: LiveCleanCounts
+    by_volume_day: tuple["VolumeDayEvidence", ...]
+    excluded_by_reason: dict[str, int]
+    exclusions_by_volume_day_reason: tuple["ExclusionEvidence", ...]
+    duplicate_rate: float
+    late_arrival_s: "LateArrivalEvidence"
+    coverage_hours: dict[str, int]
+    incomplete_windows: tuple[dict[str, Any], ...]
+    opens: "OpenEvidence"
+    successful_returned_bytes: int = Field(ge=0)
+    distinct_bytes: int = Field(ge=0)
+    catalog_misses: dict[str, Any]
+    origin_mix: dict[str, int]
+    app_mix: dict[str, int]
+    opens_by_volume_hour: tuple[dict[str, Any], ...]
+    opens_by_volume_weekday: tuple[dict[str, Any], ...]
+
+
+class BoundedCleanReport(LiveCleanReport):
+    counts: BoundedCleanCounts
+
+
+class VolumeDayEvidence(StrictModel):
+    volume_id: str
+    date: str
+    input: int = Field(ge=0)
+    kept: int = Field(ge=0)
+    excluded: int = Field(ge=0)
+
+
+class ExclusionEvidence(StrictModel):
+    volume_id: str
+    date: str
+    reason: str
+    count: int = Field(ge=0)
+
+
+class LateArrivalEvidence(StrictModel):
+    p50: float | None = Field(default=None, ge=0)
+    p90: float | None = Field(default=None, ge=0)
+    p99: float | None = Field(default=None, ge=0)
+    max: float | None = Field(default=None, ge=0)
+    negative_count: Literal[0]
+
+    @model_validator(mode="after")
+    def ordered(self):
+        values = [self.p50, self.p90, self.p99, self.max]
+        if any(value is not None for value in values):
+            if any(value is None for value in values) or values != sorted(values):
+                raise ValueError("late-arrival quantiles must be complete and ordered")
+        return self
+
+
+class OpenEvidence(StrictModel):
+    count: Literal[0]
+    open_missing: Literal[0]
+    close_missing: Literal[0]
+    bytes_inconsistent: Literal[0]
+    consumed_share: Literal[0.0]
+
+
+class LiveFinalizationDeclaration(StrictModel):
+    live_finalization_version: Literal[1] = 1
+    run_id: SafeId
+    manifest_sha256: Sha256
+    reconciliation_sha256: Sha256
+    validated_code_head_sha256: GitObjectId
+    validated_merge_commit_sha256: GitObjectId
+    validated_tree_sha256: GitObjectId
+    executed_source_archive_sha256: Sha256
+    provider_manifest: CleanupEvidenceReference
+    adapter_manifest: CleanupEvidenceReference
+    adapter_report: CleanupEvidenceReference
+    cleaned_manifest: CleanupEvidenceReference
+    cleaned_report: CleanupEvidenceReference
+    cleanup_roots: tuple[CleanupRootEvidence, ...]
+
+    @model_validator(mode="after")
+    def exact_live_roots(self):
+        kinds = {root.kind for root in self.cleanup_roots}
+        expected = {
+            "live_harness_evidence",
+            "live_provider_evidence",
+            "live_adapter_dataset",
+            "live_clean_dataset",
+        }
+        if len(self.cleanup_roots) != 4 or kinds != expected:
+            raise ValueError("live finalization must declare its four exact roots")
+        return self
+
+
 class CollectionManifest(StrictModel):
     manifest_version: Literal[2] = 2
     run_id: SafeId
@@ -278,9 +822,36 @@ class CleanupCompletionRecord(StrictModel):
     completed_at: datetime
     cleanup_owner: str = Field(min_length=1)
     evidence: str = Field(min_length=1)
+    schedule_sha256: Sha256
+    validation_report_sha256: Sha256
+    deletion_inventory_sha256: Sha256
+    root_dispositions: dict[CleanupRootKind, Literal["deleted"]]
 
     _delete_utc = field_validator("delete_by")(_utc)
     _completed_utc = field_validator("completed_at")(_utc)
+
+    @field_validator("root_dispositions")
+    @classmethod
+    def all_roots_deleted(cls, value):
+        expected = {
+            "bounded_harness_evidence",
+            "bounded_provider_evidence",
+            "bounded_adapter_dataset",
+            "bounded_clean_dataset",
+            "live_harness_evidence",
+            "live_provider_evidence",
+            "live_adapter_dataset",
+            "live_clean_dataset",
+        }
+        if set(value) != expected:
+            raise ValueError("cleanup completion must account for all eight roots")
+        return value
+
+    @model_validator(mode="after")
+    def completed_on_time(self):
+        if self.completed_at > self.delete_by:
+            raise ValueError("cleanup completion must not exceed delete_by")
+        return self
 
 
 class OfferedOperation(StrictModel):
@@ -567,6 +1138,19 @@ class ReconciliationReport(StrictModel):
     success: bool
     failures: tuple[str, ...]
 
+    @model_validator(mode="after")
+    def consistent_success(self) -> ReconciliationReport:
+        has_failures = bool(
+            self.failures
+            or self.duplicate_operation_ids
+            or self.missing_operation_ids
+            or self.unexpected_operation_ids
+            or self.unknown_event_ids
+        )
+        if self.success == has_failures:
+            raise ValueError("reconciliation success conflicts with failure details")
+        return self
+
 
 class CollectorSourceFile(StrictModel):
     raw_jsonl_path: str
@@ -598,3 +1182,13 @@ class CollectorFileManifest(StrictModel):
     collector_file_manifest_version: Literal[1] = 1
     run_id: SafeId
     files: tuple[CollectorSourceFile, ...]
+
+    @field_validator("files")
+    @classmethod
+    def unique_source_paths(cls, value):
+        if not value:
+            raise ValueError("collector file manifest requires source files")
+        paths = [item.raw_jsonl_path for item in value]
+        if len(paths) != len(set(paths)):
+            raise ValueError("collector file manifest contains duplicate source paths")
+        return value

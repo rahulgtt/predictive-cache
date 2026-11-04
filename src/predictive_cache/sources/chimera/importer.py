@@ -79,13 +79,11 @@ def _validate_ledger(
     rows: list[OfferedOperation],
     manifest: CollectionManifest,
     fixtures: dict[tuple[str, str], FixtureEntry],
-    expected_validation_prefix: (
-        tuple[tuple[int, FixtureEntry, int, int, str], ...] | None
-    ) = None,
+    expected_validation_operation_ids: tuple[str, ...] | None = None,
 ) -> dict[str, OfferedOperation]:
     expected_count = (
-        len(expected_validation_prefix)
-        if expected_validation_prefix is not None
+        len(expected_validation_operation_ids)
+        if expected_validation_operation_ids is not None
         else manifest.offered_count
     )
     if len(rows) != expected_count:
@@ -132,8 +130,20 @@ def _validate_ledger(
             raise ValueError("offered operation client_id mismatch")
     if indexes != list(range(expected_count)):
         raise ValueError("offered operation indexes must be contiguous from zero")
-    if expected_validation_prefix is not None:
-        for row, expected in zip(rows, expected_validation_prefix, strict=True):
+    if expected_validation_operation_ids is not None:
+        catalog = FixtureCatalog(fixtures=tuple(fixtures.values()))
+        expected_prefix = tuple(
+            planned_operations(manifest, catalog)[
+                : len(expected_validation_operation_ids)
+            ]
+        )
+        if tuple(item[4] for item in expected_prefix) != (
+            expected_validation_operation_ids
+        ):
+            raise ValueError(
+                "validation permit operation IDs differ from deterministic prefix"
+            )
+        for row, expected in zip(rows, expected_prefix, strict=True):
             index, fixture, offset, count, operation_id = expected
             if (
                 row.operation_index,
@@ -275,51 +285,67 @@ def _resolve_source(root: Path, relative: str) -> Path:
 def _load_raw_events(
     source_manifest_path: Path,
     sources: CollectorFileManifest,
-    start_baselines: dict[tuple[str, str, str, str], int],
+    start_baselines: dict[tuple[str, str, str, str], tuple[int, datetime]],
 ) -> tuple[dict[tuple[str, str], list[ChimeraEvent]], dict[str, str], dict[str, int]]:
     root = source_manifest_path.parent
     streams = {}
     hashes = {}
     sizes = {}
+    source_paths = set()
+    source_inodes = set()
+    source_groups = defaultdict(list)
     for source in sources.files:
-        path = _resolve_source(root, source.raw_jsonl_path)
-        data = read_bytes(path)
-        digest = hashlib.sha256(data).hexdigest()
-        if digest != source.sha256:
-            raise ValueError(f"{source.raw_jsonl_path}: event source checksum mismatch")
-        events = parse_jsonl(data, path, ChimeraEvent)
-        if any(event.producer_epoch != source.producer_epoch for event in events):
-            raise ValueError(
-                f"{source.raw_jsonl_path}: producer epoch differs from its trusted envelope"
-            )
-        sequences = [event.sequence for event in events]
         identity = (
             source.pod_name,
             source.pod_uid,
             source.node_name,
             source.producer_epoch,
         )
-        stream = (source.pod_uid, source.producer_epoch)
+        source_groups[identity].append(source)
+    for identity, source_files in source_groups.items():
+        events = []
+        stream = (identity[1], identity[3])
+        for source in source_files:
+            path = _resolve_source(root, source.raw_jsonl_path)
+            resolved = path.resolve(strict=True)
+            inode = (resolved.stat().st_dev, resolved.stat().st_ino)
+            if resolved in source_paths or inode in source_inodes:
+                raise ValueError(
+                    f"{source.raw_jsonl_path}: event source aliases another chunk"
+                )
+            source_paths.add(resolved)
+            source_inodes.add(inode)
+            data = read_bytes(path)
+            digest = hashlib.sha256(data).hexdigest()
+            if digest != source.sha256:
+                raise ValueError(f"{source.raw_jsonl_path}: event source checksum mismatch")
+            chunk = parse_jsonl(data, path, ChimeraEvent)
+            if any(event.producer_epoch != source.producer_epoch for event in chunk):
+                raise ValueError(
+                    f"{source.raw_jsonl_path}: producer epoch differs from its trusted envelope"
+                )
+            events.extend(chunk)
+            hashes[source.raw_jsonl_path] = digest
+            sizes[source.raw_jsonl_path] = len(data)
         if identity not in start_baselines:
-            raise ValueError(
-                f"{source.raw_jsonl_path}: source stream lacks a start checkpoint baseline"
-            )
-        baseline = start_baselines[identity]
+            raise ValueError(f"{identity}: source stream lacks a start checkpoint baseline")
+        baseline, captured_at = start_baselines[identity]
+        if events and _ns_datetime(min(event.sink_ns for event in events)) < captured_at:
+            raise ValueError(f"{identity}: first event predates the start checkpoint baseline")
+        sequences = [event.sequence for event in events]
         if sequences != list(range(baseline + 1, baseline + len(events) + 1)):
             raise ValueError(
-                f"{source.raw_jsonl_path}: producer sequences must be contiguous "
+                f"{identity}: producer sequences must be contiguous "
                 "from the start checkpoint baseline"
             )
         streams[stream] = events
-        hashes[source.raw_jsonl_path] = digest
-        sizes[source.raw_jsonl_path] = len(data)
     return streams, hashes, sizes
 
 
 def _start_baselines(
     checkpoints: list[Checkpoint],
     manifest: CollectionManifest,
-) -> dict[tuple[str, str, str, str], int]:
+) -> dict[tuple[str, str, str, str], tuple[int, datetime]]:
     baselines = {}
     for row in checkpoints:
         if row.scheduled_at != manifest.start_time:
@@ -327,7 +353,16 @@ def _start_baselines(
         key = (row.pod_name, row.pod_uid, row.node_name, row.producer_epoch)
         if key in baselines:
             raise ValueError(f"{key}: duplicate start checkpoint baseline")
-        baselines[key] = row.last_synced_sequence
+        baseline = row.last_synced_sequence
+        if any(
+            (
+                row.last_enqueued_sequence != baseline,
+                row.queue_depth != 0,
+                row.worker_in_flight != 0,
+            )
+        ):
+            raise ValueError(f"{key}: start checkpoint does not prove a synced baseline")
+        baselines[key] = (baseline, row.captured_at)
     if not baselines:
         raise ValueError("collection lacks start checkpoint baselines")
     return baselines
@@ -340,12 +375,25 @@ def _validate_checkpoints(
     streams: dict[tuple[str, str], list[ChimeraEvent]],
     source_hashes: dict[str, str],
     source_sizes: dict[str, int],
-    start_baselines: dict[tuple[str, str, str, str], int],
+    start_baselines: dict[tuple[str, str, str, str], tuple[int, datetime]],
     validation_permit: AdapterValidationPermit | None = None,
 ) -> None:
-    source_by_stream = {
-        (source.pod_uid, source.producer_epoch): source for source in sources.files
-    }
+    source_by_stream = {}
+    source_paths_by_stream = defaultdict(set)
+    source_order_by_stream = defaultdict(list)
+    for source in sources.files:
+        stream = (source.pod_uid, source.producer_epoch)
+        source_paths_by_stream[stream].add(source.raw_jsonl_path)
+        source_order_by_stream[stream].append(source.raw_jsonl_path)
+        if stream in source_by_stream:
+            current = source_by_stream[stream]
+            if (
+                current.pod_name != source.pod_name
+                or current.node_name != source.node_name
+            ):
+                raise ValueError(f"{stream}: source envelope identity changed across chunks")
+        else:
+            source_by_stream[stream] = source
     grouped: dict[tuple[str, str], list[Checkpoint]] = defaultdict(list)
     for row in checkpoints:
         if row.run_id != manifest.run_id:
@@ -423,7 +471,8 @@ def _validate_checkpoints(
                 source.node_name,
                 source.producer_epoch,
             )
-            expected_count = start_baselines[identity] + len(streams[stream])
+            baseline, _captured_at = start_baselines[identity]
+            expected_count = baseline + len(streams[stream])
             if any(
                 (
                     final.last_enqueued_sequence != expected_count,
@@ -440,13 +489,22 @@ def _validate_checkpoints(
                 for item in (row.active_jsonl, row.backup_jsonl)
                 if item is not None
             ]
-            if not any(
-                item.path == source.raw_jsonl_path
-                and item.sha256 == source_hashes[source.raw_jsonl_path]
-                and item.size_bytes == source_sizes[source.raw_jsonl_path]
-                for item in evidence
+            if (
+                not evidence
+                or any(
+                    item.path not in source_paths_by_stream[stream]
+                    or item.sha256 != source_hashes[item.path]
+                    or item.size_bytes != source_sizes[item.path]
+                    for item in evidence
+                )
+                or rows[0].active_jsonl is None
+                or rows[0].active_jsonl.path != source_order_by_stream[stream][0]
+                or final.active_jsonl is None
+                or final.active_jsonl.path != source_order_by_stream[stream][-1]
             ):
-                raise ValueError(f"{stream}: source file lacks matching checkpoint evidence")
+                raise ValueError(
+                    f"{stream}: checkpoint source evidence does not match manifest order"
+                )
 
 
 def _event_result(status: int) -> str:
@@ -713,13 +771,7 @@ def import_dataset(
         ledger,
         manifest,
         fixtures,
-        (
-            tuple(
-                planned_operations(manifest, catalog)[: permit.validation_operations]
-            )
-            if permit is not None
-            else None
-        ),
+        permit.operation_ids if permit is not None else None,
     )
     observed = _validate_observed(observed_rows, manifest, offered)
     start_baselines = _start_baselines(checkpoints, manifest)
