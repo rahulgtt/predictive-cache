@@ -1,11 +1,17 @@
 """Offline COMPOUND round trips using the pinned pynfs client and XDR types."""
 
+import base64
+import os
 import re
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from predictive_cache.dispatcher.schema import Plan, PlanItem, task_from_plan, warmer_ref
+from predictive_cache.dispatcher.securefs import atomic_write_json
 from predictive_cache.warmer import nfs41
-from predictive_cache.warmer.execution import execute
+from predictive_cache.warmer.cli import _load_task
+from predictive_cache.warmer.execution import _elapsed_time, execute
 
 const = nfs41.const
 xdr = nfs41.xdr
@@ -175,6 +181,70 @@ def make_client(pipe):
     client.prog = const.NFS4_CALLBACK
     client.impl_id = xdr.nfs_impl_id4(b"fixture", b"fixture-client", xdr.nfstime4(0, 0))
     return client
+
+
+def _schema_v2_handle_worker(request, emit):
+    expected_handle = b"schema-v2-supplied-handle"
+    if request["file_handle"] != expected_handle:
+        return {"status": "error", "bytes_read": 0, "reason": "fixture_handle_mismatch"}
+    pipe = ScriptedPipe(
+        [(b"x" * request["length"], True)],
+        file_size=request["offset"] + request["length"],
+    )
+    events = []
+
+    def relay(event):
+        events.append(event)
+        emit(event)
+
+    result = nfs41._run(make_client(pipe), request, nfs41._CompoundBudget(relay))
+    expected_phases = [
+        "exchange_id",
+        "create_session",
+        "reclaim_complete",
+        "getattr",
+        "open",
+        "read",
+        "close",
+        "destroy_session",
+        "destroy_clientid",
+    ]
+    compounds = [event for event in events if event["type"] == "compound"]
+    if [event["phase"] for event in compounds] != expected_phases:
+        last_phase = compounds[-1]["phase"] if compounds else "none"
+        return {
+            "status": "error",
+            "bytes_read": result["bytes_read"],
+            "reason": f"fixture_phase_mismatch:{len(compounds)}:{last_phase}",
+        }
+    for event, (args, _) in zip(compounds, pipe.calls, strict=True):
+        operations = args.argarray
+        phase = event["phase"]
+        if (
+            phase in {"getattr", "open", "read", "close"}
+            and operations[1].opputfh.object != expected_handle
+        ):
+            return {
+                "status": "error",
+                "bytes_read": result["bytes_read"],
+                "reason": "fixture_putfh_mismatch",
+            }
+        if phase == "open" and operations[2].opopen.claim.claim != const.CLAIM_FH:
+            return {
+                "status": "error",
+                "bytes_read": result["bytes_read"],
+                "reason": "fixture_open_claim_mismatch",
+            }
+        if phase == "read" and (
+            operations[2].opread.offset,
+            operations[2].opread.count,
+        ) != (request["offset"], request["length"]):
+            return {
+                "status": "error",
+                "bytes_read": result["bytes_read"],
+                "reason": "fixture_read_range_mismatch",
+            }
+    return result
 
 
 @pytest.fixture
@@ -439,6 +509,101 @@ def handle_request(warm_request):
     request = {key: value for key, value in warm_request.items() if key != "path"}
     request.update(file_handle=b"\x00private-handle\xff", plan_ref="a" * 32, task_ref="b" * 32)
     return request
+
+
+def test_schema_v2_task_uses_supplied_handle_and_exact_range_through_terminal_result(tmp_path):
+    now = datetime.now(UTC)
+    handle = b"schema-v2-supplied-handle"
+    plan = Plan.model_validate(
+        {
+            "schema_version": 2,
+            "run_id": "run-handle-proof",
+            "plan_id": "plan-handle-proof",
+            "model_version": "baseline-proof",
+            "created_at": (now - timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+            "deadline": (now + timedelta(seconds=120)).isoformat().replace("+00:00", "Z"),
+            "max_bytes": 4096,
+            "items": [
+                {
+                    "task_id": "task-handle-proof",
+                    "volume_id": "volume-proof",
+                    "file_id": "file-proof",
+                    "export_name": "export-proof",
+                    "export_id": "export-id-proof",
+                    "target_fh_b64": base64.urlsafe_b64encode(handle)
+                    .rstrip(b"=")
+                    .decode("ascii"),
+                    "target_valid_until": (now + timedelta(seconds=180))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "offset": 8192,
+                    "length": 4096,
+                    "max_bytes": 4096,
+                    "score": 1.0,
+                    "reasons": ["offline-handle-contract-proof"],
+                }
+            ],
+        }
+    )
+    item = plan.items[0]
+    assert isinstance(item, PlanItem)
+    task = task_from_plan(plan, item)
+    task_dir = tmp_path / "private-tasks"
+    task_dir.mkdir(mode=0o700)
+    task_dir.chmod(0o700)
+    task_path = task_dir / "task-handle-proof.json"
+    task_dir_fd = os.open(task_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        assert atomic_write_json(
+            task_dir_fd,
+            task_path.name,
+            task.model_dump(mode="json"),
+            no_overwrite=True,
+        )
+    finally:
+        os.close(task_dir_fd)
+
+    request, timeout = _load_task(task_path, 10)
+    request.update(host="192.0.2.1", port=2049, uid=1002, gid=1002)
+    task_deadline = request.pop("_task_deadline_elapsed")
+    request["_timeout_deadline"] = min(_elapsed_time() + timeout, task_deadline)
+    events = []
+    result = execute(request, timeout, events.append, worker=_schema_v2_handle_worker)
+
+    assert request["file_handle"] == handle
+    assert (request["offset"], request["length"]) == (8192, 4096)
+    assert result == {
+        "type": "result",
+        "status": "completed",
+        "reason": "complete",
+        "bytes_requested": 4096,
+        "bytes_read": 4096,
+        "bytes_read_is_lower_bound": False,
+        "plan_ref": warmer_ref(plan.plan_id),
+        "task_ref": warmer_ref(item.task_id),
+    }
+    compounds = [event for event in events if event["type"] == "compound"]
+    assert [event["phase"] for event in compounds] == [
+        "exchange_id",
+        "create_session",
+        "reclaim_complete",
+        "getattr",
+        "open",
+        "read",
+        "close",
+        "destroy_session",
+        "destroy_clientid",
+    ]
+    assert [(event["offset"], event["count"]) for event in compounds if event["phase"] == "read"] == [
+        (8192, 4096)
+    ]
+    assert all(
+        event["tag"].startswith(
+            f"pc1:w:{warmer_ref(plan.plan_id)}:{warmer_ref(item.task_id)}:"
+        )
+        for event in compounds
+    )
+    assert handle.decode("ascii") not in repr(events) + repr(result)
 
 
 def test_wire_handle_mode_uses_structured_tags_and_never_looks_up_path(handle_request):
