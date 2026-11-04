@@ -298,6 +298,8 @@ class VolumeState:
         lift = conf / base
         ok = (support >= cfg.min_support) & (lift >= cfg.min_lift)
         a, b, support, conf, lift = a[ok], b[ok], support[ok], conf[ok], lift[ok]
+        if not len(a):
+            return {}, []
         order = np.lexsort((b, -conf, a))
         edges: dict[int, np.ndarray] = {}
         rows = []

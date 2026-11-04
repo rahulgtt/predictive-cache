@@ -245,3 +245,14 @@ def test_pcache_model_cli_runs_read_package_locally(built, tmp_path):
     assert out.read_text().splitlines()[0].startswith('"snapshot_id"')
     result = runner.invoke(model_cli, ["score", str(package), "--rows", str(split), "--top-k", "5"])
     assert result.exit_code == 0 and "positives in top 5" in result.output
+
+
+def test_coread_fit_with_no_surviving_edges_is_empty(built):
+    from predictive_cache.prep.read_snapshots import build_states, load_clean
+
+    root = built[0].parent / "clean"
+    _, events, coverage = load_clean(root)
+    _, states = build_states(events, coverage)
+    strict = ReadSnapshotConfig(min_support=10**9)
+    start, end = int(START.timestamp() * 1e6), int(END.timestamp() * 1e6)
+    assert states[0].fit_coread(start, end, strict) == ({}, [])
