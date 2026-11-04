@@ -105,7 +105,13 @@ from .models import (
     PreReadHealth,
     ProviderInvocationRecord,
     ReconciliationReport,
+    WorkloadBoundedValidationAttestation,
     WorkloadCollectionManifest,
+    WorkloadCollectionPermit,
+    WorkloadLiveFinalizationDeclaration,
+    WorkloadProviderDeclaration,
+    WorkloadProviderInvocationRecord,
+    WorkloadReconciliationReport,
     parse_collection_manifest,
 )
 from .provenance import (
@@ -156,7 +162,9 @@ from .workload import (
     aggregate_recovery,
     build_default_workload,
     execution_plan_sha256,
+    select_workload_permit_operations,
     validate_plan_truth,
+    validate_workload_collection_permit,
     workload_config_sha256,
     workload_truth_sha256,
     write_offline_importer_fixture,
@@ -298,6 +306,305 @@ def _approved_interpreter() -> Path:
     if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
         raise click.ClickException("provider interpreter has unsafe ownership or mode")
     return path
+
+
+def _validated_workload_interpreter(
+    permit: WorkloadCollectionPermit,
+) -> Path:
+    path = Path(permit.interpreter_path)
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or not path.is_file()
+        or path.resolve(strict=True) != path
+        or sha256(path) != permit.interpreter_sha256
+    ):
+        raise click.ClickException(
+            "workload provider interpreter does not match the permit"
+        )
+    metadata = path.stat()
+    if (
+        metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise click.ClickException(
+            "workload provider interpreter has unsafe ownership or mode"
+        )
+    return path
+
+
+def _validate_full_workload_attestation(
+    permit: WorkloadCollectionPermit,
+    path: Path,
+    config: WorkloadConfig,
+    plan: WorkloadExecutionPlan,
+    truth: WorkloadTruth,
+) -> WorkloadBoundedValidationAttestation:
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or stat.S_IMODE(path.stat().st_mode) & 0o077
+        or sha256(path)
+        != permit.bounded_validation_attestation_sha256
+    ):
+        raise click.ClickException(
+            "bounded attestation does not match the full permit"
+        )
+    try:
+        bounded = load_model(
+            path,
+            WorkloadBoundedValidationAttestation,
+        )
+    except (OSError, ValueError) as error:
+        raise click.ClickException(
+            "bounded attestation is invalid"
+        ) from error
+    if (
+        bounded.status != "passed"
+        or len(bounded.operation_ids) != 3
+        or bounded.roles
+        != (
+            "ordinary",
+            "repeated_range",
+            "sequential_range",
+        )
+        or bounded.execution_plan_sha256
+        != permit.execution_plan_sha256
+        or bounded.manifest_file_sha256
+        != permit.manifest_file_sha256
+        or bounded.workload_config_file_sha256
+        != permit.workload_config_file_sha256
+        or bounded.execution_plan_file_sha256
+        != permit.execution_plan_file_sha256
+        or bounded.workload_truth_sha256
+        != permit.workload_truth_sha256
+        or bounded.workload_truth_file_sha256
+        != permit.workload_truth_file_sha256
+        or bounded.truth_binding_sha256
+        != permit.truth_binding_sha256
+        or bounded.truth_binding_file_sha256
+        != permit.truth_binding_file_sha256
+        or bounded.fixture_catalog_sha256
+        != permit.fixture_catalog_sha256
+        or bounded.fixture_catalog_file_sha256
+        != permit.fixture_catalog_file_sha256
+        or bounded.semantic_view_sha256
+        != permit.semantic_view_sha256
+        or bounded.validated_code_head_sha256
+        != permit.validated_code_head_sha256
+        or bounded.validated_merge_commit_sha256
+        != permit.validated_merge_commit_sha256
+        or bounded.validated_tree_sha256
+        != permit.validated_tree_sha256
+        or bounded.provider_package_sha256
+        != permit.provider_package_sha256
+        or bounded.provider_sha256 != permit.provider_sha256
+        or bounded.collector_sha256 != permit.collector_sha256
+        or bounded.validator_sha256 != permit.validator_sha256
+        or bounded.runbook_sha256 != permit.runbook_sha256
+        or bounded.adapter_wrapper_sha256
+        != permit.adapter_wrapper_sha256
+        or bounded.cleaner_wrapper_sha256
+        != permit.cleaner_wrapper_sha256
+        or bounded.interpreter_path != permit.interpreter_path
+        or bounded.interpreter_sha256 != permit.interpreter_sha256
+        or bounded.completed_at >= permit.execution_start_time
+        or permit.execution_start_time >= bounded.expires_at
+    ):
+        raise click.ClickException(
+            "bounded attestation is stale or incompatible"
+        )
+    expected = select_workload_permit_operations(
+        bounded.validation_run_id,
+        plan,
+        truth,
+        profile="bounded_validation",
+        config=config,
+        validation_operations=3,
+    )
+    if (
+        bounded.operation_indexes != expected[0]
+        or bounded.intent_ids != expected[1]
+        or bounded.operation_ids != expected[2]
+        or bounded.roles != expected[3]
+    ):
+        raise click.ClickException(
+            "bounded attestation does not prove canonical role closure"
+        )
+    return bounded
+
+
+def _validate_workload_permit_files(
+    permit: WorkloadCollectionPermit,
+    run_dir: Path,
+) -> None:
+    exact_files = {
+        "manifest_file_sha256": run_dir / "manifest.json",
+        "workload_config_file_sha256": run_dir / "workload-config.json",
+        "execution_plan_file_sha256": run_dir / "execution-plan.json",
+        "workload_truth_file_sha256": run_dir / "workload-truth.json",
+        "truth_binding_file_sha256": (
+            run_dir / "workload-truth-binding.json"
+        ),
+        "fixture_catalog_file_sha256": run_dir / "fixture-catalog.json",
+    }
+    if any(
+        path.is_symlink()
+        or not path.is_file()
+        or getattr(permit, field) != sha256(path)
+        for field, path in exact_files.items()
+    ):
+        raise click.ClickException(
+            "workload permit exact artifact hash mismatch"
+        )
+
+
+def _validate_workload_provider_stack(
+    provider: WorkloadProviderDeclaration,
+    permit: WorkloadCollectionPermit,
+    permit_sha256: str,
+    run_dir: Path,
+    provider_root: Path,
+    *,
+    expected_run_id: str,
+    expected_manifest_sha256: str,
+    harness_root_id: str,
+    provider_root_id: str,
+) -> WorkloadProviderInvocationRecord:
+    references = {
+        "permit": (harness_root_id, permit_sha256),
+        "provider_package_artifact": (
+            harness_root_id,
+            permit.provider_package_sha256,
+        ),
+        "provider_artifact": (
+            provider_root_id,
+            permit.provider_sha256,
+        ),
+        "collector_artifact": (
+            provider_root_id,
+            permit.collector_sha256,
+        ),
+        "validator_artifact": (
+            provider_root_id,
+            permit.validator_sha256,
+        ),
+        "runbook_artifact": (
+            provider_root_id,
+            permit.runbook_sha256,
+        ),
+        "adapter_wrapper_artifact": (
+            harness_root_id,
+            permit.adapter_wrapper_sha256,
+        ),
+        "cleaner_wrapper_artifact": (
+            harness_root_id,
+            permit.cleaner_wrapper_sha256,
+        ),
+    }
+    for name, (root_id, expected) in references.items():
+        reference = getattr(provider, name)
+        if reference.root_id != root_id:
+            raise click.ClickException(
+                "workload provider artifact uses the wrong evidence root"
+            )
+        root = run_dir if root_id == harness_root_id else provider_root
+        artifact = root / reference.path
+        if (
+            artifact.is_symlink()
+            or not artifact.is_file()
+            or sha256(artifact) != reference.sha256
+            or reference.sha256 != expected
+        ):
+            raise click.ClickException(
+                "workload provider artifact does not match the permit"
+            )
+    invocation_reference = provider.invocation_record
+    if invocation_reference.root_id != harness_root_id:
+        raise click.ClickException(
+            "workload provider invocation uses the wrong evidence root"
+        )
+    invocation_path = run_dir / invocation_reference.path
+    if (
+        invocation_path.is_symlink()
+        or not invocation_path.is_file()
+        or sha256(invocation_path) != invocation_reference.sha256
+    ):
+        raise click.ClickException(
+            "workload provider invocation evidence is unavailable"
+        )
+    invocation = load_model(
+        invocation_path,
+        WorkloadProviderInvocationRecord,
+    )
+    _validated_workload_interpreter(permit)
+    expected_argv = (
+        permit.interpreter_path,
+        "-I",
+        "-S",
+        "-c",
+        ISOLATED_PROVIDER_BOOTSTRAP,
+        ".approved-tools/provider-package.zip",
+        ".approved-tools/checkpoint-provider",
+        "<action>",
+        "<run_dir>",
+        "--permit-path",
+        "<permit_path>",
+    )
+    if (
+        provider.provider_package_sha256
+        != permit.provider_package_sha256
+        or provider.run_id != expected_run_id
+        or provider.manifest_sha256 != expected_manifest_sha256
+        or provider.permit_sha256 != permit_sha256
+        or provider.provider_sha256 != permit.provider_sha256
+        or provider.provider_snapshot_sha256 != permit.provider_sha256
+        or provider.collector_sha256 != permit.collector_sha256
+        or provider.validator_sha256 != permit.validator_sha256
+        or provider.runbook_sha256 != permit.runbook_sha256
+        or provider.adapter_wrapper_sha256
+        != permit.adapter_wrapper_sha256
+        or provider.cleaner_wrapper_sha256
+        != permit.cleaner_wrapper_sha256
+        or provider.interpreter_sha256 != permit.interpreter_sha256
+        or provider.interpreter_path != permit.interpreter_path
+        or provider.validated_code_head_sha256
+        != permit.validated_code_head_sha256
+        or provider.validated_merge_commit_sha256
+        != permit.validated_merge_commit_sha256
+        or provider.validated_tree_sha256
+        != permit.validated_tree_sha256
+        or provider.argv_contract != expected_argv
+        or invocation.argv_contract != expected_argv
+        or invocation.run_id != expected_run_id
+        or invocation.manifest_sha256 != expected_manifest_sha256
+        or invocation.interpreter_path != permit.interpreter_path
+        or invocation.permit_sha256 != permit_sha256
+        or invocation.execution_plan_sha256
+        != permit.execution_plan_sha256
+        or invocation.provider_package_sha256
+        != permit.provider_package_sha256
+        or invocation.provider_snapshot_sha256 != permit.provider_sha256
+        or invocation.collector_sha256 != permit.collector_sha256
+        or invocation.validator_sha256 != permit.validator_sha256
+        or invocation.runbook_sha256 != permit.runbook_sha256
+        or invocation.adapter_wrapper_sha256
+        != permit.adapter_wrapper_sha256
+        or invocation.cleaner_wrapper_sha256
+        != permit.cleaner_wrapper_sha256
+        or invocation.interpreter_sha256 != permit.interpreter_sha256
+        or invocation.validated_code_head_sha256
+        != permit.validated_code_head_sha256
+        or invocation.validated_merge_commit_sha256
+        != permit.validated_merge_commit_sha256
+        or invocation.validated_tree_sha256
+        != permit.validated_tree_sha256
+        or invocation.actions != ("checkpoint", "probe", "post-read")
+    ):
+        raise click.ClickException(
+            "workload provider stack differs from the permit"
+        )
+    return invocation
 
 
 def _inventory_root(path: Path, label: str) -> dict[str, str]:
@@ -611,7 +918,6 @@ def _validate_provider_provenance(
     package_snapshot = Path(harness_root.canonical_path) / package_path
     snapshot_evidence = harness_root.files.get(snapshot_path)
     package_evidence = harness_root.files.get(package_path)
-    approved_interpreter = _approved_interpreter()
     if (
         snapshot.is_symlink()
         or not snapshot.is_file()
@@ -632,6 +938,7 @@ def _validate_provider_provenance(
         raise click.ClickException(
             f"{label} provider package snapshot is not approved"
         )
+    approved_interpreter = _approved_interpreter()
     if (
         provider.run_id != run_id
         or provider.manifest_sha256 != manifest_sha256
@@ -3383,6 +3690,8 @@ def init(
 @click.option("--provider-package", type=click.Path(path_type=Path))
 @click.option("--stop-file", type=click.Path(path_type=Path))
 @click.option("--validation-operations", type=click.IntRange(1, 3))
+@click.option("--workload-permit", type=click.Path(path_type=Path))
+@click.option("--bounded-attestation", type=click.Path(path_type=Path))
 @click.option("--adapter-command", type=click.Path(path_type=Path))
 @click.option("--cleaner-command", type=click.Path(path_type=Path))
 def run(
@@ -3393,6 +3702,8 @@ def run(
     provider_package: Path | None,
     stop_file: Path | None,
     validation_operations: int | None,
+    workload_permit: Path | None,
+    bounded_attestation: Path | None,
     adapter_command: Path | None,
     cleaner_command: Path | None,
 ) -> None:
@@ -3412,82 +3723,212 @@ def run(
         if isinstance(manifest, WorkloadCollectionManifest)
         else None
     )
-    if isinstance(manifest, WorkloadCollectionManifest) and not dry_run:
+    workload_permit_model = None
+    workload_permit_sha = None
+    workload_config_model = None
+    workload_truth_model = None
+    workload_truth_binding_model = None
+    if isinstance(manifest, WorkloadCollectionManifest):
+        if dry_run:
+            if workload_permit is not None:
+                raise click.ClickException(
+                    "offline workload dry-run must not consume a live permit"
+                )
+        else:
+            if workload_permit is None:
+                raise click.ClickException(
+                    "workload manifest v3 live execution requires "
+                    "--workload-permit"
+                )
+            workload_config_model = load_model(
+                run_dir / "workload-config.json",
+                WorkloadConfig,
+            )
+            workload_truth_model = load_model(
+                run_dir / "workload-truth.json",
+                WorkloadTruth,
+            )
+            workload_truth_binding_model = load_model(
+                run_dir / "workload-truth-binding.json",
+                WorkloadTruthBinding,
+            )
+            permit_path = workload_permit.absolute()
+            if (
+                permit_path.parent.resolve(strict=True)
+                != run_dir.absolute().resolve(strict=True)
+                or permit_path.is_symlink()
+                or not permit_path.is_file()
+                or stat.S_IMODE(permit_path.stat().st_mode) & 0o077
+            ):
+                raise click.ClickException(
+                    "workload permit must be an owner-only regular file in run_dir"
+                )
+            workload_permit_model = load_model(
+                permit_path,
+                WorkloadCollectionPermit,
+            )
+            try:
+                validate_workload_collection_permit(
+                    workload_permit_model,
+                    manifest,
+                    workload_config_model,
+                    execution_plan_model,
+                    workload_truth_model,
+                    workload_truth_binding_model,
+                    catalog,
+                )
+            except ValueError as error:
+                raise click.ClickException(str(error)) from error
+            _validate_workload_permit_files(
+                workload_permit_model,
+                run_dir,
+            )
+            if (
+                manifest.software.predictive_cache_revision
+                != workload_permit_model.validated_merge_commit_sha256
+            ):
+                raise click.ClickException(
+                    "workload manifest code revision differs from permit"
+                )
+            workload_permit_sha = sha256(permit_path)
+            if validation_operations is not None:
+                raise click.ClickException(
+                    "v3 bounded selection is defined by the immutable permit"
+                )
+            if (
+                workload_permit_model.profile == "bounded_validation"
+                and (adapter_command is None or cleaner_command is None)
+            ):
+                raise click.ClickException(
+                    "v3 bounded validation requires adapter and cleaner commands"
+                )
+            if workload_permit_model.profile == "full_collection":
+                if bounded_attestation is None:
+                    raise click.ClickException(
+                        "full workload execution requires --bounded-attestation"
+                    )
+                _validate_full_workload_attestation(
+                    workload_permit_model,
+                    bounded_attestation,
+                    workload_config_model,
+                    execution_plan_model,
+                    workload_truth_model,
+                )
+            elif bounded_attestation is not None:
+                raise click.ClickException(
+                    "bounded permit must not consume a prior attestation"
+                )
+    elif workload_permit is not None:
         raise click.ClickException(
-            "workload manifest v3 is offline-only; mount and bounded validation "
-            "require a separately reviewed plan-bound evidence chain"
+            "manifest v2 must not receive a workload permit"
+        )
+    elif bounded_attestation is not None:
+        raise click.ClickException(
+            "manifest v2 must not receive a bounded workload attestation"
         )
     provider_interpreter = None
     adapter_fd = None
     cleaner_fd = None
     if not dry_run:
-        _validate_full_profile(manifest)
+        if isinstance(manifest, CollectionManifest):
+            _validate_full_profile(manifest)
         if checkpoint_command is None or provider_package is None:
             raise click.ClickException(
                 "mount execution requires --checkpoint-command and --provider-package"
             )
+        provider_package_sha = (
+            workload_permit_model.provider_package_sha256
+            if workload_permit_model is not None
+            else APPROVED_PROVIDER_PACKAGE_SHA256
+        )
+        provider_sha = (
+            workload_permit_model.provider_sha256
+            if workload_permit_model is not None
+            else APPROVED_PROVIDER_SHA256
+        )
         provider_package = _approved_artifact(
             provider_package,
-            APPROVED_PROVIDER_PACKAGE_SHA256,
+            provider_package_sha,
             "provider package",
         )
         provider_package = _snapshot_artifact(
             provider_package,
             run_dir,
             "provider-package.zip",
-            APPROVED_PROVIDER_PACKAGE_SHA256,
+            provider_package_sha,
         )
         checkpoint_command = _approved_executable(
             checkpoint_command,
-            APPROVED_PROVIDER_SHA256,
+            provider_sha,
             "checkpoint command",
         )
         checkpoint_command = _snapshot_executable(
             checkpoint_command,
             run_dir,
             "checkpoint-provider",
-            APPROVED_PROVIDER_SHA256,
+            provider_sha,
         )
-        provider_interpreter = _approved_interpreter()
-    if validation_operations is not None:
+        provider_interpreter = (
+            _validated_workload_interpreter(workload_permit_model)
+            if workload_permit_model is not None
+            else _approved_interpreter()
+        )
+    bounded_validation = validation_operations is not None or (
+        workload_permit_model is not None
+        and workload_permit_model.profile == "bounded_validation"
+    )
+    if bounded_validation:
+        adapter_sha = (
+            workload_permit_model.adapter_wrapper_sha256
+            if workload_permit_model is not None
+            else APPROVED_ADAPTER_WRAPPER_SHA256
+        )
+        cleaner_sha = (
+            workload_permit_model.cleaner_wrapper_sha256
+            if workload_permit_model is not None
+            else APPROVED_CLEANER_WRAPPER_SHA256
+        )
         adapter_command = _approved_executable(
             adapter_command,
-            APPROVED_ADAPTER_WRAPPER_SHA256,
+            adapter_sha,
             "adapter command",
         )
         cleaner_command = _approved_executable(
             cleaner_command,
-            APPROVED_CLEANER_WRAPPER_SHA256,
+            cleaner_sha,
             "cleaner command",
         )
         adapter_command = _snapshot_executable(
             adapter_command,
             run_dir,
             "adapter-wrapper",
-            APPROVED_ADAPTER_WRAPPER_SHA256,
+            adapter_sha,
         )
         cleaner_command = _snapshot_executable(
             cleaner_command,
             run_dir,
             "cleaner-wrapper",
-            APPROVED_CLEANER_WRAPPER_SHA256,
+            cleaner_sha,
         )
         adapter_fd = _open_verified_fd(
             adapter_command,
-            APPROVED_ADAPTER_WRAPPER_SHA256,
+            adapter_sha,
         )
         try:
             cleaner_fd = _open_verified_fd(
                 cleaner_command,
-                APPROVED_CLEANER_WRAPPER_SHA256,
+                cleaner_sha,
             )
         except BaseException:
             os.close(adapter_fd)
             raise
-        planned = planned_operations(manifest, catalog)[:validation_operations]
-        atomic_write_model(
-            run_dir / "adapter-validation-permit.json",
-            AdapterValidationPermit(
+        if workload_permit_model is None:
+            planned = planned_operations(manifest, catalog)[
+                :validation_operations
+            ]
+            atomic_write_model(
+                run_dir / "adapter-validation-permit.json",
+                AdapterValidationPermit(
                 permit_id=str(uuid.uuid4()),
                 run_id=manifest.run_id,
                 full_manifest_sha256=sha256(run_dir / "manifest.json"),
@@ -3501,12 +3942,47 @@ def run(
                 runbook_sha256=APPROVED_VALIDATION_RUNBOOK_SHA256,
                 status="approved",
                 expires_at=datetime.now(UTC) + timedelta(hours=1),
-            ),
-        )
+                ),
+            )
     if not dry_run:
-        atomic_write_model(
-            run_dir / "provider-invocation.json",
-            ProviderInvocationRecord(
+        invocation = (
+            WorkloadProviderInvocationRecord(
+                run_id=manifest.run_id,
+                manifest_sha256=sha256(run_dir / "manifest.json"),
+                permit_sha256=workload_permit_sha,
+                execution_plan_sha256=manifest.execution_plan_sha256,
+                provider_package_sha256=workload_permit_model.provider_package_sha256,
+                provider_package_path=".approved-tools/provider-package.zip",
+                provider_snapshot_path=".approved-tools/checkpoint-provider",
+                provider_snapshot_sha256=workload_permit_model.provider_sha256,
+                collector_sha256=workload_permit_model.collector_sha256,
+                validator_sha256=workload_permit_model.validator_sha256,
+                runbook_sha256=workload_permit_model.runbook_sha256,
+                adapter_wrapper_sha256=workload_permit_model.adapter_wrapper_sha256,
+                cleaner_wrapper_sha256=workload_permit_model.cleaner_wrapper_sha256,
+                interpreter_path=str(provider_interpreter),
+                interpreter_sha256=workload_permit_model.interpreter_sha256,
+                validated_code_head_sha256=workload_permit_model.validated_code_head_sha256,
+                validated_merge_commit_sha256=workload_permit_model.validated_merge_commit_sha256,
+                validated_tree_sha256=workload_permit_model.validated_tree_sha256,
+                argv_contract=(
+                    str(provider_interpreter),
+                    "-I",
+                    "-S",
+                    "-c",
+                    ISOLATED_PROVIDER_BOOTSTRAP,
+                    ".approved-tools/provider-package.zip",
+                    ".approved-tools/checkpoint-provider",
+                    "<action>",
+                    "<run_dir>",
+                    "--permit-path",
+                    "<permit_path>",
+                ),
+                actions=("checkpoint", "probe", "post-read"),
+                created_at=datetime.now(UTC),
+            )
+            if workload_permit_model is not None
+            else ProviderInvocationRecord(
                 run_id=manifest.run_id,
                 manifest_sha256=sha256(run_dir / "manifest.json"),
                 provider_package_sha256=APPROVED_PROVIDER_PACKAGE_SHA256,
@@ -3530,8 +4006,9 @@ def run(
                 ),
                 actions=("checkpoint", "probe", "post-read"),
                 created_at=datetime.now(UTC),
-            ),
+            )
         )
+        atomic_write_model(run_dir / "provider-invocation.json", invocation)
     if dry_run:
         executor = DryRunExecutor()
         runner = CollectionRunner(sleep=lambda _: None)
@@ -3561,8 +4038,21 @@ def run(
             checkpoint_command,
             provider_package,
             run_dir,
-            script_sha256=APPROVED_PROVIDER_SHA256,
-            package_sha256=APPROVED_PROVIDER_PACKAGE_SHA256,
+            script_sha256=(
+                workload_permit_model.provider_sha256
+                if workload_permit_model is not None
+                else APPROVED_PROVIDER_SHA256
+            ),
+            package_sha256=(
+                workload_permit_model.provider_package_sha256
+                if workload_permit_model is not None
+                else APPROVED_PROVIDER_PACKAGE_SHA256
+            ),
+            permit_path=(
+                workload_permit.absolute()
+                if workload_permit_model is not None
+                else None
+            ),
             timeout_s=manifest.checkpoint_tolerance_s,
             python_executable=str(provider_interpreter),
         )
@@ -3584,14 +4074,21 @@ def run(
             checkpoint_provider=provider,
             persistent_stop=persistent_stop,
             operation_limit=validation_operations,
-            validation_mode=validation_operations is not None,
+            validation_mode=bounded_validation,
+            workload_permit=workload_permit_model,
+            workload_permit_sha256=workload_permit_sha,
         )
-        if validation_operations is not None:
+        if bounded_validation:
+            permit_argument = (
+                workload_permit.absolute()
+                if workload_permit_model is not None
+                else run_dir / "adapter-validation-permit.json"
+            )
             subprocess.run(
                 [
                     f"/proc/self/fd/{adapter_fd}",
                     run_dir,
-                    run_dir / "adapter-validation-permit.json",
+                    permit_argument,
                 ],
                 check=True,
                 pass_fds=(adapter_fd,),
@@ -3823,7 +4320,7 @@ def recover_workload(
 @click.option("--input", "input_path", type=click.Path(path_type=Path), required=True)
 def checkpoint(run_dir: Path, input_path: Path) -> None:
     """Validate collector checkpoints and fail on any stop condition."""
-    manifest = load_v2_manifest(run_dir / "manifest.json", "checkpoint validation")
+    manifest = load_run_manifest(run_dir / "manifest.json")
     checkpoints = read_models(input_path, Checkpoint)
     reasons = checkpoint_stop_reasons(manifest, checkpoints, run_dir)
     if reasons:
@@ -3836,14 +4333,32 @@ def checkpoint(run_dir: Path, input_path: Path) -> None:
 @click.option("--observed", type=click.Path(path_type=Path), required=True)
 @click.option("--checkpoints", type=click.Path(path_type=Path), required=True)
 @click.option("--sources", type=click.Path(path_type=Path), required=True)
+@click.option("--workload-permit", type=click.Path(path_type=Path))
 def reconcile_command(
     run_dir: Path,
     observed: Path,
     checkpoints: Path,
     sources: Path,
+    workload_permit: Path | None,
 ) -> None:
     """Write an immutable exact-accounting report and fail discrepancies."""
-    load_v2_manifest(run_dir / "manifest.json", "reconciliation")
+    manifest = load_run_manifest(run_dir / "manifest.json")
+    permit_model = None
+    permit_sha = None
+    if isinstance(manifest, WorkloadCollectionManifest):
+        if workload_permit is None:
+            raise click.ClickException(
+                "workload v3 reconciliation requires --workload-permit"
+            )
+        permit_model = load_model(
+            workload_permit,
+            WorkloadCollectionPermit,
+        )
+        permit_sha = sha256(workload_permit)
+    elif workload_permit is not None:
+        raise click.ClickException(
+            "manifest v2 reconciliation must not receive a workload permit"
+        )
     checkpoint_models = read_models(checkpoints, Checkpoint)
     source_manifest = load_model(sources, CollectorFileManifest)
     report = reconcile(
@@ -3853,6 +4368,8 @@ def reconcile_command(
         checkpoint_models,
         source_manifest,
         run_dir,
+        workload_permit=permit_model,
+        workload_permit_sha256=permit_sha,
     )
     if not report.success:
         failed_path = run_dir / f"reconciliation-failed-{report.observed_sha256[:16]}.json"
@@ -4782,6 +5299,452 @@ def finalize(
         deletion_inventory_sha256=inventory_sha,
     )
     atomic_write_model(finalization_root / "cleanup-schedule.json", schedule)
+    click.echo(schedule.model_dump_json())
+
+
+@main.command("attest-workload-bounded")
+@click.option("--run-dir", type=click.Path(path_type=Path), required=True)
+@click.option("--workload-permit", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--provider-manifest",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option("--imported", type=click.Path(path_type=Path), required=True)
+@click.option("--cleaned", type=click.Path(path_type=Path), required=True)
+@click.option("--out", type=click.Path(path_type=Path), required=True)
+def attest_workload_bounded(
+    run_dir: Path,
+    workload_permit: Path,
+    provider_manifest: Path,
+    imported: Path,
+    cleaned: Path,
+    out: Path,
+) -> None:
+    """Seal a passed relation-complete workload-v3 bounded validation."""
+
+    manifest = load_run_manifest(run_dir / "manifest.json")
+    if not isinstance(manifest, WorkloadCollectionManifest):
+        raise click.ClickException(
+            "bounded workload attestation requires manifest v3"
+        )
+    permit = load_model(workload_permit, WorkloadCollectionPermit)
+    if permit.profile != "bounded_validation":
+        raise click.ClickException(
+            "bounded workload attestation requires a bounded permit"
+        )
+    config = load_model(run_dir / "workload-config.json", WorkloadConfig)
+    plan = load_model(run_dir / "execution-plan.json", WorkloadExecutionPlan)
+    truth = load_model(run_dir / "workload-truth.json", WorkloadTruth)
+    truth_binding = load_model(
+        run_dir / "workload-truth-binding.json",
+        WorkloadTruthBinding,
+    )
+    catalog = load_model(run_dir / "fixture-catalog.json", FixtureCatalog)
+    try:
+        validate_workload_collection_permit(
+            permit,
+            manifest,
+            config,
+            plan,
+            truth,
+            truth_binding,
+            catalog,
+        )
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
+    _validate_workload_permit_files(permit, run_dir)
+    expected_selection = select_workload_permit_operations(
+        manifest.run_id,
+        plan,
+        truth,
+        profile="bounded_validation",
+        config=config,
+        validation_operations=3,
+    )
+    if (
+        permit.operation_indexes != expected_selection[0]
+        or permit.intent_ids != expected_selection[1]
+        or permit.operation_ids != expected_selection[2]
+        or permit.roles != expected_selection[3]
+    ):
+        raise click.ClickException(
+            "bounded permit does not prove canonical role closure"
+        )
+    reconciliation_path = run_dir / "reconciliation.json"
+    reconciliation = load_model(
+        reconciliation_path,
+        WorkloadReconciliationReport,
+    )
+    provider = load_model(
+        provider_manifest,
+        WorkloadProviderDeclaration,
+    )
+    imported_manifest_path = imported / "manifest.json"
+    cleaned_manifest_path = cleaned / "manifest.json"
+    imported_manifest = _load_json(imported_manifest_path)
+    cleaned_manifest = _load_json(cleaned_manifest_path)
+    permit_sha = sha256(workload_permit)
+    _validate_workload_provider_stack(
+        provider,
+        permit,
+        permit_sha,
+        run_dir,
+        provider_manifest.parent,
+        expected_run_id=manifest.run_id,
+        expected_manifest_sha256=sha256(run_dir / "manifest.json"),
+        harness_root_id="bounded_harness_evidence",
+        provider_root_id="bounded_provider_evidence",
+    )
+    workload_evidence_sha = sha256(
+        run_dir / "workload-evidence.jsonl"
+    )
+    expected_count = len(permit.operation_ids)
+    executions = read_models(
+        run_dir / "execution.jsonl",
+        ExecutionResult,
+    )
+    runtime = imported_manifest.get("generator", {}).get("runtime", {})
+    if (
+        not reconciliation.success
+        or reconciliation.permit_sha256 != permit_sha
+        or reconciliation.operation_indexes != permit.operation_indexes
+        or reconciliation.operation_ids != permit.operation_ids
+        or reconciliation.workload_evidence_sha256
+        != workload_evidence_sha
+        or provider.permit_sha256 != permit_sha
+        or provider.permit.sha256 != permit_sha
+        or provider.operation_indexes != permit.operation_indexes
+        or provider.operation_ids != permit.operation_ids
+        or provider.operation_count != expected_count
+        or provider.event_count != expected_count
+        or imported_manifest.get("counts", {}).get("events")
+        != expected_count
+        or runtime.get("workload_permit_sha256") != permit_sha
+        or runtime.get("workload_evidence_sha256")
+        != workload_evidence_sha
+        or runtime.get("execution_plan_sha256")
+        != permit.execution_plan_sha256
+        or cleaned_manifest.get("counts", {}).get("input_events")
+        != expected_count
+        or cleaned_manifest.get("counts", {}).get("kept_events") != 0
+        or cleaned_manifest.get("counts", {}).get(
+            "excluded_by_reason"
+        )
+        != {"origin_synthetic": expected_count}
+    ):
+        raise click.ClickException(
+            "bounded workload evidence is incomplete or inconsistent"
+        )
+    attestation = WorkloadBoundedValidationAttestation(
+        validation_run_id=manifest.run_id,
+        permit_sha256=permit_sha,
+        manifest_sha256=sha256(run_dir / "manifest.json"),
+        manifest_file_sha256=permit.manifest_file_sha256,
+        workload_config_file_sha256=permit.workload_config_file_sha256,
+        execution_plan_sha256=permit.execution_plan_sha256,
+        execution_plan_file_sha256=permit.execution_plan_file_sha256,
+        workload_truth_sha256=permit.workload_truth_sha256,
+        workload_truth_file_sha256=permit.workload_truth_file_sha256,
+        truth_binding_sha256=permit.truth_binding_sha256,
+        truth_binding_file_sha256=permit.truth_binding_file_sha256,
+        fixture_catalog_sha256=permit.fixture_catalog_sha256,
+        fixture_catalog_file_sha256=permit.fixture_catalog_file_sha256,
+        semantic_view_sha256=permit.semantic_view_sha256,
+        operation_indexes=permit.operation_indexes,
+        intent_ids=permit.intent_ids,
+        operation_ids=permit.operation_ids,
+        roles=permit.roles,
+        reconciliation_sha256=sha256(reconciliation_path),
+        provider_manifest_sha256=sha256(provider_manifest),
+        imported_manifest_sha256=sha256(imported_manifest_path),
+        cleaned_manifest_sha256=sha256(cleaned_manifest_path),
+        workload_evidence_sha256=workload_evidence_sha,
+        validated_code_head_sha256=permit.validated_code_head_sha256,
+        validated_merge_commit_sha256=permit.validated_merge_commit_sha256,
+        validated_tree_sha256=permit.validated_tree_sha256,
+        provider_package_sha256=permit.provider_package_sha256,
+        provider_sha256=permit.provider_sha256,
+        collector_sha256=permit.collector_sha256,
+        validator_sha256=permit.validator_sha256,
+        runbook_sha256=permit.runbook_sha256,
+        adapter_wrapper_sha256=permit.adapter_wrapper_sha256,
+        cleaner_wrapper_sha256=permit.cleaner_wrapper_sha256,
+        interpreter_path=permit.interpreter_path,
+        interpreter_sha256=permit.interpreter_sha256,
+        completed_at=max(
+            item.completed_at_utc for item in executions
+        ),
+        expires_at=permit.expires_at,
+        status="passed",
+    )
+    atomic_write_model(out, attestation)
+    click.echo(attestation.model_dump_json())
+
+
+@main.command("finalize-workload")
+@click.option("--run-dir", type=click.Path(path_type=Path), required=True)
+@click.option("--workload-permit", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--bounded-attestation",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option(
+    "--provider-manifest",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option("--imported", type=click.Path(path_type=Path), required=True)
+@click.option("--cleaned", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--finalization-root",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option("--cleanup-root", "cleanup_roots", multiple=True, required=True)
+def finalize_workload(
+    run_dir: Path,
+    workload_permit: Path,
+    bounded_attestation: Path,
+    provider_manifest: Path,
+    imported: Path,
+    cleaned: Path,
+    finalization_root: Path,
+    cleanup_roots: tuple[str, ...],
+) -> None:
+    """Finalize an exact plan-bound workload-v3 live evidence chain."""
+
+    manifest = load_run_manifest(run_dir / "manifest.json")
+    if not isinstance(manifest, WorkloadCollectionManifest):
+        raise click.ClickException(
+            "workload finalization requires manifest v3"
+        )
+    permit = load_model(workload_permit, WorkloadCollectionPermit)
+    if permit.profile != "full_collection":
+        raise click.ClickException(
+            "workload finalization requires a full-collection permit"
+        )
+    config = load_model(run_dir / "workload-config.json", WorkloadConfig)
+    plan = load_model(run_dir / "execution-plan.json", WorkloadExecutionPlan)
+    truth = load_model(run_dir / "workload-truth.json", WorkloadTruth)
+    truth_binding = load_model(
+        run_dir / "workload-truth-binding.json",
+        WorkloadTruthBinding,
+    )
+    catalog = load_model(run_dir / "fixture-catalog.json", FixtureCatalog)
+    try:
+        validate_workload_collection_permit(
+            permit,
+            manifest,
+            config,
+            plan,
+            truth,
+            truth_binding,
+            catalog,
+        )
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
+    _validate_workload_permit_files(permit, run_dir)
+    permit_sha = sha256(workload_permit)
+    reconciliation_path = run_dir / "reconciliation.json"
+    reconciliation = load_model(
+        reconciliation_path,
+        WorkloadReconciliationReport,
+    )
+    if (
+        not reconciliation.success
+        or reconciliation.permit_sha256 != permit_sha
+        or reconciliation.execution_plan_sha256
+        != permit.execution_plan_sha256
+        or reconciliation.operation_indexes != permit.operation_indexes
+        or reconciliation.operation_ids != permit.operation_ids
+        or reconciliation.offered_count != len(plan.intents)
+        or reconciliation.unique_durable_count != len(plan.intents)
+        or reconciliation.workload_evidence_sha256
+        != sha256(run_dir / "workload-evidence.jsonl")
+    ):
+        raise click.ClickException(
+            "workload reconciliation does not prove the full plan"
+        )
+    provider = load_model(
+        provider_manifest,
+        WorkloadProviderDeclaration,
+    )
+    _validate_workload_provider_stack(
+        provider,
+        permit,
+        permit_sha,
+        run_dir,
+        provider_manifest.parent,
+        expected_run_id=manifest.run_id,
+        expected_manifest_sha256=sha256(run_dir / "manifest.json"),
+        harness_root_id="live_harness_evidence",
+        provider_root_id="live_provider_evidence",
+    )
+    if (
+        provider.run_id != manifest.run_id
+        or provider.manifest_sha256 != sha256(run_dir / "manifest.json")
+        or provider.permit_sha256 != permit_sha
+        or provider.permit.sha256 != permit_sha
+        or provider.execution_plan_sha256 != permit.execution_plan_sha256
+        or provider.workload_truth_sha256 != permit.workload_truth_sha256
+        or provider.truth_binding_sha256 != permit.truth_binding_sha256
+        or provider.operation_indexes != permit.operation_indexes
+        or provider.operation_ids != permit.operation_ids
+        or provider.operation_count != len(plan.intents)
+        or provider.event_count != len(plan.intents)
+        or provider.workload_evidence.sha256
+        != sha256(run_dir / "workload-evidence.jsonl")
+        or provider.validated_code_head_sha256
+        != permit.validated_code_head_sha256
+        or provider.validated_merge_commit_sha256
+        != permit.validated_merge_commit_sha256
+        or provider.validated_tree_sha256
+        != permit.validated_tree_sha256
+    ):
+        raise click.ClickException(
+            "workload provider declaration does not match the permit"
+        )
+    bounded = load_model(
+        bounded_attestation,
+        WorkloadBoundedValidationAttestation,
+    )
+    if (
+        bounded.status != "passed"
+        or sha256(bounded_attestation)
+        != permit.bounded_validation_attestation_sha256
+        or bounded.execution_plan_sha256 != permit.execution_plan_sha256
+        or bounded.workload_truth_sha256 != permit.workload_truth_sha256
+        or bounded.truth_binding_sha256 != permit.truth_binding_sha256
+        or bounded.fixture_catalog_sha256
+        != permit.fixture_catalog_sha256
+        or bounded.semantic_view_sha256 != permit.semantic_view_sha256
+        or bounded.validated_code_head_sha256
+        != permit.validated_code_head_sha256
+        or bounded.validated_merge_commit_sha256
+        != permit.validated_merge_commit_sha256
+        or bounded.validated_tree_sha256
+        != permit.validated_tree_sha256
+        or bounded.provider_package_sha256
+        != permit.provider_package_sha256
+        or bounded.provider_sha256 != permit.provider_sha256
+        or bounded.collector_sha256 != permit.collector_sha256
+        or bounded.validator_sha256 != permit.validator_sha256
+        or bounded.runbook_sha256 != permit.runbook_sha256
+        or bounded.adapter_wrapper_sha256
+        != permit.adapter_wrapper_sha256
+        or bounded.cleaner_wrapper_sha256
+        != permit.cleaner_wrapper_sha256
+        or bounded.interpreter_sha256 != permit.interpreter_sha256
+    ):
+        raise click.ClickException(
+            "bounded workload attestation is stale or incompatible"
+        )
+    imported_manifest_path = imported / "manifest.json"
+    cleaned_manifest_path = cleaned / "manifest.json"
+    imported_manifest = _load_json(imported_manifest_path)
+    cleaned_manifest = _load_json(cleaned_manifest_path)
+    runtime = imported_manifest.get("generator", {}).get("runtime", {})
+    expected_count = len(plan.intents)
+    if (
+        imported_manifest.get("data_kind") != "synthetic"
+        or imported_manifest.get("counts", {}).get("events")
+        != expected_count
+        or runtime.get("source_evidence_mode") != "controlled_demand"
+        or runtime.get("execution_plan_sha256")
+        != permit.execution_plan_sha256
+        or runtime.get("workload_truth_sha256")
+        != permit.workload_truth_sha256
+        or runtime.get("truth_binding_sha256")
+        != permit.truth_binding_sha256
+        or runtime.get("workload_permit_sha256") != permit_sha
+        or runtime.get("workload_evidence_sha256")
+        != sha256(run_dir / "workload-evidence.jsonl")
+        or cleaned_manifest.get("data_kind") != "synthetic"
+        or cleaned_manifest.get("execution_plan_sha256")
+        != permit.execution_plan_sha256
+        or cleaned_manifest.get("workload_permit_sha256") != permit_sha
+        or cleaned_manifest.get("workload_evidence_sha256")
+        != sha256(run_dir / "workload-evidence.jsonl")
+        or cleaned_manifest.get("counts", {}).get("input_events")
+        != expected_count
+        or cleaned_manifest.get("counts", {}).get("kept_events") != 0
+        or cleaned_manifest.get("counts", {}).get(
+            "excluded_by_reason"
+        )
+        != {"origin_synthetic": expected_count}
+    ):
+        raise click.ClickException(
+            "workload import/clean evidence does not preserve synthetic lineage"
+        )
+    roots = _parse_cleanup_roots(cleanup_roots)
+    if (
+        Path(roots["live_harness_evidence"].canonical_path)
+        != run_dir.resolve(strict=True)
+        or Path(roots["live_provider_evidence"].canonical_path)
+        != provider_manifest.parent.resolve(strict=True)
+        or Path(roots["live_adapter_dataset"].canonical_path)
+        != imported.resolve(strict=True)
+        or Path(roots["live_clean_dataset"].canonical_path)
+        != cleaned.resolve(strict=True)
+    ):
+        raise click.ClickException(
+            "workload live cleanup roots do not match canonical evidence"
+        )
+    finalization_root = _existing_private_root(
+        finalization_root,
+        "workload finalization control root",
+    )
+    declaration = WorkloadLiveFinalizationDeclaration(
+        run_id=manifest.run_id,
+        permit_sha256=permit_sha,
+        manifest_sha256=sha256(run_dir / "manifest.json"),
+        execution_plan_sha256=permit.execution_plan_sha256,
+        workload_truth_sha256=permit.workload_truth_sha256,
+        truth_binding_sha256=permit.truth_binding_sha256,
+        semantic_view_sha256=permit.semantic_view_sha256,
+        reconciliation_sha256=sha256(reconciliation_path),
+        provider_manifest_sha256=sha256(provider_manifest),
+        imported_manifest_sha256=sha256(imported_manifest_path),
+        cleaned_manifest_sha256=sha256(cleaned_manifest_path),
+        bounded_attestation_sha256=sha256(bounded_attestation),
+        validated_code_head_sha256=permit.validated_code_head_sha256,
+        validated_merge_commit_sha256=permit.validated_merge_commit_sha256,
+        validated_tree_sha256=permit.validated_tree_sha256,
+    )
+    declaration_path = finalization_root / "workload-finalization.json"
+    atomic_write_model(declaration_path, declaration)
+    inventory = {
+        "inventory_version": 3,
+        "run_id": manifest.run_id,
+        "bounded_validation_run_id": bounded.validation_run_id,
+        "roots": [
+            root.model_dump(mode="json")
+            for root in sorted(
+                roots.values(),
+                key=lambda item: item.kind,
+            )
+        ],
+        "workload_finalization_sha256": sha256(declaration_path),
+    }
+    inventory_sha = atomic_write_bytes(
+        finalization_root / "deletion-inventory-v3.json",
+        (canonical_json(inventory) + "\n").encode(),
+    )
+    finalized_at = datetime.now(UTC)
+    schedule = CleanupScheduleRecord(
+        run_id=manifest.run_id,
+        finalized_at=finalized_at,
+        delete_by=finalized_at + timedelta(days=7),
+        cleanup_owner=manifest.retention.cleanup_owner,
+        validation_report_sha256=sha256(declaration_path),
+        deletion_inventory_sha256=inventory_sha,
+    )
+    atomic_write_model(
+        finalization_root / "cleanup-schedule-v3.json",
+        schedule,
+    )
     click.echo(schedule.model_dump_json())
 
 

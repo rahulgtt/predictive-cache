@@ -14,10 +14,10 @@ events whose origin is not independently verified remain `unknown`.
 The manifest-v2 profile in this runbook remains the frozen unique-coverage
 collection. A separate
 [datagen-driven workload profile](datagen-read-workload.md) prepares repeated
-READ ranges and planted patterns for offline validation. That profile depends
-on the shared `read-demand-v1` semantic contract and is intentionally rejected
-by all live/permit/finalization entry points until its complete plan-bound
-evidence chain receives separate review and approval.
+READ ranges and planted patterns and has a distinct manifest-v3 permit,
+provider, reconciliation, attestation and finalization path. It depends on the
+shared `read-demand-v1` semantic contract. The v3 path never translates to this
+v2 profile, and this v2 runbook's seed-32/300-operation controls remain frozen.
 
 ## Frozen inputs
 

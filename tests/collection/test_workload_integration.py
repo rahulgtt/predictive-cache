@@ -12,6 +12,7 @@ from predictive_cache.collection.cli import main
 from predictive_cache.collection.harness import (
     CollectionRunner,
     DryRunExecutor,
+    _validate_actual_workload_cadence,
     catalog_sha256,
 )
 from predictive_cache.collection.io import atomic_write_model, read_models, sha256
@@ -30,7 +31,9 @@ from predictive_cache.collection.workload import (
     WorkloadConfig,
     WorkloadTruth,
     WorkloadTruthBinding,
+    bind_workload_truth,
     build_default_workload,
+    build_workload_collection_permit,
     execution_plan_sha256,
     resolved_operation_count,
     workload_config_sha256,
@@ -258,7 +261,7 @@ def test_offline_plan_dry_run_import_and_clean_excludes_all_synthetic_reads(
         ["run", "--run-dir", str(run_dir), "--mount-root", str(tmp_path / "mount")],
     )
     assert live_attempt.exit_code != 0
-    assert "offline-only" in live_attempt.output
+    assert "requires --workload-permit" in live_attempt.output
 
     count = CollectionRunner(sleep=lambda _: None).run(
         manifest,
@@ -396,3 +399,174 @@ def test_offline_plan_dry_run_import_and_clean_excludes_all_synthetic_reads(
     )
     assert tampered.exit_code != 0
     assert "checksum mismatch" in tampered.output
+
+
+def test_bounded_permit_runs_relation_complete_sparse_selection_promptly(
+    tmp_path: Path,
+):
+    root = Path(__file__).parents[2]
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(mode=0o700)
+    cluster_path = run_dir / "cluster-provenance-v1.json"
+    schema_path = run_dir / "event-schema-v2.json"
+    budget_path = run_dir / "budget-evidence-v1.json"
+    _copy_contract(root / "contracts/cluster-provenance-v1.json", cluster_path)
+    _copy_contract(root / "contracts/nfs4-read-v2.schema.json", schema_path)
+    _copy_contract(
+        root / "tests/collection/fixtures/budget-evidence-v1.json",
+        budget_path,
+    )
+    catalog = _catalog()
+    config = WorkloadConfig()
+    plan, truth = build_default_workload(
+        catalog,
+        config,
+        semantic_view_id=SEMANTIC_VIEW_ID,
+        semantic_view_sha256=SEMANTIC_VIEW_SHA256,
+    )
+    run_id = "workload-v3-bounded-validation"
+    manifest = WorkloadCollectionManifest(
+        run_id=run_id,
+        run_ref=hashlib.sha256(run_id.encode()).hexdigest()[:32],
+        cluster_id="offline-fixture",
+        namespace="offline",
+        volume_id=VOLUME_ID,
+        export_id=7,
+        cluster_manifest_sha256=sha256(cluster_path),
+        fixture_catalog_sha256=catalog_sha256(catalog),
+        event_schema_sha256=sha256(schema_path),
+        budget_evidence_sha256=sha256(budget_path),
+        execution_config_sha256=workload_config_sha256(config),
+        execution_plan_sha256=execution_plan_sha256(plan),
+        semantic_view_id=SEMANTIC_VIEW_ID,
+        semantic_view_sha256=SEMANTIC_VIEW_SHA256,
+        seed=config.seed,
+        start_time=START,
+        end_time=START + timedelta(milliseconds=config.duration_ms),
+        planned_operation_count=plan.planned_operation_count,
+        range_bytes=(config.range_bytes,),
+        range_offsets=config.range_offsets,
+        client_id="offline-workload",
+        software=SoftwareVersions(
+            predictive_cache_revision="7" * 40,
+            chimera_image="offline",
+            chimera_image_sha256="2" * 64,
+            cufs_image="offline",
+            cufs_image_sha256="3" * 64,
+            collector_schema_version="chimera-read-event-v2",
+        ),
+        stop_rules=StopRules(latency_guardrail_ms=5000),
+        retention=RetentionPolicy(
+            owner="test-owner",
+            cleanup_owner="test-owner",
+            cleanup_action="delete test evidence",
+        ),
+    )
+    binding = bind_workload_truth(plan, truth)
+    permit = build_workload_collection_permit(
+        manifest,
+        config,
+        plan,
+        truth,
+        binding,
+        catalog,
+        permit_id="11111111-1111-4111-8111-111111111111",
+        profile="bounded_validation",
+        expires_at=START + timedelta(hours=1),
+        validated_code_head_sha256="6" * 40,
+        validated_merge_commit_sha256="7" * 40,
+        validated_tree_sha256="8" * 40,
+        provider_package_sha256="9" * 64,
+        provider_sha256="a" * 64,
+        collector_sha256="b" * 64,
+        validator_sha256="c" * 64,
+        runbook_sha256="d" * 64,
+        adapter_wrapper_sha256="e" * 64,
+        cleaner_wrapper_sha256="f" * 64,
+        interpreter_path="/usr/bin/python3.12",
+        interpreter_sha256="0" * 64,
+        execution_start_time=START,
+        validation_operations=3,
+    )
+    atomic_write_model(run_dir / "manifest.json", manifest)
+    atomic_write_model(run_dir / "fixture-catalog.json", catalog)
+    for name, source in (
+        ("execution-plan.json", plan),
+        ("workload-config.json", config),
+        ("workload-truth.json", truth),
+        ("workload-truth-binding.json", binding),
+    ):
+        atomic_write_model(run_dir / name, source)
+    count = CollectionRunner(sleep=lambda _: None).run(
+        manifest,
+        catalog,
+        run_dir,
+        DryRunExecutor(),
+        execution_plan=plan,
+        simulated_timing=True,
+        workload_permit=permit,
+        workload_permit_sha256="1" * 64,
+    )
+    offered = read_models(run_dir / "offered.jsonl", OfferedOperation)
+    assert count == 3
+    assert tuple(row.operation_index for row in offered) == (3, 43, 50)
+    assert tuple(row.operation_id for row in offered) == permit.operation_ids
+    assert tuple(
+        int((row.offered_at_utc - START).total_seconds() * 1000)
+        for row in offered
+    ) == permit.execution_relative_ms
+    assert permit.execution_relative_ms[-1] < 4 * 60 * 1000
+    _validate_actual_workload_cadence(plan, offered)
+    compressed = [
+        offered[0],
+        offered[1].model_copy(
+            update={
+                "offered_at_utc": offered[1].offered_at_utc
+                + timedelta(seconds=1)
+            }
+        ),
+        offered[2],
+    ]
+    with pytest.raises(ValueError, match="below the frozen minimum"):
+        _validate_actual_workload_cadence(plan, compressed)
+    full_permit = build_workload_collection_permit(
+        manifest,
+        config,
+        plan,
+        truth,
+        binding,
+        catalog,
+        permit_id="22222222-2222-4222-8222-222222222222",
+        profile="full_collection",
+        expires_at=START + timedelta(hours=4),
+        validated_code_head_sha256="6" * 40,
+        validated_merge_commit_sha256="7" * 40,
+        validated_tree_sha256="8" * 40,
+        provider_package_sha256="9" * 64,
+        provider_sha256="a" * 64,
+        collector_sha256="b" * 64,
+        validator_sha256="c" * 64,
+        runbook_sha256="d" * 64,
+        adapter_wrapper_sha256="e" * 64,
+        cleaner_wrapper_sha256="f" * 64,
+        interpreter_path="/usr/bin/python3.12",
+        interpreter_sha256="0" * 64,
+        execution_start_time=START,
+        bounded_validation_attestation_sha256="1" * 64,
+    )
+    full_permit_path = run_dir / "full-permit.json"
+    atomic_write_model(full_permit_path, full_permit)
+    missing_attestation = CliRunner().invoke(
+        main,
+        [
+            "run",
+            "--run-dir",
+            str(run_dir),
+            "--mount-root",
+            str(tmp_path / "mount"),
+            "--workload-permit",
+            str(full_permit_path),
+        ],
+    )
+    assert missing_attestation.exit_code != 0
+    assert "requires --bounded-attestation" in missing_attestation.output

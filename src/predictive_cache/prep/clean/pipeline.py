@@ -29,6 +29,43 @@ from predictive_cache.semantics.read_demand import (
     ReadDemandEvent,
 )
 
+V3_RUNTIME_LINEAGE_FIELDS = (
+    "execution_plan_sha256",
+    "workload_config_sha256",
+    "truth_binding_sha256",
+    "workload_truth_sha256",
+    "workload_permit_sha256",
+    "workload_evidence_sha256",
+    "operation_indexes_json",
+    "intent_ids_json",
+    "operation_ids_json",
+)
+
+
+def _v3_runtime_lineage(runtime: dict) -> dict:
+    if "workload_permit_sha256" not in runtime:
+        return {}
+    lineage = {
+        key: runtime[key] for key in V3_RUNTIME_LINEAGE_FIELDS if key in runtime
+    }
+    if lineage and len(lineage) != len(V3_RUNTIME_LINEAGE_FIELDS):
+        raise ValueError("workload-v3 runtime lineage is incomplete")
+    return lineage
+
+
+def _admit_controlled_synthetic(
+    runtime: dict,
+    semantic_view: str,
+    v3_lineage: dict,
+) -> bool:
+    return (
+        semantic_view == SEMANTIC_VIEW_ID
+        and runtime.get("semantic_view_id") == SEMANTIC_VIEW_ID
+        and runtime.get("semantic_view_sha256") == SEMANTIC_VIEW_SHA256
+        and runtime.get("source_evidence_mode") == "controlled_demand"
+        and not v3_lineage
+    )
+
 
 def _safe_volume(value) -> str:
     if (
@@ -215,11 +252,11 @@ def run_clean(
     records, counters, catalog_paths = _source_rows(source, parent)
     runtime = parent.get("generator", {}).get("runtime", {})
     source_evidence_mode = runtime.get("source_evidence_mode")
-    admit_controlled_synthetic = (
-        semantic_view == SEMANTIC_VIEW_ID
-        and runtime.get("semantic_view_id") == SEMANTIC_VIEW_ID
-        and runtime.get("semantic_view_sha256") == SEMANTIC_VIEW_SHA256
-        and source_evidence_mode == "controlled_demand"
+    v3_lineage = _v3_runtime_lineage(runtime)
+    admit_controlled_synthetic = _admit_controlled_synthetic(
+        runtime,
+        semantic_view,
+        v3_lineage,
     )
     records.sort(key=_event_sort)
     seen = set()
@@ -485,6 +522,7 @@ def run_clean(
                     "semantic_view_sha256": SEMANTIC_VIEW_SHA256,
                     "source_evidence_mode": source_evidence_mode
                     or ("fixture_demand" if parent["data_kind"] == "synthetic" else "foreground"),
+                    **v3_lineage,
                 }
             )
         (stage / "manifest.json").write_text(canonical_json(manifest) + "\n")

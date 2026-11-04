@@ -107,9 +107,13 @@ adds deterministic repeated ranges, popularity skew, co-access groups,
 sequential progression, bursts and quiet periods over the same frozen catalog.
 The next candidate is three hours; datagen deterministically selects and
 freezes its exact operation count, variable rate and truth within declared
-safety bounds before bounded validation. V3 is offline-only: mount,
-permit, reconciliation, attestation and finalization paths reject it until a
-complete plan-bound live evidence chain is implemented and approved. Manifest
+safety bounds before bounded validation. V3 has a separate plan-bound live
+evidence path guarded by an immutable approved permit. The permit binds the
+exact plan/truth/catalog/manifest/semantic/code/provider stack and exact
+operation selection. Bounded validation may use a separately bound prompt
+schedule while retaining original plan timestamps and operation IDs as
+evidence; it does not claim full-schedule fidelity. No live permit, bounded
+READ, or three-hour collection is established by repository tests. Manifest
 v2's five-hour unique-coverage behavior is unchanged.
 
 ## Import a controlled Chimera v2 run
