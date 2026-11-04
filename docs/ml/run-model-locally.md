@@ -10,9 +10,12 @@ is served from the server: download the package and score on your machine.
 
 | Field | Value |
 | --- | --- |
-| Name | model type, for example `logreg-v1` |
+| Name | model type: `logreg-v1`, `gbdt-v1`, `gbdt-rank-v1`, `baseline-hotset` |
 | Tags | `candidate`, `data:<kind>`, plus `read-demand-v1` for READ models |
 | File | the package zip (ML spec §5): weights, `feature_schema.json`, serving contract, co-read table and policy |
+
+All model types load and score with numpy only. LightGBM is needed only to
+*train* `gbdt-*` models.
 
 Packages trained on synthetic data are plumbing evidence only. Their metrics
 are not real model-quality evidence.
@@ -81,6 +84,6 @@ uv run --extra clearml --extra ml python src/predictive_cache/clearml/read_snaps
 
 # snapshots Dataset -> registered model packages
 uv run --extra clearml --extra ml python src/predictive_cache/clearml/train.py \
-    --snapshots-dataset <snapshots-dataset-id> --models logreg-v1,baseline-hotset \
+    --snapshots-dataset <snapshots-dataset-id> --models logreg-v1,gbdt-v1,gbdt-rank-v1,baseline-hotset \
     --queue default
 ```
