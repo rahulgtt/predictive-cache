@@ -28,6 +28,14 @@ from .read_demand_plan import (
     PlanPublishError,
     publish_read_demand_plan,
 )
+from .read_demand_schedule import (
+    ZERO_ITEMS_EXIT_CODE as ZERO_SCHEDULE_ITEMS_EXIT_CODE,
+)
+from .read_demand_schedule import (
+    NoScheduleItems,
+    SchedulePublishError,
+    publish_read_demand_schedule,
+)
 from .snapshots import (
     SnapshotError,
     build_narrow_read_demand_snapshot,
@@ -480,4 +488,50 @@ def publish_plan(
         f"{published.plan_id} {published.prediction_id} "
         f"items={published.item_count} bytes={published.requested_bytes} "
         f"{published.plan_path}"
+    )
+
+
+@main.command("publish-read-demand-schedule")
+@click.option(
+    "--snapshot",
+    "snapshot_root",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.option(
+    "--package",
+    "package_path",
+    required=True,
+    type=click.Path(exists=True, path_type=Path),
+)
+@click.option("--out", "out_dir", required=True, type=click.Path(path_type=Path))
+@click.option("--prediction-cutoff", required=True, help="Exact UTC validation snapshot tick.")
+@click.option("--warm-start-offset-s", default=0, show_default=True, type=click.IntRange(min=0))
+@click.option("--warm-spacing-s", default=0, show_default=True, type=click.IntRange(min=0))
+def publish_schedule(
+    snapshot_root,
+    package_path,
+    out_dir,
+    prediction_cutoff,
+    warm_start_offset_s,
+    warm_spacing_s,
+):
+    """Publish one deterministic, handle-free Pass-1 prediction schedule."""
+    try:
+        published = publish_read_demand_schedule(
+            snapshot_root,
+            package_path,
+            out_dir,
+            prediction_cutoff=parse_utc_z(prediction_cutoff),
+            warm_start_offset_s=warm_start_offset_s,
+            warm_spacing_s=warm_spacing_s,
+        )
+    except NoScheduleItems as exc:
+        click.echo(str(exc), err=True)
+        raise click.exceptions.Exit(ZERO_SCHEDULE_ITEMS_EXIT_CODE) from exc
+    except (SchedulePublishError, SnapshotError, ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"{published.schedule_id} items={published.item_count} "
+        f"bytes={published.requested_bytes} {published.path}"
     )

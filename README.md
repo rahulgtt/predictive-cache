@@ -193,6 +193,19 @@ live Warmer integration, representative-data result, cache-residency proof, or
 performance claim. The documented offline `nas-vm` validation is complete;
 the separately approved one-READ Dispatcher-to-Warmer gate remains unrun.
 
+The additive
+[Pass-1 frozen schedule bridge](docs/experiments/pass-1-batch-schedule.md)
+scores one exact validation tick from an existing `read-demand-v1` snapshot
+with a verified trained package and writes a deterministic, hash-addressed
+JSON schedule. The schedule contains logical identities and byte ranges but no
+NFS handles. It is a two-pass batch artifact, not live ingestion or a running
+Controller. The
+[Pass-2 runtime bridge](docs/controller/pass2-runtime-bridge.md) binds those
+logical identities to a fresh owner-only approved target map and publishes
+short-lived schema-v2 plans near their due times. The existing Dispatcher can
+consume those plans in dry-run mode; live Warmer execution and NFS reads remain
+separately gated.
+
 ## Manual NFS range reader
 
 The [manual Warmer guide](docs/manual-warmer.md) describes the standalone,

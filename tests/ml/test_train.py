@@ -142,6 +142,9 @@ def test_train_writes_packages_reports_and_manifest(trained, snaps):
     for model, entry in summary["models"].items():
         with load_package(Path(entry["package"]), "fv1") as loaded:
             assert loaded.model_type == model
+            assert loaded.manifest["trained"] is (model == "logreg-v1")
+            assert loaded.manifest["data_kind"] == "fixture"
+            assert loaded.manifest["training"]["trained"] is (model == "logreg-v1")
             policy = loaded.serving_policy
             assert policy["lead_s"] == 0 and policy["horizon_s"] == 300
             assert policy["max_bytes"] == 256 * 2**20

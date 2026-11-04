@@ -417,6 +417,14 @@ do not establish live direct-handle interoperability. The Chimera/CUFS tag
 bridge and a controlled cache experiment remain distinct evidence; a mock or
 completed read cannot replace them.
 
+The focused schema-v2 handle contract test additionally starts with a plan
+item, writes the exact private Warmer task, runs the real task validator and
+supervisor, and uses the XDR fixture to prove the supplied handle and exact
+offset/count reach `PUTFH`, `GETATTR`, `OPEN(CLAIM_FH)`, `READ`, `CLOSE`, and
+session/client cleanup before an exact terminal result is accepted. This is
+offline plumbing evidence only; live handle mode remains unvalidated and
+approval-gated.
+
 ## Boundaries and missing evidence
 
 - The operator supplies a path or a trusted dispatcher attests a handle and
