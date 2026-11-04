@@ -131,6 +131,15 @@ directories, catalog metadata or datagen truth artifacts. See the
 engineers can use the
 [owner-private controlled dataset guide](docs/data-prep/owner-private-controlled-dataset.md)
 to request the frozen package without publishing its path or contents.
+The collection owner supplies `PCACHE_DATASET_ROOT` privately; never commit,
+publish, or log its value. In a private shell on `nas-vm`, verify only the
+package controls and checksum catalog:
+
+```bash
+export PCACHE_DATASET_ROOT='<owner-supplied path>'
+find "$PCACHE_DATASET_ROOT" -maxdepth 1 -type f -printf '%f\n' | sort
+(cd "$PCACHE_DATASET_ROOT" && sha256sum --status -c SHA256SUMS)
+```
 
 ## Manual NFS range reader
 

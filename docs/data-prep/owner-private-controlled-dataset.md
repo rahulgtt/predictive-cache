@@ -81,7 +81,7 @@ checksums, or paths into issues, pull requests, chat, logs, or test fixtures.
    private shell on `nas-vm`:
 
    ```bash
-   export PCACHE_PRIVATE_PACKAGE='<owner-supplied-path>'
+   export PCACHE_DATASET_ROOT='<owner-supplied path>'
    ```
 
 4. Keep source access read-only. Write importer, cleaner, snapshot, and model
@@ -95,28 +95,35 @@ authorize bypassing host, filesystem, or package permissions.
 
 ## Verify the package
 
-Run verification only after the owner has supplied `PCACHE_PRIVATE_PACKAGE`.
+Run verification only after the collection owner has supplied
+`PCACHE_DATASET_ROOT` privately.
 The checksum command is silent on success and avoids publishing individual
 hashes or names:
 
 ```bash
 set -eu
 umask 077
-: "${PCACHE_PRIVATE_PACKAGE:?owner must supply the approved package path}"
-test -r "$PCACHE_PRIVATE_PACKAGE/MANIFEST.json"
-test -r "$PCACHE_PRIVATE_PACKAGE/SHA256SUMS"
+: "${PCACHE_DATASET_ROOT:?owner must supply the approved package path}"
+test -r "$PCACHE_DATASET_ROOT/MANIFEST.json"
+test -r "$PCACHE_DATASET_ROOT/SHA256SUMS"
+
+find "$PCACHE_DATASET_ROOT" \
+  -maxdepth 1 \
+  -type f \
+  -printf '%f\n' |
+  sort
 
 python3 - <<'PY'
 import json
 import os
 from pathlib import Path
 
-root = Path(os.environ["PCACHE_PRIVATE_PACKAGE"])
+root = Path(os.environ["PCACHE_DATASET_ROOT"])
 json.loads((root / "MANIFEST.json").read_text())
 PY
 
 if (
-  cd "$PCACHE_PRIVATE_PACKAGE"
+  cd "$PCACHE_DATASET_ROOT"
   sha256sum --status -c SHA256SUMS
 ); then
   echo "Package integrity: OK"
@@ -133,18 +140,18 @@ package.
 ## Import and clean without modifying the package
 
 Use fresh private output directories that are not inside
-`PCACHE_PRIVATE_PACKAGE`:
+`PCACHE_DATASET_ROOT`:
 
 ```bash
 set -eu
 umask 077
-: "${PCACHE_PRIVATE_PACKAGE:?owner must supply the approved package path}"
+: "${PCACHE_DATASET_ROOT:?owner must supply the approved package path}"
 : "${PCACHE_IMPORT_OUT:?set a fresh private importer output directory}"
 : "${PCACHE_CLEAN_OUT:?set a fresh private cleaner output directory}"
 test ! -e "$PCACHE_IMPORT_OUT"
 test ! -e "$PCACHE_CLEAN_OUT"
 
-run="$PCACHE_PRIVATE_PACKAGE/data/live_run"
+run="$PCACHE_DATASET_ROOT/data/live_run"
 uv run pcache-chimera-import \
   --event-sources "$run/collector-file-manifest.json" \
   --observed "$run/observed.jsonl" \
