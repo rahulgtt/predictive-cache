@@ -6,8 +6,10 @@ users wait for it to arrive from cloud storage.
 > **Status: design proposal, not an implemented service.** Synthetic data
 > generation and cleaning, the controlled collection harness, Chimera v2
 > importer, strict current-run finalizer, explicit pre-finalizer historical
-> compatibility path, offline plan-file dispatcher, and experimental
-> standalone manual NFS range reader are implemented. The complete Controller,
+> compatibility path, narrow READ-demand inference snapshot and baseline
+> package/plan publisher, offline plan-file dispatcher, experimental standalone
+> manual NFS range reader, and bounded event collector are implemented. The
+> complete Controller,
 > automated live Warmer
 > integration, representative data collection and real-workload performance
 > claims remain gated work. Generated records model fictional activity and
@@ -18,8 +20,15 @@ users wait for it to arrive from cloud storage.
 An experimental [event collector](docs/controller/collector.md) supports
 normalized-v1 HTTP ingestion and replay. Opt-in
 [raw target ingestion](docs/controller/target-map.md#raw-http-target-ingestion)
-feeds private execution targets without creating demand updates. Live READ-only feature semantics and
-FeatureStore integration remain dependent on #104 and #30.
+feeds private execution targets without creating demand updates.
+
+The narrow datagen-to-Dispatcher path has passed focused tests, Ruff, and one
+controlled offline `skipped/dry_run` integration on `nas-vm`; it issued zero
+bytes and did not start the Warmer. The separately approved one-READ
+Dispatcher-to-Warmer validation remains unrun. This is plumbing evidence only,
+not model-quality, cache-residency, performance, or production-readiness
+evidence. Live READ-only feature semantics and FeatureStore integration remain
+dependent on #104 and #30.
 
 ## Run the datagen foundation
 
@@ -107,6 +116,21 @@ performance evidence. See the
 The manifest hashes the exact canonical cluster-provenance and event-schema
 bytes documented in [`contracts/README.md`](contracts/README.md).
 
+The separate manifest-v3
+[datagen-driven READ workload](docs/experiments/datagen-read-workload.md)
+adds deterministic repeated ranges, popularity skew, co-access groups,
+sequential progression, bursts and quiet periods over the same frozen catalog.
+The next candidate is three hours; datagen deterministically selects and
+freezes its exact operation count, variable rate and truth within declared
+safety bounds before bounded validation. V3 has a separate plan-bound live
+evidence path guarded by an immutable approved permit. The permit binds the
+exact plan/truth/catalog/manifest/semantic/code/provider stack and exact
+operation selection. Bounded validation may use a separately bound prompt
+schedule while retaining original plan timestamps and operation IDs as
+evidence; it does not claim full-schedule fidelity. No live permit, bounded
+READ, or three-hour collection is established by repository tests. Manifest
+v2's five-hour unique-coverage behavior is unchanged.
+
 ## Import a controlled Chimera v2 run
 
 `pcache-chimera-import` converts authoritative `nfs4_read_v2` JSONL plus its
@@ -153,6 +177,17 @@ It projects successful NFSv4.1 READs without inventing OPEN/CLOSE, handles or
 application sessions, and binds snapshots/model packages to exact semantic,
 feature-schema and serving-contract hashes. Generic datagen v1 remains
 available for lifecycle fixtures.
+
+The controlled
+[datagen-to-Warmer offline MVP](docs/experiments/datagen-to-warmer-mvp.md)
+builds the distinct `read-demand-v1-narrow-mvp` inference snapshot, packages
+the explicit non-trained `baseline-read-frequency`, publishes a bounded
+schema-v2 READ plan from an approved fixture target map, and exercises the
+existing Dispatcher only in `--no-real-reads --once` mode. This is synthetic
+contract-plumbing evidence only. It is not a trained model, full Controller,
+live Warmer integration, representative-data result, cache-residency proof, or
+performance claim. The documented offline `nas-vm` validation is complete;
+the separately approved one-READ Dispatcher-to-Warmer gate remains unrun.
 
 ## Manual NFS range reader
 
@@ -728,6 +763,7 @@ stays blocked. Synthetic fixtures cannot close either gap.
 | Need | Document |
 | --- | --- |
 | Day-to-day schedule and ownership | [Quick glance](docs/plan/team-quick-glance.md) and [detailed team plan](docs/predictive-cache-48-hour-team-plan.md) |
+| Current protocol/filesystem implementation, evidence and next READ-only workload | [Engineer 1 implementation record](docs/engineer-one-protocol-filesystem-plan.md) |
 | Full generation schema, dataset layout and synthetic patterns | [Datagen spec](docs/datagen/spec.md) |
 | Approved access to the owner-private controlled collection | [Owner-private controlled dataset](docs/data-prep/owner-private-controlled-dataset.md) |
 | Collection, state, failure and benchmark procedures | [Validation and operations](docs/architecture/validation-and-operations.md) |

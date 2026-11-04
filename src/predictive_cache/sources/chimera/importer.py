@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from predictive_cache.collection.harness import planned_operations
+from predictive_cache.collection.io import strict_json_loads
 from predictive_cache.collection.models import (
     AdapterValidationPermit,
     Checkpoint,
@@ -24,6 +25,10 @@ from predictive_cache.collection.models import (
     FixtureEntry,
     ObservedEvent,
     OfferedOperation,
+    WorkloadCollectionManifest,
+    WorkloadCollectionPermit,
+    WorkloadEvidenceBinding,
+    parse_collection_manifest,
 )
 from predictive_cache.collection.provenance import (
     APPROVED_COLLECTOR_SHA256,
@@ -31,6 +36,20 @@ from predictive_cache.collection.provenance import (
     APPROVED_PROVIDER_SHA256,
     APPROVED_VALIDATION_RUNBOOK_SHA256,
     APPROVED_VALIDATOR_SHA256,
+)
+from predictive_cache.collection.workload import (
+    WorkloadConfig,
+    WorkloadExecutionPlan,
+    WorkloadTruthBinding,
+    canonical_model_file_sha256,
+    checkpoint_schedule,
+    execution_plan_sha256,
+    fixture_catalog_sha256,
+    resolved_operation_count,
+    run_bound_operation_id,
+    workload_config_sha256,
+    workload_manifest_sha256,
+    workload_truth_binding_sha256,
 )
 from predictive_cache.datagen.io import canonical_json, sha256, source_revision, write_table
 from predictive_cache.datagen.schema import Manifest, normalize_rows
@@ -66,7 +85,8 @@ def _catalog_hash(catalog: FixtureCatalog) -> str:
 
 
 def _validate_catalog(
-    catalog: FixtureCatalog, manifest: CollectionManifest
+    catalog: FixtureCatalog,
+    manifest: CollectionManifest | WorkloadCollectionManifest,
 ) -> dict[tuple[str, str], FixtureEntry]:
     if _catalog_hash(catalog) != manifest.fixture_catalog_sha256:
         raise ValueError("fixture catalog checksum does not match the run manifest")
@@ -81,13 +101,19 @@ def _validate_catalog(
 
 def _validate_ledger(
     rows: list[OfferedOperation],
-    manifest: CollectionManifest,
+    manifest: CollectionManifest | WorkloadCollectionManifest,
     fixtures: dict[tuple[str, str], FixtureEntry],
     expected_validation_operation_ids: tuple[str, ...] | None = None,
+    execution_plan: WorkloadExecutionPlan | None = None,
+    workload_permit: WorkloadCollectionPermit | None = None,
 ) -> dict[str, OfferedOperation]:
     expected_count = (
-        len(expected_validation_operation_ids)
+        len(workload_permit.operation_ids)
+        if workload_permit is not None
+        else len(expected_validation_operation_ids)
         if expected_validation_operation_ids is not None
+        else manifest.planned_operation_count
+        if isinstance(manifest, WorkloadCollectionManifest)
         else manifest.offered_count
     )
     if len(rows) != expected_count:
@@ -95,7 +121,7 @@ def _validate_ledger(
     by_id: dict[str, OfferedOperation] = {}
     indexes = []
     ranges: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
-    for row in rows:
+    for selected_position, row in enumerate(rows):
         if row.operation_id in by_id:
             raise ValueError("offered ledger operation IDs must be unique")
         by_id[row.operation_id] = row
@@ -119,9 +145,40 @@ def _validate_ledger(
             raise ValueError("offered operation extends beyond the fixture")
         if row.count != manifest.range_bytes[0] or row.offset not in manifest.range_offsets:
             raise ValueError("offered operation range is absent from the frozen manifest")
-        for start, end in ranges[(row.volume_id, row.file_id)]:
-            if row.offset < end and start < row.offset + row.count:
-                raise ValueError("offered operation ranges must be unique and non-overlapping")
+        if isinstance(manifest, WorkloadCollectionManifest):
+            if execution_plan is None or row.operation_index >= len(execution_plan.intents):
+                raise ValueError("workload ledger lacks a matching execution-plan intent")
+            intent = execution_plan.intents[row.operation_index]
+            expected_operation_id = run_bound_operation_id(
+                manifest.run_id,
+                manifest.execution_plan_sha256,
+                intent.intent_id,
+            )
+            planned_at = (
+                workload_permit.execution_start_time
+                + timedelta(
+                    milliseconds=workload_permit.execution_relative_ms[
+                        selected_position
+                    ]
+                )
+                if workload_permit is not None
+                else manifest.start_time + timedelta(milliseconds=intent.relative_ms)
+            )
+            if (
+                row.operation_id != expected_operation_id
+                or row.fixture_id != intent.fixture_id
+                or row.offset != intent.offset
+                or row.count != intent.count
+                or abs((row.offered_at_utc - planned_at).total_seconds())
+                > manifest.operation_schedule_tolerance_s
+            ):
+                raise ValueError("offered operation differs from the execution plan")
+        else:
+            for start, end in ranges[(row.volume_id, row.file_id)]:
+                if row.offset < end and start < row.offset + row.count:
+                    raise ValueError(
+                        "offered operation ranges must be unique and non-overlapping"
+                    )
         ranges[(row.volume_id, row.file_id)].append((row.offset, row.offset + row.count))
         expected_tag = (
             f"pc1:d:{manifest.run_ref}:{row.operation_id[:32]}:{row.operation_id[32:]}"
@@ -132,8 +189,69 @@ def _validate_ledger(
             raise ValueError("offered operation correlation tag mismatch")
         if row.client_id != manifest.client_id:
             raise ValueError("offered operation client_id mismatch")
-    if indexes != list(range(expected_count)):
+    expected_indexes = (
+        list(workload_permit.operation_indexes)
+        if workload_permit is not None
+        else list(range(expected_count))
+    )
+    if indexes != expected_indexes:
+        if workload_permit is not None:
+            raise ValueError(
+                "offered operation indexes differ from the permitted selection"
+            )
         raise ValueError("offered operation indexes must be contiguous from zero")
+    if isinstance(manifest, WorkloadCollectionManifest):
+        minimum = timedelta(
+            seconds=(
+                manifest.untagged_correlation_window_s
+                + manifest.operation_schedule_tolerance_s
+            )
+        )
+        previous: dict[tuple[str, str, int, int], datetime] = {}
+        for row in rows:
+            key = (row.volume_id, row.file_id, row.offset, row.count)
+            if key in previous and row.offered_at_utc - previous[key] <= minimum:
+                raise ValueError(
+                    "identical workload ranges must exceed correlation plus "
+                    "schedule tolerance"
+                )
+            previous[key] = row.offered_at_utc
+        if execution_plan is None:
+            raise ValueError("workload ledger requires its execution plan")
+        actual_ms = [
+            int(row.offered_at_utc.timestamp() * 1000)
+            for row in rows
+        ]
+        if any(
+            right - left < execution_plan.min_offer_gap_ms
+            for left, right in zip(actual_ms, actual_ms[1:])
+        ):
+            raise ValueError(
+                "actual workload offer gap is below the frozen minimum"
+            )
+        for window_ms, cap in (
+            (
+                execution_plan.short_window_ms,
+                execution_plan.short_window_max_offers,
+            ),
+            (
+                execution_plan.long_window_ms,
+                execution_plan.long_window_max_offers,
+            ),
+        ):
+            active: list[int] = []
+            for current in actual_ms:
+                active = [
+                    value
+                    for value in active
+                    if value > current - window_ms
+                ]
+                active.append(current)
+                if len(active) > cap:
+                    raise ValueError(
+                        f"actual workload offers exceed {cap} in "
+                        f"half-open {window_ms}ms"
+                    )
     if expected_validation_operation_ids is not None:
         catalog = FixtureCatalog(fixtures=tuple(fixtures.values()))
         expected_prefix = tuple(
@@ -178,6 +296,166 @@ def _validate_ledger(
                     "offered ledger does not match the permitted deterministic prefix"
                 )
     return by_id
+
+
+def _workload_collection_permit(
+    path: Path,
+    data: bytes,
+    manifest: WorkloadCollectionManifest,
+    manifest_bytes: bytes,
+    config: WorkloadConfig,
+    config_bytes: bytes,
+    plan: WorkloadExecutionPlan,
+    plan_bytes: bytes,
+    truth_binding: WorkloadTruthBinding,
+    truth_binding_bytes: bytes,
+    catalog: FixtureCatalog,
+    catalog_bytes: bytes,
+    *,
+    evaluated_at: datetime | None = None,
+) -> WorkloadCollectionPermit:
+    permit = parse_json(data, path, WorkloadCollectionPermit)
+    canonical = (
+        canonical_json(permit.model_dump(mode="json")) + "\n"
+    ).encode("utf-8")
+    if data != canonical:
+        raise ValueError("workload collection permit must use exact canonical bytes")
+
+    plan_hash = execution_plan_sha256(plan)
+    config_hash = workload_config_sha256(config)
+    binding_hash = workload_truth_binding_sha256(truth_binding)
+    catalog_hash = fixture_catalog_sha256(catalog)
+    if (
+        permit.expires_at <= (evaluated_at or datetime.now(UTC))
+        or permit.run_id != manifest.run_id
+        or permit.manifest_sha256 != workload_manifest_sha256(manifest)
+        or permit.manifest_file_sha256
+        != hashlib.sha256(manifest_bytes).hexdigest()
+        or permit.workload_config_sha256 != config_hash
+        or permit.workload_config_file_sha256
+        != hashlib.sha256(config_bytes).hexdigest()
+        or permit.execution_plan_sha256 != plan_hash
+        or permit.execution_plan_file_sha256
+        != hashlib.sha256(plan_bytes).hexdigest()
+        or permit.truth_binding_sha256 != binding_hash
+        or permit.truth_binding_file_sha256
+        != hashlib.sha256(truth_binding_bytes).hexdigest()
+        or permit.fixture_catalog_sha256 != catalog_hash
+        or permit.fixture_catalog_file_sha256
+        != hashlib.sha256(catalog_bytes).hexdigest()
+        or permit.semantic_view_sha256 != SEMANTIC_VIEW_SHA256
+    ):
+        raise ValueError("workload collection permit canonical binding mismatch")
+    if (
+        permit.manifest_file_sha256 != canonical_model_file_sha256(manifest)
+        or permit.workload_config_file_sha256
+        != canonical_model_file_sha256(config)
+        or permit.execution_plan_file_sha256
+        != canonical_model_file_sha256(plan)
+        or permit.truth_binding_file_sha256
+        != canonical_model_file_sha256(truth_binding)
+        or permit.fixture_catalog_file_sha256
+        != canonical_model_file_sha256(catalog)
+        or manifest.execution_config_sha256 != config_hash
+        or manifest.execution_plan_sha256 != plan_hash
+        or manifest.fixture_catalog_sha256 != catalog_hash
+        or manifest.semantic_view_id != SEMANTIC_VIEW_ID
+        or manifest.semantic_view_sha256 != SEMANTIC_VIEW_SHA256
+        or manifest.software.predictive_cache_revision
+        != permit.validated_merge_commit_sha256
+        or plan.workload_config_sha256 != config_hash
+        or plan.fixture_catalog_sha256 != catalog_hash
+        or plan.semantic_view_id != manifest.semantic_view_id
+        or plan.semantic_view_sha256 != manifest.semantic_view_sha256
+        or manifest.planned_operation_count != len(plan.intents)
+        or manifest.seed != config.seed
+        or manifest.end_time - manifest.start_time
+        != timedelta(milliseconds=config.duration_ms)
+        or manifest.checkpoint_interval_s != config.checkpoint_interval_s
+        or manifest.operation_schedule_tolerance_s
+        != config.operation_schedule_tolerance_s
+        or manifest.range_bytes != (config.range_bytes,)
+        or manifest.range_offsets != config.range_offsets
+        or manifest.untagged_correlation_window_s
+        != config.untagged_correlation_window_s
+        or plan.seed != config.seed
+        or plan.duration_ms != config.duration_ms
+        or plan.planned_operation_count != resolved_operation_count(config)
+        or plan.range_bytes != config.range_bytes
+        or plan.range_offsets != config.range_offsets
+        or plan.min_offer_gap_ms != config.min_offer_gap_ms
+        or plan.short_window_ms != config.short_window_ms
+        or plan.short_window_max_offers != config.short_window_max_offers
+        or plan.long_window_ms != config.long_window_ms
+        or plan.long_window_max_offers != config.long_window_max_offers
+        or plan.untagged_correlation_window_s
+        != config.untagged_correlation_window_s
+        or plan.operation_schedule_tolerance_s
+        != config.operation_schedule_tolerance_s
+        or plan.simulated_durability_margin_ms
+        != config.simulated_durability_margin_ms
+        or truth_binding.execution_plan_sha256 != plan_hash
+        or truth_binding.workload_truth_sha256 != permit.workload_truth_sha256
+        or truth_binding.semantic_view_id != manifest.semantic_view_id
+        or truth_binding.semantic_view_sha256 != manifest.semantic_view_sha256
+    ):
+        raise ValueError("workload collection permit artifact binding mismatch")
+
+    try:
+        selected_intents = tuple(
+            plan.intents[index] for index in permit.operation_indexes
+        )
+    except IndexError as error:
+        raise ValueError("workload collection permit selects an unknown plan index") from error
+    expected_intent_ids = tuple(intent.intent_id for intent in selected_intents)
+    expected_operation_ids = tuple(
+        run_bound_operation_id(manifest.run_id, plan_hash, intent.intent_id)
+        for intent in selected_intents
+    )
+    expected_original_relative_ms = tuple(
+        intent.relative_ms for intent in selected_intents
+    )
+    if (
+        permit.intent_ids != expected_intent_ids
+        or permit.operation_ids != expected_operation_ids
+        or permit.original_relative_ms != expected_original_relative_ms
+        or permit.schedule_tolerance_s
+        != manifest.operation_schedule_tolerance_s
+    ):
+        raise ValueError("workload collection permit selected operation mismatch")
+    if permit.profile == "full_collection":
+        expected_schedule = tuple(intent.relative_ms for intent in plan.intents)
+        if (
+            permit.operation_indexes != tuple(range(len(plan.intents)))
+            or permit.execution_start_time != manifest.start_time
+            or permit.execution_relative_ms != expected_schedule
+        ):
+            raise ValueError("full workload permit must preserve the complete plan schedule")
+    else:
+        repeat_delay_ms = (
+            (
+                config.untagged_correlation_window_s
+                + config.operation_schedule_tolerance_s
+            )
+            * 1000
+            + config.min_offer_gap_ms
+        )
+        expected_schedule = (
+            0,
+            repeat_delay_ms,
+            repeat_delay_ms + config.min_offer_gap_ms,
+        )[: len(permit.operation_indexes)]
+        if permit.execution_relative_ms != expected_schedule:
+            raise ValueError("bounded workload permit execution schedule mismatch")
+    if (
+        permit.execution_start_time >= permit.expires_at
+        or permit.execution_start_time
+        + timedelta(milliseconds=permit.execution_relative_ms[-1])
+        + timedelta(seconds=permit.schedule_tolerance_s)
+        >= permit.expires_at
+    ):
+        raise ValueError("workload collection permit execution schedule mismatch")
+    return permit
 
 
 def _validation_permit(
@@ -277,6 +555,101 @@ def _validate_observed(
     return by_event
 
 
+def _validate_workload_evidence(
+    rows: list[WorkloadEvidenceBinding],
+    permit: WorkloadCollectionPermit,
+    permit_sha256: str,
+    plan: WorkloadExecutionPlan,
+    offered: dict[str, OfferedOperation],
+    observed: dict[tuple[str, str, str], ObservedEvent],
+    source_root: Path,
+) -> None:
+    if (
+        len(rows) != len(permit.operation_ids)
+        or tuple(row.operation_id for row in rows)
+        != permit.operation_ids
+        or tuple(row.operation_index for row in rows)
+        != permit.operation_indexes
+    ):
+        raise ValueError(
+            "workload evidence rows differ from the permitted selection"
+        )
+    observed_by_operation = {
+        row.operation_id: row
+        for row in observed.values()
+        if row.operation_id is not None
+    }
+    for selected_position, row in enumerate(rows):
+        operation = offered.get(row.operation_id)
+        observation = observed_by_operation.get(row.operation_id)
+        intent = plan.intents[row.operation_index]
+        scheduled = permit.execution_start_time + timedelta(
+            milliseconds=permit.execution_relative_ms[selected_position]
+        )
+        if (
+            operation is None
+            or observation is None
+            or row.run_id != permit.run_id
+            or row.permit_sha256 != permit_sha256
+            or row.execution_plan_sha256 != permit.execution_plan_sha256
+            or row.intent_id != intent.intent_id
+            or row.original_relative_ms != intent.relative_ms
+            or row.scheduled_at_utc != scheduled
+            or row.offered_at_utc != operation.offered_at_utc
+            or row.event_id != observation.event_id
+            or row.producer_epoch != observation.producer_epoch
+            or row.producer_sequence != observation.producer_sequence
+            or row.observed_sha256
+            != hashlib.sha256(
+                (
+                    canonical_json(observation.model_dump(mode="json"))
+                    + "\n"
+                ).encode()
+            ).hexdigest()
+        ):
+            raise ValueError(
+                "workload evidence plan/observed binding mismatch"
+            )
+        raw_path = source_root / row.raw_jsonl_path
+        if (
+            raw_path.is_symlink()
+            or not raw_path.is_file()
+            or hashlib.sha256(raw_path.read_bytes()).hexdigest()
+            != row.raw_jsonl_sha256
+        ):
+            raise ValueError(
+                "workload evidence raw chunk binding mismatch"
+            )
+        raw_lines = raw_path.read_bytes().splitlines()
+        if row.raw_line_number > len(raw_lines):
+            raise ValueError(
+                "workload evidence raw line is unavailable"
+            )
+        raw_line = raw_lines[row.raw_line_number - 1]
+        if (
+            hashlib.sha256(raw_line).hexdigest()
+            != row.raw_record_sha256
+        ):
+            raise ValueError(
+                "workload evidence raw line hash mismatch"
+            )
+        try:
+            raw = strict_json_loads(raw_line.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise ValueError(
+                "workload evidence raw line is invalid"
+            ) from error
+        if (
+            raw.get("local_id") != row.event_id
+            or raw.get("producer_epoch") != row.producer_epoch
+            or raw.get("producer_sequence")
+            != str(row.producer_sequence)
+        ):
+            raise ValueError(
+                "workload evidence raw identity mismatch"
+            )
+
+
 def _resolve_source(root: Path, relative: str) -> Path:
     candidate = root / relative
     if candidate.is_symlink() or not candidate.is_file():
@@ -350,11 +723,13 @@ def _load_raw_events(
 
 def _start_baselines(
     checkpoints: list[Checkpoint],
-    manifest: CollectionManifest,
+    manifest: CollectionManifest | WorkloadCollectionManifest,
+    scheduled_at: datetime | None = None,
 ) -> dict[tuple[str, str, str, str], tuple[int, datetime]]:
     baselines = {}
+    baseline_time = scheduled_at or manifest.start_time
     for row in checkpoints:
-        if row.scheduled_at != manifest.start_time:
+        if row.scheduled_at != baseline_time:
             continue
         key = (row.pod_name, row.pod_uid, row.node_name, row.producer_epoch)
         if key in baselines:
@@ -376,13 +751,13 @@ def _start_baselines(
 
 def _validate_checkpoints(
     checkpoints: list[Checkpoint],
-    manifest: CollectionManifest,
+    manifest: CollectionManifest | WorkloadCollectionManifest,
     sources: CollectorFileManifest,
     streams: dict[tuple[str, str], list[ChimeraEvent]],
     source_hashes: dict[str, str],
     source_sizes: dict[str, int],
     start_baselines: dict[tuple[str, str, str, str], tuple[int, datetime]],
-    validation_permit: AdapterValidationPermit | None = None,
+    validation_permit: AdapterValidationPermit | WorkloadCollectionPermit | None = None,
 ) -> None:
     source_by_stream = {}
     source_paths_by_stream = defaultdict(set)
@@ -431,14 +806,26 @@ def _validate_checkpoints(
     if set(grouped) != set(source_by_stream):
         raise ValueError("checkpoint streams must exactly match event source streams")
     full_expected_times = [
-        manifest.start_time + timedelta(seconds=manifest.checkpoint_interval_s * index)
-        for index in range(21)
+        manifest.start_time + timedelta(milliseconds=relative_ms)
+        for relative_ms in checkpoint_schedule(
+            int((manifest.end_time - manifest.start_time).total_seconds() * 1000),
+            manifest.checkpoint_interval_s,
+        )
     ]
     for stream, rows in grouped.items():
         rows.sort(key=lambda row: row.scheduled_at)
+        bounded_validation = isinstance(
+            validation_permit, AdapterValidationPermit
+        ) or (
+            isinstance(validation_permit, WorkloadCollectionPermit)
+            and validation_permit.profile == "bounded_validation"
+        )
         expected_times = (
-            full_expected_times[: len(rows)]
-            if validation_permit is not None
+            [validation_permit.execution_start_time]
+            if isinstance(validation_permit, WorkloadCollectionPermit)
+            and validation_permit.profile == "bounded_validation"
+            else full_expected_times[: len(rows)]
+            if isinstance(validation_permit, AdapterValidationPermit)
             else full_expected_times
         )
         if not rows or [row.scheduled_at for row in rows] != expected_times:
@@ -468,7 +855,7 @@ def _validate_checkpoints(
                 or current.last_synced_sequence < previous.last_synced_sequence
             ):
                 raise ValueError(f"{stream}: producer sequence reset")
-        if validation_permit is None:
+        if not bounded_validation:
             final = rows[-1]
             source = source_by_stream[stream]
             identity = (
@@ -579,6 +966,11 @@ def _validate_and_build_events(
                 and manifest.start_time <= _ns_datetime(event.sink_ns) < manifest.end_time
             ):
                 raise ValueError(f"{event.local_id}: source timestamps fall outside the run")
+            if (
+                _ns_datetime(event.event_ns) < operation.offered_at_utc
+                or _ns_datetime(event.sink_ns) < operation.offered_at_utc
+            ):
+                raise ValueError(f"{event.local_id}: source event predates its offered operation")
             if event.source_file_size is not None and event.source_file_size != fixture.size_bytes:
                 raise ValueError(f"{event.local_id}: source and fixture file sizes differ")
             if event.offset != operation.offset or event.requested_count != operation.count:
@@ -701,7 +1093,7 @@ def _build_counters(
                 {
                     "volume_id": manifest.volume_id,
                     "start": hour,
-                    "end": hour + timedelta(hours=1),
+                    "end": min(hour + timedelta(hours=1), manifest.end_time),
                     "reason": "approved_collection_exclusion",
                     "loss_fraction": dropped_count / offered_count,
                 }
@@ -734,6 +1126,11 @@ def import_dataset(
     fixture_catalog_path: Path,
     checkpoints_path: Path,
     out_dir: Path,
+    execution_plan_path: Path | None = None,
+    workload_config_path: Path | None = None,
+    truth_binding_path: Path | None = None,
+    workload_permit_path: Path | None = None,
+    workload_evidence_path: Path | None = None,
     validation_permit_path: Path | None = None,
     validation_permit_reference_time: datetime | None = None,
     format: str = "parquet",
@@ -749,10 +1146,122 @@ def import_dataset(
         "fixture_catalog": Path(fixture_catalog_path),
         "checkpoints": Path(checkpoints_path),
     }
+    if execution_plan_path is not None:
+        inputs["execution_plan"] = Path(execution_plan_path)
+    if workload_config_path is not None:
+        inputs["workload_config"] = Path(workload_config_path)
+    if truth_binding_path is not None:
+        inputs["truth_binding"] = Path(truth_binding_path)
+    if workload_permit_path is not None:
+        inputs["workload_permit"] = Path(workload_permit_path)
+    if workload_evidence_path is not None:
+        inputs["workload_evidence"] = Path(workload_evidence_path)
     input_bytes = {name: read_bytes(path) for name, path in inputs.items()}
     input_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in input_bytes.items()}
-    manifest = parse_json(input_bytes["run_manifest"], inputs["run_manifest"], CollectionManifest)
+    manifest = parse_collection_manifest(input_bytes["run_manifest"])
     catalog = parse_json(input_bytes["fixture_catalog"], inputs["fixture_catalog"], FixtureCatalog)
+    execution_plan = None
+    workload_config = None
+    truth_binding = None
+    workload_permit = None
+    if isinstance(manifest, WorkloadCollectionManifest):
+        if (
+            manifest.semantic_view_id != SEMANTIC_VIEW_ID
+            or manifest.semantic_view_sha256 != SEMANTIC_VIEW_SHA256
+        ):
+            raise ValueError(
+                "workload manifest semantic view differs from read-demand-v1"
+            )
+        if execution_plan_path is None:
+            raise ValueError("workload manifest v3 requires its execution plan")
+        execution_plan = parse_json(
+            input_bytes["execution_plan"],
+            inputs["execution_plan"],
+            WorkloadExecutionPlan,
+        )
+        if execution_plan_sha256(execution_plan) != manifest.execution_plan_sha256:
+            raise ValueError("execution plan checksum mismatch")
+        if execution_plan.fixture_catalog_sha256 != manifest.fixture_catalog_sha256:
+            raise ValueError("execution plan catalog checksum mismatch")
+        if execution_plan.workload_config_sha256 != manifest.execution_config_sha256:
+            raise ValueError("execution plan config checksum mismatch")
+        if (
+            execution_plan.semantic_view_id != manifest.semantic_view_id
+            or execution_plan.semantic_view_sha256 != manifest.semantic_view_sha256
+        ):
+            raise ValueError("execution plan semantic view mismatch")
+        if any(
+            (
+                execution_plan.operation_schedule_tolerance_s
+                != manifest.operation_schedule_tolerance_s,
+                execution_plan.seed != manifest.seed,
+                execution_plan.untagged_correlation_window_s
+                != manifest.untagged_correlation_window_s,
+                (execution_plan.range_bytes,) != manifest.range_bytes,
+                execution_plan.range_offsets != manifest.range_offsets,
+                execution_plan.planned_operation_count
+                != manifest.planned_operation_count,
+                execution_plan.duration_ms
+                != int(
+                    (manifest.end_time - manifest.start_time).total_seconds() * 1000
+                ),
+            )
+        ):
+            raise ValueError("execution plan controls differ from the run manifest")
+        workload_inputs = (
+            workload_config_path,
+            truth_binding_path,
+            workload_permit_path,
+            workload_evidence_path,
+        )
+        if any(path is not None for path in workload_inputs):
+            if not all(path is not None for path in workload_inputs):
+                raise ValueError(
+                    "workload live import requires config, truth binding, and permit"
+                )
+            workload_config = parse_json(
+                input_bytes["workload_config"],
+                inputs["workload_config"],
+                WorkloadConfig,
+            )
+            truth_binding = parse_json(
+                input_bytes["truth_binding"],
+                inputs["truth_binding"],
+                WorkloadTruthBinding,
+            )
+            workload_permit = _workload_collection_permit(
+                inputs["workload_permit"],
+                input_bytes["workload_permit"],
+                manifest,
+                input_bytes["run_manifest"],
+                workload_config,
+                input_bytes["workload_config"],
+                execution_plan,
+                input_bytes["execution_plan"],
+                truth_binding,
+                input_bytes["truth_binding"],
+                catalog,
+                input_bytes["fixture_catalog"],
+                evaluated_at=validation_permit_reference_time,
+            )
+    elif execution_plan_path is not None:
+        raise ValueError("manifest v2 must not receive a workload execution plan")
+    elif any(
+        path is not None
+        for path in (
+            workload_config_path,
+            truth_binding_path,
+            workload_permit_path,
+            workload_evidence_path,
+        )
+    ):
+        raise ValueError("manifest v2 must not receive workload-v3 permit inputs")
+    if validation_permit_path is not None and isinstance(
+        manifest, WorkloadCollectionManifest
+    ):
+        raise ValueError(
+            "workload manifest v3 must not receive a v2 adapter validation permit"
+        )
     permit = (
         _validation_permit(
             Path(validation_permit_path),
@@ -780,9 +1289,33 @@ def import_dataset(
         manifest,
         fixtures,
         permit.operation_ids if permit is not None else None,
+        execution_plan,
+        workload_permit,
     )
     observed = _validate_observed(observed_rows, manifest, offered)
-    start_baselines = _start_baselines(checkpoints, manifest)
+    if workload_permit is not None:
+        workload_evidence = parse_jsonl(
+            input_bytes["workload_evidence"],
+            inputs["workload_evidence"],
+            WorkloadEvidenceBinding,
+        )
+        _validate_workload_evidence(
+            workload_evidence,
+            workload_permit,
+            input_hashes["workload_permit"],
+            execution_plan,
+            offered,
+            observed,
+            inputs["event_sources"].parent,
+        )
+    start_baselines = _start_baselines(
+        checkpoints,
+        manifest,
+        workload_permit.execution_start_time
+        if workload_permit is not None
+        and workload_permit.profile == "bounded_validation"
+        else None,
+    )
     streams, source_hashes, source_sizes = _load_raw_events(
         inputs["event_sources"],
         sources,
@@ -796,12 +1329,40 @@ def import_dataset(
         source_hashes,
         source_sizes,
         start_baselines,
-        permit,
+        workload_permit or permit,
     )
     output_events, exclusions, event_report = _validate_and_build_events(
         streams, observed, offered, fixtures, manifest
     )
     counters, known_gaps = _build_counters(manifest, offered, observed)
+    source_evidence_mode = (
+        "controlled_demand"
+        if workload_permit is not None
+        else manifest.evidence_mode
+        if isinstance(manifest, WorkloadCollectionManifest)
+        else "controlled_demand"
+    )
+    workload_lineage = (
+        {
+            "execution_plan_sha256": workload_permit.execution_plan_sha256,
+            "workload_config_sha256": workload_permit.workload_config_sha256,
+            "truth_binding_sha256": workload_permit.truth_binding_sha256,
+            "workload_truth_sha256": workload_permit.workload_truth_sha256,
+            "workload_permit_sha256": input_hashes["workload_permit"],
+            "workload_evidence_sha256": input_hashes["workload_evidence"],
+            "operation_indexes_json": canonical_json(
+                list(workload_permit.operation_indexes)
+            ),
+            "intent_ids_json": canonical_json(
+                list(workload_permit.intent_ids)
+            ),
+            "operation_ids_json": canonical_json(
+                list(workload_permit.operation_ids)
+            ),
+        }
+        if workload_permit is not None
+        else {}
+    )
     config = {
         "adapter": "pcache-chimera-import",
         "adapter_version": _version(),
@@ -809,11 +1370,12 @@ def import_dataset(
         "run_id": manifest.run_id,
         "chimera_image_sha256": manifest.software.chimera_image_sha256,
         "event_schema_sha256": manifest.event_schema_sha256,
-        "input_sha256": input_hashes,
-        "event_source_sha256": dict(sorted(source_hashes.items())),
         "semantic_view_id": SEMANTIC_VIEW_ID,
         "semantic_view_sha256": SEMANTIC_VIEW_SHA256,
-        "source_evidence_mode": "controlled_demand",
+        "source_evidence_mode": source_evidence_mode,
+        "input_sha256": input_hashes,
+        "event_source_sha256": dict(sorted(source_hashes.items())),
+        **workload_lineage,
     }
     config_sha = hashlib.sha256(canonical_json(config).encode()).hexdigest()
     out = Path(out_dir).absolute()
@@ -855,6 +1417,13 @@ def import_dataset(
             "input_sha256": input_hashes,
             "event_source_sha256": dict(sorted(source_hashes.items())),
         }
+        if workload_lineage:
+            report.update(
+                {
+                    **workload_lineage,
+                    "source_evidence_mode": source_evidence_mode,
+                }
+            )
         (stage / "report").mkdir()
         (stage / "report/import.json").write_text(canonical_json(report) + "\n")
         register("report/import.json")
@@ -883,8 +1452,9 @@ def import_dataset(
             "event_schema_sha256": manifest.event_schema_sha256,
             "semantic_view_id": SEMANTIC_VIEW_ID,
             "semantic_view_sha256": SEMANTIC_VIEW_SHA256,
-            "source_evidence_mode": "controlled_demand",
+            "source_evidence_mode": source_evidence_mode,
             **{f"{name}_sha256": digest for name, digest in input_hashes.items()},
+            **workload_lineage,
         }
         counts = {
             "events": len(output_events),

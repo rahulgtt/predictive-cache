@@ -22,16 +22,36 @@ from predictive_cache.collection.models import (
     CollectionManifest,
     FixtureCatalog,
     FixtureEntry,
+    ObservedEvent,
+    OfferedOperation,
     RetentionPolicy,
     SoftwareVersions,
     StopRules,
+    WorkloadCollectionManifest,
+    WorkloadEvidenceBinding,
 )
 from predictive_cache.collection.provenance import (
+    APPROVED_ADAPTER_WRAPPER_SHA256,
+    APPROVED_CLEANER_WRAPPER_SHA256,
     APPROVED_COLLECTOR_SHA256,
+    APPROVED_PROVIDER_INTERPRETER_SHA256,
     APPROVED_PROVIDER_PACKAGE_SHA256,
     APPROVED_PROVIDER_SHA256,
+    APPROVED_VALIDATED_CODE_HEAD_SHA256,
+    APPROVED_VALIDATED_MERGE_COMMIT_SHA256,
+    APPROVED_VALIDATED_TREE_SHA256,
     APPROVED_VALIDATION_RUNBOOK_SHA256,
     APPROVED_VALIDATOR_SHA256,
+)
+from predictive_cache.collection.workload import (
+    WorkloadConfig,
+    bind_workload_truth,
+    build_default_workload,
+    build_workload_collection_permit,
+    execution_plan_sha256,
+    fixture_catalog_sha256,
+    run_bound_operation_id,
+    workload_config_sha256,
 )
 from predictive_cache.datagen.io import canonical_json
 from predictive_cache.prep.clean.io import read_rows
@@ -47,6 +67,7 @@ from predictive_cache.sources.chimera.importer import (
     _validate_catalog,
     _validate_ledger,
     _validation_permit,
+    _workload_collection_permit,
     import_dataset,
 )
 
@@ -464,6 +485,393 @@ def _rows(root: Path, manifest: dict, prefix: str) -> list[dict]:
     ]
 
 
+def _workload_contract(tmp_path: Path, *, profile: str = "bounded_validation"):
+    tmp_path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    fixture_catalog = FixtureCatalog(
+        fixtures=tuple(
+            FixtureEntry(
+                fixture_id=f"fixture-{index:02d}",
+                volume_id=VOLUME_ID,
+                file_id=hashlib.sha256(f"workload-file-{index}".encode()).hexdigest(),
+                dir_id=f"dir-{index:02d}",
+                export_id=EXPORT_ID,
+                export_name=EXPORT_NAME,
+                export_path=f"/{EXPORT_NAME}",
+                relative_path=f"fixtures/workload-{index:02d}.bin",
+                size_bytes=65536,
+                sha256=hashlib.sha256(
+                    f"workload-content-{index}".encode()
+                ).hexdigest(),
+            )
+            for index in range(60)
+        )
+    )
+    config = WorkloadConfig()
+    plan, truth = build_default_workload(
+        fixture_catalog,
+        config,
+        semantic_view_id=SEMANTIC_VIEW_ID,
+        semantic_view_sha256=SEMANTIC_VIEW_SHA256,
+    )
+    truth_binding = bind_workload_truth(plan, truth)
+    run_id = "workload-import-run"
+    manifest = WorkloadCollectionManifest(
+        run_id=run_id,
+        run_ref=hashlib.sha256(run_id.encode()).hexdigest()[:32],
+        cluster_id="cluster-1",
+        namespace="nasuni",
+        volume_id=VOLUME_ID,
+        export_id=EXPORT_ID,
+        cluster_manifest_sha256="06" * 32,
+        fixture_catalog_sha256=fixture_catalog_sha256(fixture_catalog),
+        event_schema_sha256="07" * 32,
+        budget_evidence_sha256="0a" * 32,
+        execution_config_sha256=workload_config_sha256(config),
+        execution_plan_sha256=execution_plan_sha256(plan),
+        semantic_view_id=SEMANTIC_VIEW_ID,
+        semantic_view_sha256=SEMANTIC_VIEW_SHA256,
+        seed=config.seed,
+        start_time=START,
+        end_time=START + timedelta(milliseconds=config.duration_ms),
+        planned_operation_count=len(plan.intents),
+        range_bytes=(config.range_bytes,),
+        range_offsets=config.range_offsets,
+        untagged_correlation_window_s=config.untagged_correlation_window_s,
+        client_id="workload-client",
+        software=SoftwareVersions(
+            predictive_cache_revision=APPROVED_VALIDATED_MERGE_COMMIT_SHA256,
+            chimera_image="chimera:test",
+            chimera_image_sha256="08" * 32,
+            chimera_revision="b" * 40,
+            cufs_image="cufs:test",
+            cufs_image_sha256="09" * 32,
+            cufs_revision="c" * 40,
+            collector_schema_version="v1",
+            harness_version=2,
+        ),
+        stop_rules=StopRules(latency_guardrail_ms=5000),
+        retention=RetentionPolicy(
+            owner="owner",
+            cleanup_owner="owner",
+            cleanup_action="delete",
+        ),
+    )
+    permit = build_workload_collection_permit(
+        manifest,
+        config,
+        plan,
+        truth,
+        truth_binding,
+        fixture_catalog,
+        permit_id="11111111-1111-4111-8111-111111111111",
+        profile=profile,
+        expires_at=START + timedelta(days=1),
+        validated_code_head_sha256=APPROVED_VALIDATED_CODE_HEAD_SHA256,
+        validated_merge_commit_sha256=APPROVED_VALIDATED_MERGE_COMMIT_SHA256,
+        validated_tree_sha256=APPROVED_VALIDATED_TREE_SHA256,
+        provider_package_sha256=APPROVED_PROVIDER_PACKAGE_SHA256,
+        provider_sha256=APPROVED_PROVIDER_SHA256,
+        collector_sha256=APPROVED_COLLECTOR_SHA256,
+        validator_sha256=APPROVED_VALIDATOR_SHA256,
+        runbook_sha256=APPROVED_VALIDATION_RUNBOOK_SHA256,
+        adapter_wrapper_sha256=APPROVED_ADAPTER_WRAPPER_SHA256,
+        cleaner_wrapper_sha256=APPROVED_CLEANER_WRAPPER_SHA256,
+        interpreter_path="/usr/bin/python3.12",
+        interpreter_sha256=APPROVED_PROVIDER_INTERPRETER_SHA256,
+        execution_start_time=(
+            START + timedelta(minutes=10)
+            if profile == "bounded_validation"
+            else START
+        ),
+        validation_operations=3 if profile == "bounded_validation" else None,
+        bounded_validation_attestation_sha256=(
+            "1" * 64 if profile == "full_collection" else None
+        ),
+    )
+    paths = {
+        "manifest": tmp_path / "workload-manifest.json",
+        "config": tmp_path / "workload-config.json",
+        "plan": tmp_path / "execution-plan.json",
+        "truth_binding": tmp_path / "truth-binding.json",
+        "catalog": tmp_path / "workload-catalog.json",
+        "permit": tmp_path / "workload-permit.json",
+    }
+    for path, model in (
+        (paths["manifest"], manifest),
+        (paths["config"], config),
+        (paths["plan"], plan),
+        (paths["truth_binding"], truth_binding),
+        (paths["catalog"], fixture_catalog),
+        (paths["permit"], permit),
+    ):
+        _json(path, model.model_dump(mode="json"))
+    return manifest, config, plan, truth_binding, fixture_catalog, permit, paths
+
+
+def _workload_rows(manifest, plan, catalog, permit=None):
+    fixtures = {fixture.fixture_id: fixture for fixture in catalog.fixtures}
+    indexes = (
+        permit.operation_indexes
+        if permit is not None
+        else tuple(range(len(plan.intents)))
+    )
+    relative_ms = (
+        permit.execution_relative_ms
+        if permit is not None
+        else tuple(plan.intents[index].relative_ms for index in indexes)
+    )
+    start = permit.execution_start_time if permit is not None else manifest.start_time
+    rows = []
+    for selected_position, index in enumerate(indexes):
+        intent = plan.intents[index]
+        fixture = fixtures[intent.fixture_id]
+        rows.append(
+            OfferedOperation(
+                operation_id=run_bound_operation_id(
+                    manifest.run_id,
+                    manifest.execution_plan_sha256,
+                    intent.intent_id,
+                ),
+                operation_index=index,
+                run_id=manifest.run_id,
+                fixture_id=fixture.fixture_id,
+                offered_at_utc=start
+                + timedelta(milliseconds=relative_ms[selected_position]),
+                offered_at_monotonic_ns=selected_position + 1,
+                volume_id=fixture.volume_id,
+                file_id=fixture.file_id,
+                dir_id=fixture.dir_id,
+                export_id=fixture.export_id,
+                relative_path=fixture.relative_path,
+                file_size=fixture.size_bytes,
+                offset=intent.offset,
+                count=intent.count,
+                expected_outcome="ok",
+                client_id=manifest.client_id,
+                tag="",
+                timing_mode="wallclock",
+                origin="synthetic",
+            )
+        )
+    return rows
+
+
+def _load_workload_permit(
+    manifest,
+    config,
+    plan,
+    truth_binding,
+    catalog,
+    paths,
+):
+    return _workload_collection_permit(
+        paths["permit"],
+        paths["permit"].read_bytes(),
+        manifest,
+        paths["manifest"].read_bytes(),
+        config,
+        paths["config"].read_bytes(),
+        plan,
+        paths["plan"].read_bytes(),
+        truth_binding,
+        paths["truth_binding"].read_bytes(),
+        catalog,
+        paths["catalog"].read_bytes(),
+        evaluated_at=START,
+    )
+
+
+def _workload_import_fixture(tmp_path: Path):
+    (
+        manifest,
+        config,
+        plan,
+        truth_binding,
+        catalog,
+        permit,
+        paths,
+    ) = _workload_contract(tmp_path)
+    rows = _workload_rows(manifest, plan, catalog, permit)
+    paths.update(
+        {
+            "event_sources": tmp_path / "event-sources.json",
+            "observed": tmp_path / "observed.jsonl",
+            "offered_ledger": tmp_path / "offered.jsonl",
+            "checkpoints": tmp_path / "checkpoints.jsonl",
+            "raw": tmp_path / f"collector/{POD_UID}/{EPOCH}/events.jsonl",
+            "workload_evidence": tmp_path / "workload-evidence.jsonl",
+        }
+    )
+    paths["raw"].parent.mkdir(parents=True)
+    _jsonl(
+        paths["offered_ledger"],
+        [row.model_dump(mode="json") for row in rows],
+    )
+    baseline = 63
+    raw_events = []
+    observed = []
+    for position, operation in enumerate(rows, start=1):
+        event_time = operation.offered_at_utc + timedelta(seconds=1)
+        sink_time = event_time + timedelta(milliseconds=10)
+        raw = _raw_event(
+            position,
+            operation.operation_id,
+            sequence=baseline + position,
+        )
+        raw.update(
+            {
+                "event_time_ns": str(int(event_time.timestamp() * 1_000_000_000)),
+                "sink_time_ns": str(int(sink_time.timestamp() * 1_000_000_000)),
+                "volume_id": operation.volume_id,
+                "file_id": operation.file_id,
+                "requested_offset": str(operation.offset),
+                "requested_count": operation.count,
+                "returned_bytes": operation.count,
+                "file_size": str(operation.file_size),
+            }
+        )
+        raw_events.append(raw)
+        observed.append(
+            {
+                "observed_event_version": 2,
+                "operation_id": operation.operation_id,
+                "event_id": raw["local_id"],
+                "pod_uid": POD_UID,
+                "producer_epoch": EPOCH,
+                "producer_sequence": baseline + position,
+                "server_operation_id": raw["operation_id"],
+                "sink_time_ns": int(raw["sink_time_ns"]),
+                "volume_id": operation.volume_id,
+                "file_id": operation.file_id,
+                "offset": operation.offset,
+                "count": operation.count,
+                "durable_at": operation.offered_at_utc + timedelta(seconds=2),
+                "status": "durable",
+                "exclusion_reason": None,
+                "tag": None,
+            }
+        )
+    _jsonl(paths["raw"], raw_events)
+    _jsonl(paths["observed"], observed)
+    raw_hash = hashlib.sha256(paths["raw"].read_bytes()).hexdigest()
+    relative_raw = paths["raw"].relative_to(tmp_path).as_posix()
+    permit_sha = hashlib.sha256(paths["permit"].read_bytes()).hexdigest()
+    evidence_rows = []
+    raw_lines = paths["raw"].read_bytes().splitlines()
+    for selected_position, (operation, raw, observation) in enumerate(
+        zip(rows, raw_events, observed, strict=True)
+    ):
+        observation_model = ObservedEvent.model_validate(observation)
+        evidence_rows.append(
+            WorkloadEvidenceBinding(
+                run_id=manifest.run_id,
+                permit_sha256=permit_sha,
+                execution_plan_sha256=permit.execution_plan_sha256,
+                operation_index=operation.operation_index,
+                intent_id=permit.intent_ids[selected_position],
+                operation_id=operation.operation_id,
+                role=permit.roles[selected_position],
+                original_relative_ms=permit.original_relative_ms[
+                    selected_position
+                ],
+                scheduled_at_utc=permit.execution_start_time
+                + timedelta(
+                    milliseconds=permit.execution_relative_ms[
+                        selected_position
+                    ]
+                ),
+                offered_at_utc=operation.offered_at_utc,
+                event_id=raw["local_id"],
+                producer_epoch=EPOCH,
+                producer_sequence=baseline + selected_position + 1,
+                raw_jsonl_path=relative_raw,
+                raw_jsonl_sha256=raw_hash,
+                raw_line_number=selected_position + 1,
+                raw_record_sha256=hashlib.sha256(
+                    raw_lines[selected_position]
+                ).hexdigest(),
+                observed_sha256=hashlib.sha256(
+                    (
+                        canonical_json(
+                            observation_model.model_dump(mode="json")
+                        )
+                        + "\n"
+                    ).encode()
+                ).hexdigest(),
+            )
+        )
+    _jsonl(
+        paths["workload_evidence"],
+        [row.model_dump(mode="json") for row in evidence_rows],
+    )
+    _json(
+        paths["event_sources"],
+        {
+            "collector_file_manifest_version": 1,
+            "run_id": manifest.run_id,
+            "files": [
+                {
+                    "raw_jsonl_path": relative_raw,
+                    "sha256": raw_hash,
+                    "pod_name": "collector-0",
+                    "pod_uid": POD_UID,
+                    "node_name": "node-1",
+                    "producer_epoch": EPOCH,
+                }
+            ],
+        },
+    )
+    checkpoint_time = permit.execution_start_time
+    _jsonl(
+        paths["checkpoints"],
+        [
+            {
+                "checkpoint_version": 1,
+                "run_id": manifest.run_id,
+                "scheduled_at": checkpoint_time,
+                "captured_at": checkpoint_time,
+                "pod_name": "collector-0",
+                "pod_uid": POD_UID,
+                "node_name": "node-1",
+                "producer_epoch": EPOCH,
+                "restart_count": 0,
+                "restart_explained": False,
+                "last_enqueued_sequence": baseline,
+                "last_synced_sequence": baseline,
+                "synced_count": baseline,
+                "queue_depth": 0,
+                "worker_in_flight": 0,
+                "delivery_clean": 1,
+                "barrier_ready": 1,
+                "drops": {
+                    "queue": 0,
+                    "encode": 0,
+                    "sink": 0,
+                    "rollback": 0,
+                    "rotation": 0,
+                },
+                "active_jsonl": {
+                    "path": relative_raw,
+                    "size_bytes": paths["raw"].stat().st_size,
+                    "sha256": raw_hash,
+                },
+                "backup_jsonl": None,
+                "collector_sink_healthy": True,
+                "storage_healthy": True,
+                "cluster_healthy": True,
+                "volume_healthy": True,
+                "export_healthy": True,
+                "parse_errors": 0,
+                "identity_mismatches": 0,
+                "checksum_mismatches": 0,
+                "foreground_read_errors": 0,
+                "max_observed_latency_ms": 1.0,
+            }
+        ],
+    )
+    return manifest, permit, paths
+
+
 def test_empty_tag_requires_canonical_null_observed_representation(tmp_path):
     paths = _fixture(tmp_path)
     rows = [json.loads(line) for line in paths["observed"].read_text().splitlines()]
@@ -826,6 +1234,217 @@ def test_nonzero_baseline_rejects_checkpoint_rollback_and_epoch_mismatch(tmp_pat
         _import(paths, tmp_path / "epoch-out")
 
 
+def test_v3_bounded_ledger_accepts_sparse_permit_selection_in_plan_order(tmp_path: Path):
+    (
+        manifest,
+        config,
+        plan,
+        truth_binding,
+        catalog,
+        _permit,
+        paths,
+    ) = _workload_contract(tmp_path)
+    permit = _load_workload_permit(
+        manifest,
+        config,
+        plan,
+        truth_binding,
+        catalog,
+        paths,
+    )
+    rows = _workload_rows(manifest, plan, catalog, permit)
+    fixtures = _validate_catalog(catalog, manifest)
+
+    validated = _validate_ledger(
+        rows,
+        manifest,
+        fixtures,
+        execution_plan=plan,
+        workload_permit=permit,
+    )
+
+    assert permit.operation_indexes == (3, 43, 50)
+    assert tuple(row.operation_index for row in validated.values()) == (3, 43, 50)
+    assert tuple(validated) == permit.operation_ids
+
+
+@pytest.mark.parametrize("mutation", ["reordered", "missing", "extra"])
+def test_v3_bounded_ledger_requires_exact_permit_rows(tmp_path: Path, mutation: str):
+    manifest, config, plan, truth_binding, catalog, _permit, paths = (
+        _workload_contract(tmp_path)
+    )
+    permit = _load_workload_permit(
+        manifest,
+        config,
+        plan,
+        truth_binding,
+        catalog,
+        paths,
+    )
+    rows = _workload_rows(manifest, plan, catalog, permit)
+    if mutation == "reordered":
+        rows = [rows[1], rows[0], rows[2]]
+    elif mutation == "missing":
+        rows = rows[:-1]
+    else:
+        rows = [*rows, rows[-1].model_copy(update={"operation_id": "f" * 64})]
+
+    with pytest.raises(ValueError):
+        _validate_ledger(
+            rows,
+            manifest,
+            _validate_catalog(catalog, manifest),
+            execution_plan=plan,
+            workload_permit=permit,
+        )
+
+
+def test_v3_bounded_ledger_rejects_execution_schedule_tampering(tmp_path: Path):
+    manifest, config, plan, truth_binding, catalog, _permit, paths = (
+        _workload_contract(tmp_path)
+    )
+    permit = _load_workload_permit(
+        manifest,
+        config,
+        plan,
+        truth_binding,
+        catalog,
+        paths,
+    )
+    rows = _workload_rows(manifest, plan, catalog, permit)
+    rows[1] = rows[1].model_copy(
+        update={
+            "offered_at_utc": rows[1].offered_at_utc
+            + timedelta(seconds=manifest.operation_schedule_tolerance_s + 1)
+        }
+    )
+
+    with pytest.raises(ValueError, match="execution plan"):
+        _validate_ledger(
+            rows,
+            manifest,
+            _validate_catalog(catalog, manifest),
+            execution_plan=plan,
+            workload_permit=permit,
+        )
+
+
+@pytest.mark.parametrize(
+    ("artifact", "field", "value", "message"),
+    [
+        ("permit", "execution_plan_sha256", "0" * 64, "canonical binding"),
+        ("permit", "semantic_view_sha256", "0" * 64, "canonical binding"),
+        ("truth_binding", "workload_truth_sha256", "0" * 64, "canonical binding"),
+        ("config", "min_offer_gap_ms", 21_000, "canonical binding"),
+    ],
+)
+def test_v3_permit_rejects_artifact_and_semantic_hash_tampering(
+    tmp_path: Path,
+    artifact: str,
+    field: str,
+    value,
+    message: str,
+):
+    manifest, config, plan, truth_binding, catalog, _permit, paths = (
+        _workload_contract(tmp_path)
+    )
+    document = json.loads(paths[artifact].read_text())
+    document[field] = value
+    _json(paths[artifact], document)
+
+    with pytest.raises(ValueError, match=message):
+        _load_workload_permit(
+            manifest,
+            config,
+            plan,
+            truth_binding,
+            catalog,
+            paths,
+        )
+
+
+def test_v3_offline_full_plan_ledger_remains_unchanged(tmp_path: Path):
+    manifest, _config, plan, _binding, catalog, _permit, _paths = (
+        _workload_contract(tmp_path)
+    )
+    rows = _workload_rows(manifest, plan, catalog)
+
+    validated = _validate_ledger(
+        rows,
+        manifest,
+        _validate_catalog(catalog, manifest),
+        execution_plan=plan,
+    )
+
+    assert tuple(row.operation_index for row in validated.values()) == tuple(
+        range(len(plan.intents))
+    )
+
+
+def test_v3_live_import_and_clean_preserve_lineage_but_exclude_synthetic(
+    tmp_path: Path,
+):
+    manifest, permit, paths = _workload_import_fixture(tmp_path / "evidence")
+    imported = tmp_path / "imported"
+    result = import_dataset(
+        event_sources_path=paths["event_sources"],
+        observed_path=paths["observed"],
+        run_manifest_path=paths["manifest"],
+        offered_ledger_path=paths["offered_ledger"],
+        fixture_catalog_path=paths["catalog"],
+        checkpoints_path=paths["checkpoints"],
+        execution_plan_path=paths["plan"],
+        workload_config_path=paths["config"],
+        truth_binding_path=paths["truth_binding"],
+        workload_permit_path=paths["permit"],
+        workload_evidence_path=paths["workload_evidence"],
+        validation_permit_reference_time=START,
+        out_dir=imported,
+        format="jsonl",
+    )
+    runtime = result.generator.runtime
+    expected_lineage = {
+        "execution_plan_sha256": permit.execution_plan_sha256,
+        "workload_config_sha256": permit.workload_config_sha256,
+        "truth_binding_sha256": permit.truth_binding_sha256,
+        "workload_truth_sha256": permit.workload_truth_sha256,
+        "workload_permit_sha256": hashlib.sha256(
+            paths["permit"].read_bytes()
+        ).hexdigest(),
+        "workload_evidence_sha256": hashlib.sha256(
+            paths["workload_evidence"].read_bytes()
+        ).hexdigest(),
+        "operation_indexes_json": canonical_json(
+            list(permit.operation_indexes)
+        ),
+        "intent_ids_json": canonical_json(list(permit.intent_ids)),
+        "operation_ids_json": canonical_json(list(permit.operation_ids)),
+    }
+    assert runtime["source_evidence_mode"] == "controlled_demand"
+    assert {key: runtime[key] for key in expected_lineage} == expected_lineage
+    report = json.loads((imported / "report/import.json").read_text())
+    assert report["source_evidence_mode"] == "controlled_demand"
+    assert {key: report[key] for key in expected_lineage} == expected_lineage
+    assert result.period.start == manifest.start_time
+
+    cleaned = tmp_path / "cleaned"
+    clean_manifest = run_clean(
+        imported,
+        CleanConfig(),
+        cleaned,
+        format="jsonl",
+        semantic_view=SEMANTIC_VIEW_ID,
+    )
+    assert clean_manifest["counts"]["kept_events"] == 0
+    assert clean_manifest["counts"]["excluded_by_reason"] == {
+        "origin_synthetic": 3
+    }
+    assert clean_manifest["source_evidence_mode"] == "controlled_demand"
+    assert {
+        key: clean_manifest[key] for key in expected_lineage
+    } == expected_lineage
+
+
 def _full_validation_contract(tmp_path: Path):
     fixtures = tuple(
         FixtureEntry(
@@ -1087,3 +1706,53 @@ def test_imported_read_events_replay_without_becoming_demand(tmp_path: Path, for
     assert stats["consumer_errors"] == stats["dedupe_capacity_evictions"] == 0
     assert stats["tracker_failed"] is False
     assert updates == []
+
+
+def test_cli_passes_workload_v3_bindings_explicitly(tmp_path: Path, monkeypatch):
+    captured = {}
+
+    def fake_import(**kwargs):
+        captured.update(kwargs)
+        return type("Imported", (), {"dataset_id": "workload-validation"})()
+
+    monkeypatch.setattr("predictive_cache.sources.chimera.cli.import_dataset", fake_import)
+    config = tmp_path / "workload-config.json"
+    plan = tmp_path / "execution-plan.json"
+    binding = tmp_path / "truth-binding.json"
+    permit = tmp_path / "workload-permit.json"
+    evidence = tmp_path / "workload-evidence.jsonl"
+    arguments = [
+        "--event-sources",
+        str(tmp_path / "sources.json"),
+        "--observed",
+        str(tmp_path / "observed.jsonl"),
+        "--run-manifest",
+        str(tmp_path / "manifest.json"),
+        "--offered-ledger",
+        str(tmp_path / "offered.jsonl"),
+        "--fixture-catalog",
+        str(tmp_path / "catalog.json"),
+        "--checkpoints",
+        str(tmp_path / "checkpoints.jsonl"),
+        "--execution-plan",
+        str(plan),
+        "--workload-config",
+        str(config),
+        "--truth-binding",
+        str(binding),
+        "--workload-permit",
+        str(permit),
+        "--workload-evidence",
+        str(evidence),
+        "--out",
+        str(tmp_path / "out"),
+    ]
+
+    result = CliRunner().invoke(main, arguments)
+
+    assert result.exit_code == 0, result.output
+    assert captured["execution_plan_path"] == plan
+    assert captured["workload_config_path"] == config
+    assert captured["truth_binding_path"] == binding
+    assert captured["workload_permit_path"] == permit
+    assert captured["workload_evidence_path"] == evidence

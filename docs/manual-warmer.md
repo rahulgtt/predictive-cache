@@ -6,6 +6,10 @@ unverified.** One separately authorized path-mode NFSv4.1 read returned
 correlation, cache residency or performance. Any further live pilot requires
 separate owner approval.
 
+The [datagen-to-Warmer MVP](experiments/datagen-to-warmer-mvp.md) stops at
+Dispatcher `skipped/dry_run` results. Its separately listed one-READ gate is a
+future approval checklist, not permission to execute handle-mode NFS I/O.
+
 The experimental reader is independent of the Controller and any model. A
 completed NFS read would not prove that data became or remained resident in
 CUFS, or that foreground performance improved. Do not use it in production or

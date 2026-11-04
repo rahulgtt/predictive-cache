@@ -528,12 +528,178 @@ guarantee that, and this requirement is recorded for the protocol lane
 
 - **Ingest queue:** bounded (`ingest.queue_max`, default 200 000 events).
   When full, new events are dropped and counted (`dropped_overflow`).
-- **Live event source:** the CUFS hook, OTel or the instrumented client is
-  owned by the protocol lane (§15).
+- **Live event source:** Chimera `nfs4_read_v2` through the read shipper
+  (§8.1.1). Other sources (CUFS hook, OTel) are not planned for the MVP.
+
+#### 8.1.1 Live Chimera transport (`read-demand-v1`, #59)
+
+The reviewed Chimera patch (`chimera/chimera-nfs4-read-events-v2.patch`)
+has **no network push**. Each Chimera pod's event worker appends bounded
+`nfs4_read_v2` JSON lines to `nfs4_read_event_path`. This is an owner-only
+`0600` regular file that rotates at 64 MiB to one `.1` backup. Durability
+is published only as metrics:
+
+- `chimera_nfs4_read_event_producer_info{producer_epoch}`;
+- `chimera_nfs4_read_event_state{state=last_synced_sequence|queue_depth|worker_in_flight|delivery_clean|barrier_ready}`;
+- `chimera_nfs4_read_events_dropped{stage=queue|encode|sink|rollback|rotation}`.
+
+A visible line is not proof of durability. Live ingest is therefore **pull
+at the pod, push to the Controller**:
+
+```text
+Chimera pod ┌ event worker ─▶ events.jsonl (+ .1) ─▶ read-shipper (sidecar) ─POST /v1/events─▶ Controller
+            └ metrics: epoch, last_synced_sequence, barrier, drops ─────▶┘
+```
+
+**Read shipper** (a new small component, a sidecar in the Chimera pod).
+It runs as the daemon UID, mounts the sink directory read-only and reads
+metrics from localhost. It never touches the NFS request path; the
+patch's worker queue already isolates foreground threads.
+
+- **Tail:** it follows the active file by `(inode, offset)`. On rotation
+  (the inode changes) it finishes the `.1` file from its saved offset, then
+  switches to the new file. If the cursor's data has already rotated out of
+  `.1`, the gap is counted as `rotated_unsent`.
+- **Forwarding gate (per line):** the line's `producer_epoch` equals the
+  live `producer_info` epoch and its `producer_sequence ≤
+  last_synced_sequence`, so the line has completed `fdatasync`. Lines from
+  an older epoch that were never sent after a restart are dropped and
+  counted (`stale_epoch`). Counters are never subtracted across epochs.
+- **Completeness barrier (for coverage, not forwarding):** the patch's full
+  consumer barrier means all of the following hold in one coherent scrape:
+  - `barrier_ready=1` and `delivery_clean=1`;
+  - `queue_depth=0` and `worker_in_flight=0`;
+  - all five drop counters are unchanged.
+
+  Waiting for that before forwarding every line would stall under steady
+  load, which the queue rarely drains. So forwarding uses only the synced
+  watermark (low latency, best effort), and a coverage hour becomes
+  `complete` only on a full barrier (Controller handling, below). This is
+  a deliberate split of the patch's single consumer rule, and it keeps the
+  patch's rule for any data used as evidence.
+- **Batch:** at most 10 000 events, 4 MiB or 1 s, whichever comes first.
+  With no traffic it sends an empty heartbeat batch every 10 s.
+- **At-least-once:** it advances and persists its cursor `(producer_epoch,
+  inode, offset, last_sequence)` only after a `202`. On a `5xx` or timeout
+  it retries the same batch with backoff. The sink file is the only buffer
+  (bounded to about 128 MiB by rotation); the shipper holds no unbounded
+  memory.
+
+**Request** (`POST /v1/events`, `Content-Type: application/json`, the same
+HTTP limits and bearer auth as above):
+
+```json
+{
+  "schema": "nfs4_read_v2",
+  "pod_uid": "…", "producer_epoch": "<uuid>",
+  "first_sequence": "1200", "last_sequence": "1450",
+  "health": {"scraped_at_ns": "…", "last_synced_sequence": "1450",
+             "barrier_ready": true, "delivery_clean": true, "queue_depth": 0, "worker_in_flight": 0,
+             "dropped": {"queue": 0, "encode": 0, "sink": 0, "rollback": 0, "rotation": 0},
+             "shipper_dropped": {"rotated_unsent": 0, "stale_epoch": 0}},
+  "events": [ { "schema": "nfs4_read_v2", "local_id": "…", "...": "raw line, unmodified" } ]
+}
+```
+
+- `health` is one coherent metrics scrape taken after the batch's last
+  line was read. `dropped` holds cumulative Chimera counters for this
+  epoch; `shipper_dropped` holds cumulative shipper counters.
+- Every event's `producer_epoch` must equal the envelope's, and its
+  `producer_sequence` must lie in `[first_sequence, last_sequence]`.
+  Otherwise the whole request gets `400`.
+- The response is `202 {"accepted": n, "dropped": m, "duplicate": d}`, and
+  the Controller does not wait on processing. A body without
+  `"schema": "nfs4_read_v2"` is a schema-v1 replay/test batch (the generic
+  path in §8.2).
+- `401`, `413` and `503` are as in the HTTP limits above. A malformed
+  envelope gets `400` and is never retried.
+
+**Controller handling**
+
+- **Dedupe key:** `(pod_uid, producer_epoch, producer_sequence)`, which
+  is exact and replaces `event_id` dedupe on this path. Chimera's `local_id` stays
+  the canonical `event_id` for diagnostics. The per-`(pod_uid, epoch)`
+  high-water marks are part of the Ingestor checkpoint (§8.7).
+- **`known_at`:** the Controller receipt time, stamped strictly increasing
+  as above (within a batch, in `producer_sequence` order), and passed as `durable_at` to
+  `semantics.read_demand.project_chimera_read`. The shipper's gate ensures
+  the line was already synced, so receipt time is never before durable
+  availability.
+- **Coverage:** buckets are event-time hours per `(volume_id, hour)` in
+  `ingest.allowed_volumes`. Every hour starts `unknown`.
+
+  It becomes `complete` only when every registered shipper has delivered a
+  batch whose `health` scrape satisfies the full completeness barrier, with
+  `scraped_at ≥ hour_end + ingest.event_time_skew_s` (default 30 s), and
+  all sequences up to that scrape's `last_synced_sequence` have been
+  accepted. In addition, all of the following held from the hour's start
+  to that scrape:
+  - sequences were contiguous within one epoch (no gaps);
+  - heartbeats were at most `shipper_heartbeat_max_s` apart;
+  - `delivery_clean` stayed true;
+  - no Chimera or shipper drop counter changed;
+  - no Controller-side loss occurred. Controller-side loss means:
+    - `dropped_overflow`;
+    - any row rejected for schema, `identity_valid=false` or projection
+      errors (charged to its volume, or to every allowed volume when the
+      volume can't be read);
+    - a `400` batch from a registered shipper.
+
+  Otherwise the hour is `incomplete`. An epoch change (Chimera restart)
+  marks every hour that was not yet complete as `incomplete`. A row whose
+  `event_time` falls in an hour that is already `complete` is counted
+  (`late_after_final`) and makes that hour `incomplete` again. Failed
+  READs and `warmer`/`unknown` rows are not loss: they are not demand.
+  Status goes to `ReadDemandEngine.update_coverage`, so labels and
+  windowed features become unknown rather than zero (read-demand-v1).
+  Shippers are registered by config (`ingest.shippers`, expected
+  `pod_uid`s). An unregistered `pod_uid` is rejected with `403`.
+- **Origin:** projection follows the frozen contract. Every Chimera row is
+  `origin=synthetic, origin_trust=client_asserted`. `demand_class` comes
+  from `origin_claim`: `pc1:d` maps to `controlled_demand` and `pc1:w` to
+  `warmer`; untagged reads map to `unknown`. **Consequence for the MVP:**
+  only controlled-demand traffic (the `pc1:d:` tag) feeds features live.
+  Untagged user reads are counted and excluded until a trusted foreground
+  origin exists (read-demand-v1 § Remaining production dependencies, #34).
+  Any lab-only policy that admits untagged reads is a contract change,
+  not a config flag.
+- **Metadata:** `file_size` is taken from the event when
+  `file_size_valid`. `dir_id` is null. `metadata_status` follows the
+  projection, and the package's `runtime_capabilities` must match
+  (`verified_file_size`, `anchor_context`).
 
 ### 8.2 Streaming cleaning (parity with batch)
 
-These share code with data prep:
+**`read-demand-v1` mode** (the live Chimera path, §8.1.1) does not use
+the HandleTracker or the open/close update stream:
+
+1. Validate each raw line with `sources.chimera.contract.ChimeraEvent`.
+   Invalid lines and `identity_valid=false` are counted per reason and
+   charged to coverage as Controller-side loss (§8.1.1).
+2. Dedupe on `(pod_uid, producer_epoch, producer_sequence)`. Memory is bounded per
+   `(pod_uid, epoch)` by the contiguous high-water mark plus a small
+   out-of-order set.
+3. Run `TargetMap.observe` (§8.11) on every valid event, including
+   `warmer` and failed READs.
+4. Keep only successful READs (`outcome=success`, `nfs_status=0`). Others
+   are counted.
+5. Map each event with `project_chimera_read(event, durable_at=known_at,
+   dir_id=None, file_size=…)` to a `ReadDemandEvent`, then apply
+   `ReadDemandEngine.update`. The engine excludes `warmer` and `unknown`
+   rows itself, and the Controller counts them.
+
+**Parity requirement:**
+- `ReadDemandEngine` is the single feature implementation for offline
+  (`build_read_demand_feature_rows`) and live paths.
+- Replaying a projected dataset through the HTTP path in
+  `(known_at, event_id)` order must yield the same features at fixed
+  ticks as the offline builder.
+- Candidates and anchors follow
+  [read-demand-v1 § Co-read table and candidates](../data-prep/read-demand-v1.md#co-read-table-and-candidates)
+  (#31).
+
+**Generic mode** (datagen schema-v1 replay and tests). These share code
+with data prep:
 
 - **Rules:** `prep.clean.rules.classify_event` (data-prep §4.3 rules 1 and
   3–8), with `known_at` as the ingest time.
@@ -1042,6 +1208,10 @@ controller:
     listen: "0.0.0.0:8090"
     queue_max: 200000
     allowed_volumes: [vol-0001]
+    semantic_view: read-demand-v1     # or generic-v1 (datagen replay/tests)
+    shippers: []                      # expected Chimera pod_uids (§8.1.1); others get 403
+    shipper_heartbeat_max_s: 60
+    event_time_skew_s: 30             # allowed producer clock skew before an hour can be complete
     http: {max_body_mib: 4, max_events: 10000, max_concurrent: 8, read_timeout_s: 2,
            token_env: PCACHE_INGEST_TOKEN}
   sinks: {predictions_dir: /var/lib/pcache/out/predictions, plans_dir: /var/lib/pcache/out/plans,
@@ -1118,8 +1288,22 @@ The Controller uses the stdlib `http.server` (a threading server) for
 - the synthetic disclaimer is present.
 
 **Ingestion (#59):**
-- **streaming/batch parity** of update sequences on fixtures and datagen
-  `tiny`;
+- **READ mode:** features at fixed ticks from the HTTP path equal
+  `build_read_demand_feature_rows` on the same projected events;
+- **shipper:** rotation mid-batch (finishes `.1` then continues), a gap
+  past `.1` counted as `rotated_unsent`, lines above `last_synced_sequence`
+  held back, an epoch change drops unsent old-epoch lines, retry of the
+  same batch is deduped by `(pod_uid, producer_epoch, producer_sequence)`,
+  and an envelope/event epoch or sequence mismatch gets `400`;
+- **coverage:** an hour stays `unknown` until a full barrier scraped after
+  `hour_end + event_time_skew_s`; a sequence gap, a missed heartbeat, any
+  drop-counter change, Controller overflow, a rejected row, an epoch
+  change or a `late_after_final` row marks it `incomplete`, and labels for
+  it are unknown;
+- untagged (`origin_claim=unknown`) and `pc1:w` reads never change features,
+  but do refresh the `TargetMap`;
+- **streaming/batch parity** (generic mode) of update sequences on
+  fixtures and datagen `tiny`;
 - out-of-order HTTP batches and stale or future source `ingest_time` still
   give non-decreasing `known_at`;
 - a late close, and a range read delivered after
