@@ -20,6 +20,12 @@ users wait for it to arrive from cloud storage.
 An experimental [event collector](docs/controller/collector.md) supports
 normalized-v1 HTTP ingestion and replay.
 
+A standalone [READ planner](docs/controller/planner.md) selects bounded
+schema-v2 plans and publishes private files. It still needs the live tick,
+feature store and TargetMap integration. Its five-minute demand forecast is
+separate from the execution window: with fresh targets, the default warming
+plan expires after two minutes, or sooner if a target becomes stale earlier.
+
 The narrow datagen-to-Dispatcher path has passed focused tests, Ruff, and one
 controlled offline `skipped/dry_run` integration on `nas-vm`; it issued zero
 bytes and did not start the Warmer. The separately approved one-READ
@@ -589,7 +595,7 @@ responsibilities and validation limits.
   "run_id": "demo-run-001",
   "plan_id": "plan-001",
   "model_version": "demo-model-001",
-  "deadline": "2026-11-03T09:05:01.000000Z",
+  "deadline": "2026-11-03T09:02:01.000000Z",
   "max_bytes": 65536,
   "items": [{
     "task_id": "task-001",
@@ -601,6 +607,12 @@ responsibilities and validation limits.
   }]
 }
 ```
+
+The five-minute prediction above does not give the Warmer five minutes to
+act. With the default target validity, this example expires after two minutes;
+an older target can shorten that window further. The planner uses the earliest
+selected target's expiry as the plan deadline. See the authoritative
+[schema-v2 contract](docs/dispatcher.md#schema-v2-plan-contract).
 
 Here `max_bytes` means total **requested read bytes across all attempts**,
 including retries. This plan has no spare allowance for a retry after a full
