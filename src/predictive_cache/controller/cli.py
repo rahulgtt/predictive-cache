@@ -15,8 +15,9 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from predictive_cache.controller.http import HttpSource
-from predictive_cache.controller.ingest import Ingestor
+from predictive_cache.controller.ingest import ChimeraTargetIngestor, Ingestor
 from predictive_cache.controller.sources import RealClock, ReplayClock, ReplaySource
+from predictive_cache.controller.targets import TargetMap
 from predictive_cache.prep.config import CleanConfig
 
 
@@ -37,8 +38,17 @@ class _Replay(_Strict):
     batch_size: int = Field(default=1000, ge=1, le=10000)
 
 
+class _Targets(_Strict):
+    exports: dict[int, str]
+    max_entries: int = Field(default=100000, ge=1)
+    target_max_age_s: int = Field(default=3600, ge=1)
+
+
 class _Ingest(_Strict):
     source: Literal["http", "replay"]
+    mode: Literal["generic-v1", "chimera-targets"] = "generic-v1"
+    shippers: list[str] = Field(default_factory=list)
+    targets: _Targets | None = None
     listen: str = "127.0.0.1:8090"
     queue_max: int = Field(default=200000, ge=1)
     allowed_volumes: list[str] = Field(min_length=1)
@@ -107,9 +117,24 @@ def run(config_path):
         if kind in {"OpenObserved", "OpenCompleted", "MetaChanged"}:
             updates[kind] += 1
 
-    ingestor = Ingestor(
-        cfg.clean, sink, queue_max=settings.queue_max, allowed_volumes=settings.allowed_volumes
-    )
+    raw_mode = settings.mode == "chimera-targets"
+    if raw_mode:
+        if settings.source != "http" or settings.targets is None or not settings.shippers:
+            raise click.ClickException("raw target mode requires HTTP, shippers and exports")
+        try:
+            targets = TargetMap(**settings.targets.model_dump())
+            ingestor = ChimeraTargetIngestor(
+                targets,
+                queue_max=settings.queue_max,
+                allowed_volumes=settings.allowed_volumes,
+                shippers=settings.shippers,
+            )
+        except (TypeError, ValueError):
+            raise click.ClickException("invalid raw target configuration") from None
+    else:
+        ingestor = Ingestor(
+            cfg.clean, sink, queue_max=settings.queue_max, allowed_volumes=settings.allowed_volumes
+        )
     try:
         if settings.source == "replay":
             if settings.replay is None:
@@ -153,7 +178,10 @@ def run(config_path):
                 max_concurrent=options.max_concurrent,
                 read_timeout_s=options.read_timeout_s,
             )
-            source.start(ingestor.offer)
+            if raw_mode:
+                source.start(raw_sink=ingestor.offer)
+            else:
+                source.start(ingestor.offer)
             click.echo("ingestion receiver started")
             try:
                 while True:
@@ -166,7 +194,16 @@ def run(config_path):
                 ingestor.drain(clock.now())
     except Exception:
         raise click.ClickException("ingestion failed; check configuration and source") from None
-    click.echo(json.dumps(_summary(ingestor, updates), sort_keys=True))
+    summary = _summary(ingestor, updates)
+    if raw_mode:
+        summary.update(
+            mode="chimera-targets",
+            demand_enabled=False,
+            coverage_status="unknown",
+            target_counters=targets.stats(),
+            restart_continuity=False,
+        )
+    click.echo(json.dumps(summary, sort_keys=True))
 
 
 if __name__ == "__main__":

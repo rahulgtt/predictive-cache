@@ -16,7 +16,9 @@ users wait for it to arrive from cloud storage.
 > already work.
 
 An experimental [event collector](docs/controller/collector.md) supports
-normalized-v1 HTTP ingestion and replay. Live READ-only feature semantics and
+normalized-v1 HTTP ingestion and replay. Opt-in
+[raw target ingestion](docs/controller/target-map.md#raw-http-target-ingestion)
+feeds private execution targets without creating demand updates. Live READ-only feature semantics and
 FeatureStore integration remain dependent on #104 and #30.
 
 ## Run the datagen foundation

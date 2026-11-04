@@ -294,3 +294,108 @@ def test_stats_snapshot_is_safe_during_drain_and_from_receiver(event):
         sys.setswitchinterval(old_interval)
     assert not reader.is_alive()
     assert not errors
+
+
+def raw_core(**changes):
+    from predictive_cache.controller.ingest import ChimeraTargetIngestor
+    from predictive_cache.controller.targets import TargetMap
+
+    return ChimeraTargetIngestor(
+        TargetMap({7: "test-ro"}), allowed_volumes=["01" * 16], shippers=["fixture-pod"], **changes
+    )
+
+
+@pytest.mark.parametrize("origin", ["unknown", "warmer", "synthetic", "controlled_demand"])
+def test_raw_origins_refresh_targets_without_demand(raw_chimera, raw_envelope, origin):
+    core = raw_core()
+    body = raw_envelope(raw_chimera(origin_claim=origin))
+    assert core.offer(body, receipt=NOW) == (1, 0, 0)
+    assert core.targets.resolve("01" * 16, "02" * 32, NOW) is None
+    assert core.drain(NOW + timedelta(seconds=1)) == []
+    assert core.targets.resolve("01" * 16, "02" * 32, NOW).seen_at == NOW
+    assert core.stats()["targets_updated"] == 1
+    assert core.stats()["updates_emitted"] == 0
+    assert core.stats()["processed"] == 1
+
+
+def test_raw_failed_reads_refresh_and_duplicates_do_not_extend_age(raw_chimera, raw_envelope):
+    core = raw_core()
+    body = raw_envelope(raw_chimera(nfs_status=5, outcome="error", returned_bytes=0))
+    assert core.offer(body, receipt=NOW) == (1, 0, 0)
+    core.drain(NOW + timedelta(seconds=1))
+    target = core.targets.resolve("01" * 16, "02" * 32, NOW)
+    assert core.stats()["excluded_by_reason"] == {"result_failed": 1}
+    assert core.offer(body, receipt=NOW + timedelta(seconds=2)) == (0, 0, 1)
+    core.drain(NOW + timedelta(seconds=3))
+    assert core.targets.resolve("01" * 16, "02" * 32, NOW + timedelta(seconds=3)) == target
+
+
+@pytest.mark.parametrize(
+    "mutation,status",
+    [
+        (lambda b: b.update(pod_uid="unregistered"), 403),
+        (lambda b: b.update(producer_epoch="not-uuid"), 400),
+        (lambda b: b["health"].update(last_synced_sequence="0"), 400),
+        (lambda b: b["events"][0].update(producer_epoch="different"), 400),
+        (lambda b: b.update(first_sequence="2"), 400),
+        (lambda b: b["health"].update(delivery_clean=1), 400),
+        (lambda b: b["health"]["dropped"].update(queue=-1), 400),
+    ],
+)
+def test_raw_envelope_rejection_is_atomic(raw_envelope, mutation, status):
+    from predictive_cache.controller.ingest import EnvelopeError
+
+    core = raw_core()
+    body = raw_envelope()
+    mutation(body)
+    with pytest.raises(EnvelopeError) as error:
+        core.offer(body, receipt=NOW)
+    assert error.value.status == status
+    assert core.stats()["accepted"] == core.stats()["stream_count"] == 0
+    assert core.targets.stats()["entries"] == 0
+
+
+def test_raw_ordering_bounds_retry_and_epoch_cap(raw_chimera, raw_envelope):
+    core = raw_core(queue_max=1, max_epochs_per_pod=1)
+    one, two = raw_chimera(), raw_chimera(producer_sequence="2", file_id="03" * 32)
+    body = raw_envelope(two, one)
+    assert core.offer(body, receipt=NOW) == (1, 1, 0)
+    core.drain(NOW + timedelta(seconds=1))
+    assert core.offer(body, receipt=NOW + timedelta(seconds=2)) == (1, 0, 1)
+    core.drain(NOW + timedelta(seconds=3))
+    assert core.targets.resolve("01" * 16, "03" * 32, NOW + timedelta(seconds=3)).seen_at > NOW
+    new = raw_chimera(producer_epoch="33333333-3333-4333-8333-333333333333")
+    assert core.offer(raw_envelope(new), receipt=NOW + timedelta(seconds=4)) == (0, 1, 0)
+    assert core.stats()["stream_count"] == 1
+    with pytest.raises(NotImplementedError, match="restart continuity"):
+        core.state()
+
+
+def test_raw_gap_state_is_bounded_and_heartbeat_is_empty(raw_chimera, raw_envelope):
+    core = raw_core(max_sequence_gap=2)
+    assert core.offer(raw_envelope(), receipt=NOW) == (1, 0, 0)
+    core.drain(NOW + timedelta(seconds=1))
+    assert core.offer(raw_envelope(raw_chimera(producer_sequence="4")), receipt=NOW) == (0, 1, 0)
+    body = raw_envelope()
+    body["events"] = []
+    assert core.offer(body, receipt=NOW) == (0, 0, 0)
+    assert core.stats()["heartbeats"] == 1
+    assert core.stats()["pending_sequences"] == 0
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"identity_valid": False},
+        {"target_fh": "bad="},
+        {"export_id": 8},
+        {"file_size": str(2**64)},
+        {"volume_id": "03" * 16},
+    ],
+)
+def test_raw_invalid_rows_never_update_targets(raw_chimera, raw_envelope, changes):
+    core = raw_core()
+    core.offer(raw_envelope(raw_chimera(**changes)), receipt=NOW)
+    core.drain(NOW + timedelta(seconds=1))
+    assert core.targets.stats()["entries"] == 0
+    assert core.stats()["updates_emitted"] == 0

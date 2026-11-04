@@ -441,3 +441,266 @@ class Ingestor:
                 Counter(document["excluded"]),
             )
             self._last_error = document["last_error"]
+
+
+class EnvelopeError(ValueError):
+    """Sanitized raw-ingress rejection; never carries request data."""
+
+    def __init__(self, status=400):
+        super().__init__("invalid raw event envelope")
+        self.status = status
+
+
+def _u64(value):
+    if (
+        not isinstance(value, str)
+        or not value.isascii()
+        or not value.isdecimal()
+        or len(value) > 20
+        or (len(value) > 1 and value.startswith("0"))
+    ):
+        raise EnvelopeError()
+    result = int(value)
+    if result > 2**64 - 1:
+        raise EnvelopeError()
+    return result
+
+
+class ChimeraTargetIngestor:
+    """Bounded, target-only raw ingress. No demand or coverage assertions.
+
+    Dedupe is exact for admitted sequence numbers while this instance lives.
+    New epochs fail closed at the per-pod cap rather than forgetting identities.
+    Raw queue and dedupe restart persistence are deliberately unsupported.
+    """
+
+    def __init__(
+        self,
+        targets,
+        *,
+        allowed_volumes,
+        shippers,
+        queue_max=200_000,
+        max_event_bytes=65_536,
+        max_epochs_per_pod=4,
+        max_sequence_gap=4096,
+        clock=None,
+    ):
+        if not allowed_volumes or not shippers:
+            raise ValueError("raw ingress requires volume and shipper allowlists")
+        if any(not isinstance(v, str) or not v for v in (*allowed_volumes, *shippers)):
+            raise ValueError("invalid ingress allowlists")
+        if any(
+            type(v) is not int or v < 1
+            for v in (queue_max, max_event_bytes, max_epochs_per_pod, max_sequence_gap)
+        ):
+            raise ValueError("invalid raw ingress bounds")
+        self.targets, self.clock = targets, clock
+        self.allowed_volumes, self.shippers = frozenset(allowed_volumes), frozenset(shippers)
+        self.queue_max, self.max_event_bytes = queue_max, max_event_bytes
+        self.max_epochs_per_pod, self.max_sequence_gap = max_epochs_per_pod, max_sequence_gap
+        self._queue, self._streams = deque(), {}
+        self._lock, self._consumer_lock = Lock(), RLock()
+        self._last_known = self._advanced = MIN_TIME
+        self._counts, self._excluded = Counter(), Counter()
+
+    def _envelope(self, body):
+        from predictive_cache.sources.chimera.contract import canonical_uuid
+
+        try:
+            if (
+                not isinstance(body, dict)
+                or set(body)
+                != {
+                    "schema",
+                    "pod_uid",
+                    "producer_epoch",
+                    "first_sequence",
+                    "last_sequence",
+                    "health",
+                    "events",
+                }
+                or body["schema"] != "nfs4_read_v2"
+            ):
+                raise EnvelopeError()
+            pod, epoch = body["pod_uid"], body["producer_epoch"]
+            if not isinstance(pod, str):
+                raise EnvelopeError()
+            if pod not in self.shippers:
+                raise EnvelopeError(403)
+            canonical_uuid(epoch)
+            first, last = _u64(body["first_sequence"]), _u64(body["last_sequence"])
+            if first > last:
+                raise EnvelopeError()
+            events, health = body["events"], body["health"]
+            if not isinstance(events, list) or any(not isinstance(e, dict) for e in events):
+                raise EnvelopeError()
+            if len(events) > 10000:
+                raise EnvelopeError(413)
+            if not isinstance(health, dict) or set(health) != {
+                "scraped_at_ns",
+                "last_synced_sequence",
+                "barrier_ready",
+                "delivery_clean",
+                "queue_depth",
+                "worker_in_flight",
+                "dropped",
+                "shipper_dropped",
+            }:
+                raise EnvelopeError()
+            _u64(health["scraped_at_ns"])
+            synced = _u64(health["last_synced_sequence"])
+            if last > synced:
+                raise EnvelopeError()
+            for name in ("barrier_ready", "delivery_clean"):
+                if type(health[name]) is not bool:
+                    raise EnvelopeError()
+            counters = {name: health[name] for name in ("queue_depth", "worker_in_flight")}
+            for name, keys in (
+                ("dropped", {"queue", "encode", "sink", "rollback", "rotation"}),
+                ("shipper_dropped", {"rotated_unsent", "stale_epoch"}),
+            ):
+                if not isinstance(health[name], dict) or set(health[name]) != keys:
+                    raise EnvelopeError()
+                counters.update({name + key: value for key, value in health[name].items()})
+            if any(
+                type(value) is not int or not 0 <= value <= 2**64 - 1 for value in counters.values()
+            ):
+                raise EnvelopeError()
+            ordered = []
+            for raw in events:
+                sequence = _u64(raw.get("producer_sequence"))
+                if (
+                    raw.get("producer_epoch") != epoch
+                    or not first <= sequence <= last
+                    or sequence == 0
+                ):
+                    raise EnvelopeError()
+                ordered.append((sequence, raw))
+            if ordered and (
+                min(s for s, _ in ordered) != first or max(s for s, _ in ordered) != last
+            ):
+                raise EnvelopeError()
+            return pod, epoch, sorted(ordered, key=lambda pair: pair[0])
+        except EnvelopeError:
+            raise
+        except (TypeError, ValueError, KeyError, OverflowError, AttributeError):
+            raise EnvelopeError() from None
+
+    def offer(self, body, receipt=None):
+        """Validate envelope/admit only; raw row parsing and target updates wait for drain."""
+        pod, epoch, events = self._envelope(body)
+        received = (
+            instant(receipt)
+            if receipt is not None
+            else instant(self.clock.now() if self.clock else datetime.now(UTC))
+        )
+        if not self._lock.acquire(blocking=False):
+            self._counts["dropped_busy"] += len(events)
+            self._counts["dropped"] += len(events)
+            return 0, len(events), 0
+        accepted = dropped = duplicate = 0
+        try:
+            key = pod, epoch
+            if key not in self._streams and events:
+                if sum(p == pod for p, _ in self._streams) >= self.max_epochs_per_pod:
+                    self._counts["dropped_epoch_capacity"] += len(events)
+                    self._counts["dropped"] += len(events)
+                    return 0, len(events), 0
+            stream = self._streams.get(key, [events[0][0] - 1, set()] if events else None)
+            for sequence, raw in events:
+                high, pending = stream
+                if sequence <= high or sequence in pending:
+                    duplicate += 1
+                    continue
+                reason = None
+                if (
+                    not isinstance(raw.get("volume_id"), str)
+                    or raw["volume_id"] not in self.allowed_volumes
+                ):
+                    reason = "volume"
+                elif len(self._queue) >= self.queue_max:
+                    reason = "overflow"
+                elif sequence - high > self.max_sequence_gap:
+                    reason = "sequence_gap"
+                try:
+                    encoded = canonical_json(raw)
+                    if len(encoded.encode()) > self.max_event_bytes:
+                        reason = "event_too_large"
+                except (TypeError, ValueError, OverflowError):
+                    reason = "schema_invalid"
+                if reason:
+                    dropped += 1
+                    self._counts["dropped_" + reason] += 1
+                    continue
+                known = max(received, self._last_known + US, self._advanced)
+                self._last_known = known
+                self._queue.append((json.loads(encoded), known))
+                self._streams[key] = stream
+                pending.add(sequence)
+                while stream[0] + 1 in pending:
+                    stream[0] += 1
+                    pending.remove(stream[0])
+                accepted += 1
+            self._counts["accepted"] += accepted
+            self._counts["dropped"] += dropped
+            self._counts["duplicate"] += duplicate
+            self._counts["heartbeats"] += not events
+            return accepted, dropped, duplicate
+        finally:
+            self._lock.release()
+
+    def drain(self, now=None):
+        from predictive_cache.sources.chimera.contract import ChimeraEvent
+
+        now = (
+            instant(now)
+            if now is not None
+            else instant(self.clock.now() if self.clock else datetime.now(UTC))
+        )
+        with self._consumer_lock:
+            with self._lock:
+                if now < self._advanced:
+                    raise ValueError("drain clock cannot move backwards")
+                rows = []
+                while self._queue and self._queue[0][1] < now:
+                    rows.append(self._queue.popleft())
+                self._advanced = now
+            for raw, known in rows:
+                try:
+                    event = ChimeraEvent.model_validate(raw)
+                except (ValueError, TypeError, KeyError, OverflowError):
+                    self._excluded["schema_invalid"] += 1
+                else:
+                    if self.targets.update(event, known):
+                        self._counts["targets_updated"] += 1
+                    else:
+                        self._excluded["target_rejected"] += 1
+                    if event.outcome != "success":
+                        self._excluded["result_failed"] += 1
+                    elif event.origin_claim != "controlled_demand":
+                        self._excluded["origin_" + event.origin_claim] += 1
+                    else:
+                        self._excluded["controlled_demand_not_enabled"] += 1
+                self._counts["processed"] += 1
+        return []
+
+    def stats(self):
+        with self._consumer_lock, self._lock:
+            return {
+                **dict(self._counts),
+                "accepted": self._counts["accepted"],
+                "processed": self._counts["processed"],
+                "dropped": self._counts["dropped"],
+                "duplicate": self._counts["duplicate"],
+                "queue_depth": len(self._queue),
+                "stream_count": len(self._streams),
+                "pending_sequences": sum(len(pending) for _, pending in self._streams.values()),
+                "excluded_by_reason": dict(self._excluded),
+                "updates_emitted": 0,
+                "tracker_failed": False,
+                "tracker_exhausted": False,
+            }
+
+    def state(self):
+        raise NotImplementedError("raw ingress restart continuity is not implemented")
