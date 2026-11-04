@@ -101,6 +101,17 @@ performance evidence. See the
 The manifest hashes the exact canonical cluster-provenance and event-schema
 bytes documented in [`contracts/README.md`](contracts/README.md).
 
+The separate manifest-v3
+[datagen-driven READ workload](docs/experiments/datagen-read-workload.md)
+adds deterministic repeated ranges, popularity skew, co-access groups,
+sequential progression, bursts and quiet periods over the same frozen catalog.
+The next candidate is three hours; datagen deterministically selects and
+freezes its exact operation count, variable rate and truth within declared
+safety bounds before bounded validation. V3 is offline-only: mount,
+permit, reconciliation, attestation and finalization paths reject it until a
+complete plan-bound live evidence chain is implemented and approved. Manifest
+v2's five-hour unique-coverage behavior is unchanged.
+
 ## Import a controlled Chimera v2 run
 
 `pcache-chimera-import` converts authoritative `nfs4_read_v2` JSONL plus its
@@ -722,6 +733,7 @@ stays blocked. Synthetic fixtures cannot close either gap.
 | Need | Document |
 | --- | --- |
 | Day-to-day schedule and ownership | [Quick glance](docs/plan/team-quick-glance.md) and [detailed team plan](docs/predictive-cache-48-hour-team-plan.md) |
+| Current protocol/filesystem implementation, evidence and next READ-only workload | [Engineer 1 implementation record](docs/engineer-one-protocol-filesystem-plan.md) |
 | Full generation schema, dataset layout and synthetic patterns | [Datagen spec](docs/datagen/spec.md) |
 | Approved access to the owner-private controlled collection | [Owner-private controlled dataset](docs/data-prep/owner-private-controlled-dataset.md) |
 | Collection, state, failure and benchmark procedures | [Validation and operations](docs/architecture/validation-and-operations.md) |
