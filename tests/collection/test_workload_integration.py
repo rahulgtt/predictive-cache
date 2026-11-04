@@ -570,3 +570,59 @@ def test_bounded_permit_runs_relation_complete_sparse_selection_promptly(
     )
     assert missing_attestation.exit_code != 0
     assert "requires --bounded-attestation" in missing_attestation.output
+    lab_permit = build_workload_collection_permit(
+        manifest,
+        config,
+        plan,
+        truth,
+        binding,
+        catalog,
+        permit_id="33333333-3333-4333-8333-333333333333",
+        profile="full_collection",
+        expires_at=START + timedelta(hours=4),
+        validated_code_head_sha256="6" * 40,
+        validated_merge_commit_sha256="7" * 40,
+        validated_tree_sha256="8" * 40,
+        provider_package_sha256="9" * 64,
+        provider_sha256="a" * 64,
+        collector_sha256="b" * 64,
+        validator_sha256="c" * 64,
+        runbook_sha256="d" * 64,
+        adapter_wrapper_sha256="e" * 64,
+        cleaner_wrapper_sha256="f" * 64,
+        interpreter_path="/usr/bin/python3.12",
+        interpreter_sha256="0" * 64,
+        execution_start_time=START,
+        lab_unvalidated_full_run=True,
+    )
+    lab_permit_path = run_dir / "lab-full-permit.json"
+    atomic_write_model(lab_permit_path, lab_permit)
+    missing_waiver_flag = CliRunner().invoke(
+        main,
+        [
+            "run",
+            "--run-dir",
+            str(run_dir),
+            "--mount-root",
+            str(tmp_path / "mount"),
+            "--workload-permit",
+            str(lab_permit_path),
+        ],
+    )
+    assert missing_waiver_flag.exit_code != 0
+    assert "explicit runtime waiver flag" in missing_waiver_flag.output
+    accepted_waiver = CliRunner().invoke(
+        main,
+        [
+            "run",
+            "--run-dir",
+            str(run_dir),
+            "--mount-root",
+            str(tmp_path / "mount"),
+            "--workload-permit",
+            str(lab_permit_path),
+            "--allow-unvalidated-full-lab-run",
+        ],
+    )
+    assert accepted_waiver.exit_code != 0
+    assert "mount execution requires" in accepted_waiver.output

@@ -100,6 +100,7 @@ from .models import (
     LiveCoverageRow,
     LiveFinalizationDeclaration,
     LiveProviderDeclaration,
+    LAB_FULL_RUN_WAIVER,
     ObservedEvent,
     OfferedOperation,
     PreReadHealth,
@@ -600,6 +601,12 @@ def _validate_workload_provider_stack(
         or invocation.validated_tree_sha256
         != permit.validated_tree_sha256
         or invocation.actions != ("checkpoint", "probe", "post-read")
+        or provider.lab_unvalidated_full_run
+        != permit.lab_unvalidated_full_run
+        or provider.lab_waiver_statement != permit.lab_waiver_statement
+        or invocation.lab_unvalidated_full_run
+        != permit.lab_unvalidated_full_run
+        or invocation.lab_waiver_statement != permit.lab_waiver_statement
     ):
         raise click.ClickException(
             "workload provider stack differs from the permit"
@@ -3692,6 +3699,7 @@ def init(
 @click.option("--validation-operations", type=click.IntRange(1, 3))
 @click.option("--workload-permit", type=click.Path(path_type=Path))
 @click.option("--bounded-attestation", type=click.Path(path_type=Path))
+@click.option("--allow-unvalidated-full-lab-run", is_flag=True)
 @click.option("--adapter-command", type=click.Path(path_type=Path))
 @click.option("--cleaner-command", type=click.Path(path_type=Path))
 def run(
@@ -3704,6 +3712,7 @@ def run(
     validation_operations: int | None,
     workload_permit: Path | None,
     bounded_attestation: Path | None,
+    allow_unvalidated_full_lab_run: bool,
     adapter_command: Path | None,
     cleaner_command: Path | None,
 ) -> None:
@@ -3803,17 +3812,33 @@ def run(
                     "v3 bounded validation requires adapter and cleaner commands"
                 )
             if workload_permit_model.profile == "full_collection":
-                if bounded_attestation is None:
-                    raise click.ClickException(
-                        "full workload execution requires --bounded-attestation"
+                if workload_permit_model.lab_unvalidated_full_run:
+                    if (
+                        not allow_unvalidated_full_lab_run
+                        or bounded_attestation is not None
+                        or workload_permit_model.lab_waiver_statement
+                        != LAB_FULL_RUN_WAIVER
+                    ):
+                        raise click.ClickException(
+                            "unvalidated full lab run requires the explicit "
+                            "runtime waiver flag and no bounded attestation"
+                        )
+                else:
+                    if allow_unvalidated_full_lab_run:
+                        raise click.ClickException(
+                            "runtime lab waiver flag requires a lab-waived permit"
+                        )
+                    if bounded_attestation is None:
+                        raise click.ClickException(
+                            "full workload execution requires --bounded-attestation"
+                        )
+                    _validate_full_workload_attestation(
+                        workload_permit_model,
+                        bounded_attestation,
+                        workload_config_model,
+                        execution_plan_model,
+                        workload_truth_model,
                     )
-                _validate_full_workload_attestation(
-                    workload_permit_model,
-                    bounded_attestation,
-                    workload_config_model,
-                    execution_plan_model,
-                    workload_truth_model,
-                )
             elif bounded_attestation is not None:
                 raise click.ClickException(
                     "bounded permit must not consume a prior attestation"
@@ -3825,6 +3850,10 @@ def run(
     elif bounded_attestation is not None:
         raise click.ClickException(
             "manifest v2 must not receive a bounded workload attestation"
+        )
+    elif allow_unvalidated_full_lab_run:
+        raise click.ClickException(
+            "runtime lab waiver flag requires a workload-v3 lab permit"
         )
     provider_interpreter = None
     adapter_fd = None
@@ -3965,6 +3994,12 @@ def run(
                 validated_code_head_sha256=workload_permit_model.validated_code_head_sha256,
                 validated_merge_commit_sha256=workload_permit_model.validated_merge_commit_sha256,
                 validated_tree_sha256=workload_permit_model.validated_tree_sha256,
+                lab_unvalidated_full_run=(
+                    workload_permit_model.lab_unvalidated_full_run
+                ),
+                lab_waiver_statement=(
+                    workload_permit_model.lab_waiver_statement
+                ),
                 argv_contract=(
                     str(provider_interpreter),
                     "-I",
@@ -5488,7 +5523,6 @@ def attest_workload_bounded(
 @click.option(
     "--bounded-attestation",
     type=click.Path(path_type=Path),
-    required=True,
 )
 @click.option(
     "--provider-manifest",
@@ -5506,7 +5540,7 @@ def attest_workload_bounded(
 def finalize_workload(
     run_dir: Path,
     workload_permit: Path,
-    bounded_attestation: Path,
+    bounded_attestation: Path | None,
     provider_manifest: Path,
     imported: Path,
     cleaned: Path,
@@ -5602,45 +5636,64 @@ def finalize_workload(
         != permit.validated_merge_commit_sha256
         or provider.validated_tree_sha256
         != permit.validated_tree_sha256
+        or provider.lab_unvalidated_full_run
+        != permit.lab_unvalidated_full_run
+        or provider.lab_waiver_statement != permit.lab_waiver_statement
     ):
         raise click.ClickException(
             "workload provider declaration does not match the permit"
         )
-    bounded = load_model(
-        bounded_attestation,
-        WorkloadBoundedValidationAttestation,
-    )
-    if (
-        bounded.status != "passed"
-        or sha256(bounded_attestation)
-        != permit.bounded_validation_attestation_sha256
-        or bounded.execution_plan_sha256 != permit.execution_plan_sha256
-        or bounded.workload_truth_sha256 != permit.workload_truth_sha256
-        or bounded.truth_binding_sha256 != permit.truth_binding_sha256
-        or bounded.fixture_catalog_sha256
-        != permit.fixture_catalog_sha256
-        or bounded.semantic_view_sha256 != permit.semantic_view_sha256
-        or bounded.validated_code_head_sha256
-        != permit.validated_code_head_sha256
-        or bounded.validated_merge_commit_sha256
-        != permit.validated_merge_commit_sha256
-        or bounded.validated_tree_sha256
-        != permit.validated_tree_sha256
-        or bounded.provider_package_sha256
-        != permit.provider_package_sha256
-        or bounded.provider_sha256 != permit.provider_sha256
-        or bounded.collector_sha256 != permit.collector_sha256
-        or bounded.validator_sha256 != permit.validator_sha256
-        or bounded.runbook_sha256 != permit.runbook_sha256
-        or bounded.adapter_wrapper_sha256
-        != permit.adapter_wrapper_sha256
-        or bounded.cleaner_wrapper_sha256
-        != permit.cleaner_wrapper_sha256
-        or bounded.interpreter_sha256 != permit.interpreter_sha256
-    ):
-        raise click.ClickException(
-            "bounded workload attestation is stale or incompatible"
+    bounded = None
+    bounded_attestation_sha = None
+    if permit.lab_unvalidated_full_run:
+        if (
+            bounded_attestation is not None
+            or permit.lab_waiver_statement != LAB_FULL_RUN_WAIVER
+        ):
+            raise click.ClickException(
+                "lab-waived finalization requires no bounded attestation"
+            )
+    else:
+        if bounded_attestation is None:
+            raise click.ClickException(
+                "validated finalization requires --bounded-attestation"
+            )
+        bounded = load_model(
+            bounded_attestation,
+            WorkloadBoundedValidationAttestation,
         )
+        if (
+            bounded.status != "passed"
+            or sha256(bounded_attestation)
+            != permit.bounded_validation_attestation_sha256
+            or bounded.execution_plan_sha256 != permit.execution_plan_sha256
+            or bounded.workload_truth_sha256 != permit.workload_truth_sha256
+            or bounded.truth_binding_sha256 != permit.truth_binding_sha256
+            or bounded.fixture_catalog_sha256
+            != permit.fixture_catalog_sha256
+            or bounded.semantic_view_sha256 != permit.semantic_view_sha256
+            or bounded.validated_code_head_sha256
+            != permit.validated_code_head_sha256
+            or bounded.validated_merge_commit_sha256
+            != permit.validated_merge_commit_sha256
+            or bounded.validated_tree_sha256
+            != permit.validated_tree_sha256
+            or bounded.provider_package_sha256
+            != permit.provider_package_sha256
+            or bounded.provider_sha256 != permit.provider_sha256
+            or bounded.collector_sha256 != permit.collector_sha256
+            or bounded.validator_sha256 != permit.validator_sha256
+            or bounded.runbook_sha256 != permit.runbook_sha256
+            or bounded.adapter_wrapper_sha256
+            != permit.adapter_wrapper_sha256
+            or bounded.cleaner_wrapper_sha256
+            != permit.cleaner_wrapper_sha256
+            or bounded.interpreter_sha256 != permit.interpreter_sha256
+        ):
+            raise click.ClickException(
+                "bounded workload attestation is stale or incompatible"
+            )
+        bounded_attestation_sha = sha256(bounded_attestation)
     imported_manifest_path = imported / "manifest.json"
     cleaned_manifest_path = cleaned / "manifest.json"
     imported_manifest = _load_json(imported_manifest_path)
@@ -5708,7 +5761,9 @@ def finalize_workload(
         provider_manifest_sha256=sha256(provider_manifest),
         imported_manifest_sha256=sha256(imported_manifest_path),
         cleaned_manifest_sha256=sha256(cleaned_manifest_path),
-        bounded_attestation_sha256=sha256(bounded_attestation),
+        bounded_attestation_sha256=bounded_attestation_sha,
+        lab_unvalidated_full_run=permit.lab_unvalidated_full_run,
+        lab_waiver_statement=permit.lab_waiver_statement,
         validated_code_head_sha256=permit.validated_code_head_sha256,
         validated_merge_commit_sha256=permit.validated_merge_commit_sha256,
         validated_tree_sha256=permit.validated_tree_sha256,
@@ -5718,7 +5773,11 @@ def finalize_workload(
     inventory = {
         "inventory_version": 3,
         "run_id": manifest.run_id,
-        "bounded_validation_run_id": bounded.validation_run_id,
+        "bounded_validation_run_id": (
+            bounded.validation_run_id if bounded is not None else None
+        ),
+        "lab_unvalidated_full_run": permit.lab_unvalidated_full_run,
+        "lab_waiver_statement": permit.lab_waiver_statement,
         "roots": [
             root.model_dump(mode="json")
             for root in sorted(

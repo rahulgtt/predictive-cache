@@ -29,6 +29,7 @@ from predictive_cache.collection.models import (
     CollectionManifest,
     FixtureCatalog,
     FixtureEntry,
+    LAB_FULL_RUN_WAIVER,
     RetentionPolicy,
     SoftwareVersions,
     StopRules,
@@ -96,7 +97,7 @@ def built():
     )
 
 
-def permitted(profile="bounded_validation"):
+def permitted(profile="bounded_validation", *, lab_unvalidated_full_run=False):
     fixture_catalog = catalog()
     config = WorkloadConfig()
     plan, truth = build_default_workload(
@@ -183,8 +184,11 @@ def permitted(profile="bounded_validation"):
         ),
         validation_operations=3 if profile == "bounded_validation" else None,
         bounded_validation_attestation_sha256=(
-            "1" * 64 if profile == "full_collection" else None
+            "1" * 64
+            if profile == "full_collection" and not lab_unvalidated_full_run
+            else None
         ),
+        lab_unvalidated_full_run=lab_unvalidated_full_run,
     )
     return manifest, config, plan, truth, binding, fixture_catalog, permit
 
@@ -480,6 +484,31 @@ def test_v3_full_permit_selects_every_plan_operation_once_in_original_order():
             truth,
             binding,
             fixture_catalog,
+        )
+
+
+def test_v3_full_lab_waiver_is_explicit_and_mutually_exclusive():
+    *_models, permit = permitted(
+        profile="full_collection",
+        lab_unvalidated_full_run=True,
+    )
+    assert permit.bounded_validation_attestation_sha256 is None
+    assert permit.lab_unvalidated_full_run is True
+    assert permit.lab_waiver_statement == LAB_FULL_RUN_WAIVER
+    with pytest.raises(ValidationError, match="exactly one"):
+        type(permit).model_validate(
+            {
+                **permit.model_dump(mode="json"),
+                "bounded_validation_attestation_sha256": "1" * 64,
+            }
+        )
+    with pytest.raises(ValidationError, match="exactly one"):
+        type(permit).model_validate(
+            {
+                **permit.model_dump(mode="json"),
+                "lab_unvalidated_full_run": False,
+                "lab_waiver_statement": None,
+            }
         )
 
 

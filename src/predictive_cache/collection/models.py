@@ -159,6 +159,10 @@ class AdapterValidationPermit(StrictModel):
 
 
 WorkloadPermitProfile = Literal["bounded_validation", "full_collection"]
+LAB_FULL_RUN_WAIVER = (
+    "Unvalidated one-shot lab full run: bounded PASS attestation was "
+    "explicitly waived by the user."
+)
 WorkloadValidationRole = Literal[
     "ordinary",
     "repeated_range",
@@ -199,6 +203,11 @@ class WorkloadCollectionPermit(StrictModel):
     interpreter_path: str
     interpreter_sha256: Sha256
     bounded_validation_attestation_sha256: Sha256 | None = None
+    lab_unvalidated_full_run: bool = False
+    lab_waiver_statement: Literal[
+        "Unvalidated one-shot lab full run: bounded PASS attestation was "
+        "explicitly waived by the user."
+    ] | None = None
     operation_indexes: tuple[Annotated[int, Field(ge=0, strict=True)], ...]
     intent_ids: tuple[Sha256, ...]
     operation_ids: tuple[Sha256, ...]
@@ -240,6 +249,8 @@ class WorkloadCollectionPermit(StrictModel):
         if self.execution_relative_ms != tuple(sorted(self.execution_relative_ms)):
             raise ValueError("permit execution timestamps must remain ordered")
         if self.profile == "bounded_validation":
+            if self.lab_unvalidated_full_run or self.lab_waiver_statement is not None:
+                raise ValueError("bounded permit must not carry a full-run lab waiver")
             if self.bounded_validation_attestation_sha256 is not None:
                 raise ValueError(
                     "bounded permit must not bind a prior bounded attestation"
@@ -258,9 +269,15 @@ class WorkloadCollectionPermit(StrictModel):
                     "bounded validation roles must be the canonical relation prefix"
                 )
         else:
-            if self.bounded_validation_attestation_sha256 is None:
+            has_attestation = self.bounded_validation_attestation_sha256 is not None
+            has_lab_waiver = (
+                self.lab_unvalidated_full_run
+                and self.lab_waiver_statement == LAB_FULL_RUN_WAIVER
+            )
+            if has_attestation == has_lab_waiver:
                 raise ValueError(
-                    "full collection permit requires bounded PASS attestation"
+                    "full collection permit requires exactly one of bounded "
+                    "PASS attestation or explicit lab waiver"
                 )
             if self.operation_indexes != tuple(range(selected)):
                 raise ValueError(
@@ -791,6 +808,8 @@ class WorkloadProviderInvocationRecord(StrictModel):
     validated_code_head_sha256: GitObjectId
     validated_merge_commit_sha256: GitObjectId
     validated_tree_sha256: GitObjectId
+    lab_unvalidated_full_run: bool = False
+    lab_waiver_statement: str | None = None
     argv_contract: tuple[str, ...]
     actions: tuple[str, ...]
     created_at: datetime
@@ -867,6 +886,8 @@ class WorkloadProviderDeclaration(LiveProviderDeclaration):
     runbook_sha256: Sha256
     adapter_wrapper_sha256: Sha256
     cleaner_wrapper_sha256: Sha256
+    lab_unvalidated_full_run: bool = False
+    lab_waiver_statement: str | None = None
 
 
 class WorkloadBoundedValidationAttestation(StrictModel):
@@ -939,7 +960,9 @@ class WorkloadLiveFinalizationDeclaration(StrictModel):
     provider_manifest_sha256: Sha256
     imported_manifest_sha256: Sha256
     cleaned_manifest_sha256: Sha256
-    bounded_attestation_sha256: Sha256
+    bounded_attestation_sha256: Sha256 | None = None
+    lab_unvalidated_full_run: bool = False
+    lab_waiver_statement: str | None = None
     validated_code_head_sha256: GitObjectId
     validated_merge_commit_sha256: GitObjectId
     validated_tree_sha256: GitObjectId

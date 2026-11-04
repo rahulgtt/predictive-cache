@@ -43,6 +43,7 @@ from .models import (
     ExecutionResult,
     FixtureCatalog,
     JsonlEvidence,
+    LAB_FULL_RUN_WAIVER,
     ObservedEvent,
     OfferedOperation,
     WorkloadCollectionManifest,
@@ -685,6 +686,7 @@ def build_workload_collection_permit(
     execution_start_time: datetime,
     validation_operations: int | None = None,
     bounded_validation_attestation_sha256: str | None = None,
+    lab_unvalidated_full_run: bool = False,
 ) -> WorkloadCollectionPermit:
     """Build and immediately cross-check a manifest-v3 workload permit."""
 
@@ -736,6 +738,10 @@ def build_workload_collection_permit(
         interpreter_sha256=interpreter_sha256,
         bounded_validation_attestation_sha256=(
             bounded_validation_attestation_sha256
+        ),
+        lab_unvalidated_full_run=lab_unvalidated_full_run,
+        lab_waiver_statement=(
+            LAB_FULL_RUN_WAIVER if lab_unvalidated_full_run else None
         ),
         operation_indexes=indexes,
         intent_ids=intent_ids,
