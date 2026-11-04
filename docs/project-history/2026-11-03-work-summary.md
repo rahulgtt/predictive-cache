@@ -26,7 +26,7 @@ Sessions: Implement plan dispatcher, Review and integrate dispatcher
 
 Implemented the controller that converts model serving plans into bounded warming work. It added:
 
-- `pcache-dispatch` CLI
+- `pcache-dispatcher` CLI
 - Strict serving-plan schemas and validation
 - Secure filesystem handling
 - Subprocess result tracking
@@ -102,7 +102,14 @@ Exercised the existing trainer rather than adding a new model:
 - Ran 123 targeted tests with three skips
 - Kept ClearML disabled
 
-It identified two concrete missing product surfaces: no production clean-output-to-training-snapshot command and no `pcache-eval` CLI. The private 300-event dataset was also imported and cleaned; all 300 events were correctly excluded as synthetic, leaving zero production-demand rows.
+It identified two concrete missing product surfaces at the time: no production
+clean-output-to-training-snapshot command and no `pcache-eval` CLI. The private
+300-event dataset was also imported and cleaned; all 300 events were correctly
+excluded as synthetic, leaving zero production-demand rows.
+
+**Current correction:** [PR #78](https://github.com/rahulgtt/predictive-cache/pull/78)
+subsequently merged `pcache-eval`. A production
+clean-output-to-training-snapshot command remains absent.
 
 ## 10. Private dataset packaging and repository access guide
 
@@ -120,4 +127,26 @@ The original sanitized-publication idea was cancelled after the requirements cha
 
 The documentation was committed separately without private paths, handles, identities, or dataset bytes.
 
-**Verified addendum:** Group 10 opened [PR #94](https://github.com/rahulgtt/predictive-cache/pull/94), **“Document owner-private controlled dataset access.”** It remains open and contains documentation only—no private dataset bytes or exact storage paths.
+**Current correction:** Group 10's
+[PR #94](https://github.com/rahulgtt/predictive-cache/pull/94) merged the
+documentation-only owner-private access guide. No private dataset bytes or
+exact storage paths were added. [PR #95](https://github.com/rahulgtt/predictive-cache/pull/95)
+then added the terminal retain-all behavior, and
+[PR #97](https://github.com/rahulgtt/predictive-cache/pull/97) merged the final
+wording that distinguishes the private package snapshot from the indefinite
+retain-all disposition for all 13 roots.
+
+## Subsequent semantic and workload implementation
+
+After this summary window,
+[PR #107](https://github.com/rahulgtt/predictive-cache/pull/107) merged the
+versioned `read-demand-v1` projection across datagen, Chimera import, cleaning,
+features, snapshots, model packages, training, and evaluation. It uses
+successful READ facts only and rejects OPEN/CLOSE/session/handle lifecycle
+inference.
+
+The follow-up workload integration adds an offline-only manifest-v3 profile for
+a deterministic three-hour planted READ workload. The seed-42 candidate
+contains 165 aligned READs, repeated ranges, popularity tiers, co-read groups,
+sequential patterns, and burst/quiet windows. It preserves manifest-v2's
+five-hour collection unchanged and does not authorize or start live NFS I/O.

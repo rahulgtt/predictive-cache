@@ -532,6 +532,10 @@ key are skipped.
    `conf`, `lift`), with `fit_start`, `fit_end`, `delta_s` and the parent
    dataset ID recorded in the snapshot manifest.
 
+Under the `read-demand-v1` view, `CoReadTable` replaces this table: it uses
+direct-successor READ runs per volume with no session key. See
+[read-demand-v1 § Co-read table and candidates](read-demand-v1.md#co-read-table-and-candidates).
+
 How fits map to ticks is in §8.2. Order-2 context (A→B→C vs D→B→E, datagen
 §7.1) is not in v1 (§15).
 
@@ -574,6 +578,11 @@ function can't leak. The result is a bounded union:
   consulted. Ineligible files are dropped and counted.
 - **Coverage** is measured in the snapshot `universe` table (§8.5), never
   inferred.
+
+Under the `read-demand-v1` view the sources, the view methods, eligibility
+and the per-tick `anchor_file_id` are redefined from eligible READs, and
+`project` is disabled until `dir_id` is verified. See
+[read-demand-v1 § Co-read table and candidates](read-demand-v1.md#co-read-table-and-candidates).
 
 ## 7. Labels
 

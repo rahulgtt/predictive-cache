@@ -32,6 +32,17 @@ from .models import (
     OfferedOperation,
     PreReadHealth,
     ReconciliationReport,
+    WorkloadCollectionManifest,
+    WorkloadCollectionPermit,
+    WorkloadEvidenceBinding,
+    WorkloadReconciliationReport,
+    parse_collection_manifest,
+)
+from .workload import (
+    WorkloadExecutionPlan,
+    checkpoint_schedule,
+    execution_plan_sha256,
+    run_bound_operation_id,
 )
 
 _LIBC = ctypes.CDLL(None)
@@ -83,12 +94,14 @@ class CommandCheckpointProvider:
         package_sha256: str,
         timeout_s: int = 30,
         python_executable: str = "python3",
+        permit_path: Path | None = None,
     ) -> None:
         self.script = script.absolute()
         self.package = package.absolute()
         self.run_dir = run_dir.absolute()
         self.timeout_s = timeout_s
         self.python_executable = python_executable
+        self.permit_path = permit_path.absolute() if permit_path is not None else None
         self._script_fd = self._open_verified(self.script, script_sha256)
         try:
             self._package_fd = self._open_verified(
@@ -131,7 +144,7 @@ class CommandCheckpointProvider:
             raise RuntimeError("provider runtime artifacts are closed")
         os.lseek(self._script_fd, 0, os.SEEK_SET)
         os.lseek(self._package_fd, 0, os.SEEK_SET)
-        return [
+        command = [
             self.python_executable,
             "-I",
             "-S",
@@ -141,8 +154,11 @@ class CommandCheckpointProvider:
             f"/proc/self/fd/{self._script_fd}",
             action,
             self.run_dir,
-            *arguments,
         ]
+        if self.permit_path is not None:
+            command.extend(("--permit-path", self.permit_path))
+        command.extend(arguments)
+        return command
 
     def collect(self, scheduled_at: datetime) -> list[Checkpoint]:
         completed = subprocess.run(
@@ -417,6 +433,135 @@ def planned_operations(
         identity = operation_id(manifest, fixture.fixture_id, index, offset, actual_count)
         operations.append((index, fixture, offset, actual_count, identity))
     return operations
+
+
+def planned_workload_operations(
+    manifest: WorkloadCollectionManifest,
+    catalog: FixtureCatalog,
+    plan: WorkloadExecutionPlan,
+) -> list[tuple[int, FixtureEntry, int, int, str]]:
+    if catalog_sha256(catalog) != manifest.fixture_catalog_sha256:
+        raise ValueError("fixture catalog checksum mismatch")
+    if execution_plan_sha256(plan) != manifest.execution_plan_sha256:
+        raise ValueError("execution plan checksum mismatch")
+    if plan.fixture_catalog_sha256 != manifest.fixture_catalog_sha256:
+        raise ValueError("execution plan fixture catalog checksum mismatch")
+    if plan.workload_config_sha256 != manifest.execution_config_sha256:
+        raise ValueError("execution plan config checksum mismatch")
+    if plan.semantic_view_id != manifest.semantic_view_id or (
+        plan.semantic_view_sha256 != manifest.semantic_view_sha256
+    ):
+        raise ValueError("execution plan semantic view mismatch")
+    if plan.planned_operation_count != manifest.planned_operation_count:
+        raise ValueError("execution plan operation count mismatch")
+    if any(
+        (
+            plan.operation_schedule_tolerance_s
+            != manifest.operation_schedule_tolerance_s,
+            plan.seed != manifest.seed,
+            plan.untagged_correlation_window_s
+            != manifest.untagged_correlation_window_s,
+            (plan.range_bytes,) != manifest.range_bytes,
+            plan.range_offsets != manifest.range_offsets,
+        )
+    ):
+        raise ValueError("execution plan controls differ from the run manifest")
+    if plan.duration_ms != int(
+        (manifest.end_time - manifest.start_time).total_seconds() * 1000
+    ):
+        raise ValueError("execution plan duration mismatch")
+    fixtures = {fixture.fixture_id: fixture for fixture in catalog.fixtures}
+    plan_hash = execution_plan_sha256(plan)
+    operations = []
+    for index, intent in enumerate(plan.intents):
+        fixture = fixtures.get(intent.fixture_id)
+        if fixture is None:
+            raise ValueError("execution plan references a fixture outside the catalog")
+        if any(
+            (
+                fixture.volume_id != manifest.volume_id,
+                fixture.export_id != manifest.export_id,
+                intent.offset not in manifest.range_offsets,
+                intent.count not in manifest.range_bytes,
+                intent.offset + intent.count > fixture.size_bytes,
+            )
+        ):
+            raise ValueError("execution plan range is outside the frozen manifest/catalog")
+        operations.append(
+            (
+                index,
+                fixture,
+                intent.offset,
+                intent.count,
+                run_bound_operation_id(
+                    manifest.run_id,
+                    plan_hash,
+                    intent.intent_id,
+                ),
+            )
+        )
+    return operations
+
+
+def _validate_repeated_offer_spacing(
+    manifest: WorkloadCollectionManifest,
+    offered: list[OfferedOperation],
+) -> None:
+    minimum = timedelta(
+        seconds=(
+            manifest.untagged_correlation_window_s
+            + manifest.operation_schedule_tolerance_s
+        )
+    )
+    previous: dict[tuple[str, str, int, int], datetime] = {}
+    for operation in offered:
+        key = (
+            operation.volume_id,
+            operation.file_id,
+            operation.offset,
+            operation.count,
+        )
+        if key in previous and operation.offered_at_utc - previous[key] <= minimum:
+            raise ValueError(
+                "identical workload ranges must exceed correlation plus schedule tolerance"
+            )
+        previous[key] = operation.offered_at_utc
+
+
+def _validate_actual_workload_cadence(
+    plan: WorkloadExecutionPlan,
+    offered: list[OfferedOperation],
+) -> None:
+    """Fail closed on actual gaps/caps; never catch up after a late offer."""
+
+    times = [
+        int(operation.offered_at_utc.timestamp() * 1000)
+        for operation in offered
+    ]
+    if times != sorted(times):
+        raise ValueError("actual workload offer times must be ordered")
+    if any(
+        right - left < plan.min_offer_gap_ms
+        for left, right in zip(times, times[1:])
+    ):
+        raise ValueError("actual workload offer gap is below the frozen minimum")
+    for window_ms, cap in (
+        (plan.short_window_ms, plan.short_window_max_offers),
+        (plan.long_window_ms, plan.long_window_max_offers),
+    ):
+        active: list[int] = []
+        for current in times:
+            active = [
+                value
+                for value in active
+                if value > current - window_ms
+            ]
+            active.append(current)
+            if len(active) > cap:
+                raise ValueError(
+                    f"actual workload offers exceed {cap} in "
+                    f"half-open {window_ms}ms"
+                )
 
 
 def correlate_untagged_events(
@@ -746,16 +891,19 @@ class CollectionRunner:
 
     def run(
         self,
-        manifest: CollectionManifest,
+        manifest: CollectionManifest | WorkloadCollectionManifest,
         catalog: FixtureCatalog,
         evidence_dir: Path,
         executor: ReadExecutor,
         *,
+        execution_plan: WorkloadExecutionPlan | None = None,
         simulated_timing: bool = False,
         checkpoint_provider: CheckpointProvider | None = None,
         persistent_stop: Callable[[], str | None] | None = None,
         operation_limit: int | None = None,
         validation_mode: bool = False,
+        workload_permit: WorkloadCollectionPermit | None = None,
+        workload_permit_sha256: str | None = None,
     ) -> int:
         if sha256(evidence_dir / "cluster-provenance-v1.json") != (
             manifest.cluster_manifest_sha256
@@ -771,12 +919,53 @@ class CollectionRunner:
         results = evidence_dir / "execution.jsonl"
         existing = read_models(ledger, OfferedOperation) if ledger.exists() else []
         completed_results = read_models(results, ExecutionResult) if results.exists() else []
-        expected = planned_operations(manifest, catalog)
+        if isinstance(manifest, WorkloadCollectionManifest):
+            if execution_plan is None:
+                raise ValueError("workload manifest v3 requires its execution plan")
+            all_expected = planned_workload_operations(
+                manifest,
+                catalog,
+                execution_plan,
+            )
+            if workload_permit is None:
+                expected = all_expected
+            else:
+                if workload_permit.run_id != manifest.run_id:
+                    raise ValueError("workload permit run identity mismatch")
+                by_index = {item[0]: item for item in all_expected}
+                try:
+                    expected = [
+                        by_index[index]
+                        for index in workload_permit.operation_indexes
+                    ]
+                except KeyError as error:
+                    raise ValueError(
+                        "workload permit references an unknown plan index"
+                    ) from error
+                if tuple(item[4] for item in expected) != (
+                    workload_permit.operation_ids
+                ):
+                    raise ValueError(
+                        "workload permit operation IDs differ from the plan"
+                    )
+        else:
+            if execution_plan is not None:
+                raise ValueError("manifest v2 must not receive a workload execution plan")
+            expected = planned_operations(manifest, catalog)
         if operation_limit is not None:
+            if isinstance(manifest, WorkloadCollectionManifest):
+                raise ValueError(
+                    "workload manifest v3 uses exact permit-selected operations"
+                )
             if operation_limit < 1 or operation_limit > 3:
                 raise ValueError("bounded validation permits one to three operations")
             expected = expected[:operation_limit]
         live_mount = isinstance(executor, DirectMountExecutor)
+        if live_mount and isinstance(manifest, WorkloadCollectionManifest):
+            if workload_permit is None or workload_permit_sha256 is None:
+                raise ValueError(
+                    "workload manifest v3 live execution requires an immutable permit"
+                )
         if live_mount and checkpoint_provider is None:
             raise ValueError("controlled mount execution requires a checkpoint provider")
         if live_mount and existing:
@@ -785,7 +974,28 @@ class CollectionRunner:
             raise RuntimeError("supervised restart is ambiguous; start a new run")
         if live_mount and not executor.allow_non_nfs_for_test:
             expected_offsets = (0, 12288, 24576, 36864, 49152)
-            if (
+            if isinstance(manifest, WorkloadCollectionManifest):
+                if (
+                    len(catalog.fixtures) != 60
+                    or any(
+                        fixture.size_bytes < 65536
+                        for fixture in catalog.fixtures
+                    )
+                    or manifest.max_concurrency != 1
+                    or manifest.range_bytes != (4096,)
+                    or manifest.range_offsets != expected_offsets
+                    or manifest.tag_mode != "empty"
+                    or execution_plan is None
+                    or execution_plan.min_offer_gap_ms < 20_000
+                    or execution_plan.short_window_ms != 60_000
+                    or execution_plan.short_window_max_offers > 3
+                    or execution_plan.long_window_ms != 900_000
+                    or execution_plan.long_window_max_offers > 25
+                ):
+                    raise ValueError(
+                        "direct mount execution requires the approved v3 profile"
+                    )
+            elif (
                 len(catalog.fixtures) != 60
                 or any(fixture.size_bytes != 65536 for fixture in catalog.fixtures)
                 or manifest.offered_count != 300
@@ -794,7 +1004,9 @@ class CollectionRunner:
                 or manifest.range_offsets != expected_offsets
                 or manifest.tag_mode != "empty"
             ):
-                raise ValueError("direct mount execution requires the authorized live profile")
+                raise ValueError(
+                    "direct mount execution requires the authorized live profile"
+                )
         if len(existing) > len(expected):
             raise ValueError("ledger contains more operations than the manifest")
         if len(existing) != len(completed_results):
@@ -802,6 +1014,18 @@ class CollectionRunner:
         for actual, planned in zip(existing, expected, strict=False):
             if actual.operation_id != planned[4] or actual.operation_index != planned[0]:
                 raise ValueError("ledger identity mismatch on restart")
+            if isinstance(manifest, WorkloadCollectionManifest):
+                planned_at = manifest.start_time + timedelta(
+                    milliseconds=execution_plan.intents[planned[0]].relative_ms
+                )
+                if (
+                    abs((actual.offered_at_utc - planned_at).total_seconds())
+                    > manifest.operation_schedule_tolerance_s
+                ):
+                    raise ValueError("workload ledger timestamp differs from execution plan")
+        if isinstance(manifest, WorkloadCollectionManifest):
+            _validate_repeated_offer_spacing(manifest, existing)
+            _validate_actual_workload_cadence(execution_plan, existing)
         for operation, result in zip(existing, completed_results, strict=True):
             if operation.operation_id != result.operation_id:
                 raise ValueError("execution result identity mismatch on restart")
@@ -811,7 +1035,11 @@ class CollectionRunner:
                 raise RuntimeError(f"prior foreground read error for {operation.operation_id}")
             if result.latency_ms > manifest.stop_rules.latency_guardrail_ms:
                 raise RuntimeError(f"prior latency guardrail breach for {operation.operation_id}")
-        interval = 1.0 / manifest.offered_rate_per_s
+        interval = (
+            None
+            if isinstance(manifest, WorkloadCollectionManifest)
+            else 1.0 / manifest.offered_rate_per_s
+        )
         completed = len(existing)
         schedule_anchor_wall = self.now()
         schedule_anchor_monotonic_ns = self.monotonic_ns()
@@ -819,16 +1047,18 @@ class CollectionRunner:
         checkpoint_path = evidence_dir / "checkpoints.jsonl"
         health_path = evidence_dir / "pre-read-health.jsonl"
         scheduled = [
-            manifest.start_time
-            + timedelta(seconds=manifest.checkpoint_interval_s * index)
-            for index in range(
-                int(
-                    (manifest.end_time - manifest.start_time).total_seconds()
-                    / manifest.checkpoint_interval_s
-                )
-                + 1
+            manifest.start_time + timedelta(milliseconds=relative_ms)
+            for relative_ms in checkpoint_schedule(
+                int((manifest.end_time - manifest.start_time).total_seconds() * 1000),
+                manifest.checkpoint_interval_s,
             )
         ]
+        if (
+            isinstance(manifest, WorkloadCollectionManifest)
+            and workload_permit is not None
+            and workload_permit.profile == "bounded_validation"
+        ):
+            scheduled = [workload_permit.execution_start_time]
         next_checkpoint = 0
         durable_events: list[CollectorDurableEvent] = []
         canonical_observed: list[ObservedEvent] = []
@@ -864,10 +1094,30 @@ class CollectionRunner:
                     raise RuntimeError("; ".join(reasons))
                 next_checkpoint += 1
 
-        for planned in expected[completed:]:
-            target_wall = manifest.start_time + timedelta(
-                seconds=planned[0] * interval
-            )
+        for selected_position, planned in enumerate(
+            expected[completed:],
+            start=completed,
+        ):
+            if isinstance(manifest, WorkloadCollectionManifest):
+                target_wall = (
+                    workload_permit.execution_start_time
+                    + timedelta(
+                        milliseconds=workload_permit.execution_relative_ms[
+                            selected_position
+                        ]
+                    )
+                    if workload_permit is not None
+                    else manifest.start_time
+                    + timedelta(
+                        milliseconds=execution_plan.intents[
+                            planned[0]
+                        ].relative_ms
+                    )
+                )
+            else:
+                target_wall = manifest.start_time + timedelta(
+                    seconds=planned[0] * interval
+                )
             if simulated_timing:
                 offered_at = target_wall
             else:
@@ -901,6 +1151,18 @@ class CollectionRunner:
                 monotonic_ns=self.monotonic_ns(),
                 timing_mode="simulated" if simulated_timing else "wallclock",
             )
+            if isinstance(manifest, WorkloadCollectionManifest):
+                _validate_actual_workload_cadence(
+                    execution_plan,
+                    [
+                        *(
+                            read_models(ledger, OfferedOperation)
+                            if ledger.exists()
+                            else []
+                        ),
+                        operation,
+                    ],
+                )
             if checkpoint_provider is not None:
                 supervised_started_ns = self.monotonic_ns()
                 health_requested_at = (
@@ -978,7 +1240,19 @@ class CollectionRunner:
                         raise RuntimeError("pre-read health barrier failed")
                 stop_if_requested()
             append_model(ledger, operation)
+            if isinstance(manifest, WorkloadCollectionManifest):
+                _validate_repeated_offer_spacing(
+                    manifest,
+                    read_models(ledger, OfferedOperation),
+                )
             result = executor.read(operation)
+            if simulated_timing and result.executor_kind == "dry-run":
+                result = result.model_copy(
+                    update={
+                        "completed_at_utc": operation.offered_at_utc,
+                        "latency_ms": 0,
+                    }
+                )
             if checkpoint_provider is not None:
                 supervised_latency_ms = (
                     self.monotonic_ns() - supervised_started_ns
@@ -1046,6 +1320,56 @@ class CollectionRunner:
                     read_models(ledger, OfferedOperation),
                     unresolved,
                 )
+                if (
+                    isinstance(manifest, WorkloadCollectionManifest)
+                    and workload_permit is not None
+                    and workload_permit_sha256 is not None
+                ):
+                    observed = next(
+                        item
+                        for item in canonical_observed
+                        if item.operation_id == operation.operation_id
+                    )
+                    binding = WorkloadEvidenceBinding(
+                        run_id=manifest.run_id,
+                        permit_sha256=workload_permit_sha256,
+                        execution_plan_sha256=manifest.execution_plan_sha256,
+                        operation_index=operation.operation_index,
+                        intent_id=execution_plan.intents[
+                            operation.operation_index
+                        ].intent_id,
+                        operation_id=operation.operation_id,
+                        role=(
+                            workload_permit.roles[selected_position]
+                            if workload_permit.profile
+                            == "bounded_validation"
+                            else None
+                        ),
+                        original_relative_ms=execution_plan.intents[
+                            operation.operation_index
+                        ].relative_ms,
+                        scheduled_at_utc=target_wall,
+                        offered_at_utc=operation.offered_at_utc,
+                        event_id=provider_event.event_id,
+                        producer_epoch=provider_event.producer_epoch,
+                        producer_sequence=provider_event.producer_sequence,
+                        raw_jsonl_path=provider_event.raw_jsonl_path,
+                        raw_jsonl_sha256=provider_event.raw_jsonl_sha256,
+                        raw_line_number=provider_event.raw_line_number,
+                        raw_record_sha256=provider_event.raw_record_sha256,
+                        observed_sha256=hashlib.sha256(
+                            (
+                                canonical_json(
+                                    observed.model_dump(mode="json")
+                                )
+                                + "\n"
+                            ).encode()
+                        ).hexdigest(),
+                    )
+                    append_model(
+                        evidence_dir / "workload-evidence.jsonl",
+                        binding,
+                    )
         if checkpoint_provider is not None:
             if validation_mode:
                 reasons = checkpoint_stop_reasons(
@@ -1175,8 +1499,11 @@ def reconcile(
     checkpoints: list[Checkpoint],
     collector_files: CollectorFileManifest,
     evidence_root: Path | None = None,
-) -> ReconciliationReport:
-    manifest = CollectionManifest.model_validate_json(manifest_path.read_text())
+    *,
+    workload_permit: WorkloadCollectionPermit | None = None,
+    workload_permit_sha256: str | None = None,
+) -> ReconciliationReport | WorkloadReconciliationReport:
+    manifest = parse_collection_manifest(manifest_path.read_bytes())
     offered = read_models(ledger_path, OfferedOperation)
     observed = read_models(observed_path, ObservedEvent)
     if manifest.tag_mode == "empty":
@@ -1240,8 +1567,21 @@ def reconcile(
                     failures.append("collector source file checksum mismatch")
             except (FileNotFoundError, OSError, ValueError):
                 failures.append("collector source file unavailable")
-    if len(offered_ids) != manifest.offered_count or len(offered_ids) != len(offered_set):
+    expected_count = (
+        len(workload_permit.operation_ids)
+        if workload_permit is not None
+        else manifest.planned_operation_count
+        if isinstance(manifest, WorkloadCollectionManifest)
+        else manifest.offered_count
+    )
+    if len(offered_ids) != expected_count or len(offered_ids) != len(offered_set):
         failures.append("offered ledger count or uniqueness mismatch")
+    if workload_permit is not None and (
+        tuple(offered_ids) != workload_permit.operation_ids
+        or tuple(item.operation_index for item in offered)
+        != workload_permit.operation_indexes
+    ):
+        failures.append("offered ledger differs from workload permit selection")
     if duplicate_ids:
         failures.append("duplicate durable operation IDs")
     if missing:
@@ -1276,7 +1616,17 @@ def reconcile(
     invalid_exclusions = sorted(set(exclusions) - set(manifest.allowed_exclusion_reasons))
     if invalid_exclusions:
         failures.append("unapproved exclusion reasons")
-    failures.extend(checkpoint_stop_reasons(manifest, checkpoints, evidence_root))
+    failures.extend(
+        checkpoint_stop_reasons(
+            manifest,
+            checkpoints,
+            evidence_root,
+            require_complete=not (
+                workload_permit is not None
+                and workload_permit.profile == "bounded_validation"
+            ),
+        )
+    )
     checkpoint_epochs = {(item.pod_uid, item.producer_epoch) for item in checkpoints}
     for item in observed:
         if (item.pod_uid, item.producer_epoch) not in checkpoint_epochs:
@@ -1306,7 +1656,7 @@ def reconcile(
             -1,
         ):
             failures.append("observed producer sequence exceeds checkpoint watermark")
-    return ReconciliationReport(
+    common = dict(
         run_id=manifest.run_id,
         manifest_sha256=sha256(manifest_path),
         ledger_sha256=sha256(ledger_path),
@@ -1321,4 +1671,39 @@ def reconcile(
         pod_epochs={key: tuple(sorted(value)) for key, value in sorted(pod_epochs.items())},
         success=not failures,
         failures=tuple(sorted(set(failures))),
+    )
+    if workload_permit is None:
+        return ReconciliationReport(**common)
+    if evidence_root is None or workload_permit_sha256 is None:
+        raise ValueError("workload reconciliation requires permit evidence")
+    workload_evidence_path = evidence_root / "workload-evidence.jsonl"
+    workload_evidence = read_models(
+        workload_evidence_path,
+        WorkloadEvidenceBinding,
+    )
+    if (
+        len(workload_evidence) != expected_count
+        or tuple(item.operation_id for item in workload_evidence)
+        != workload_permit.operation_ids
+        or any(
+            item.permit_sha256 != workload_permit_sha256
+            or item.execution_plan_sha256
+            != workload_permit.execution_plan_sha256
+            for item in workload_evidence
+        )
+    ):
+        common["success"] = False
+        common["failures"] = tuple(
+            sorted(
+                set(common["failures"])
+                | {"workload evidence binding is incomplete"}
+            )
+        )
+    return WorkloadReconciliationReport(
+        **common,
+        permit_sha256=workload_permit_sha256,
+        execution_plan_sha256=workload_permit.execution_plan_sha256,
+        operation_indexes=workload_permit.operation_indexes,
+        operation_ids=workload_permit.operation_ids,
+        workload_evidence_sha256=sha256(workload_evidence_path),
     )

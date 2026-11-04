@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
@@ -155,6 +156,150 @@ class AdapterValidationPermit(StrictModel):
         if len(self.operation_ids) != self.validation_operations:
             raise ValueError("validation operation IDs must match the approved count")
         return self
+
+
+WorkloadPermitProfile = Literal["bounded_validation", "full_collection"]
+WorkloadValidationRole = Literal[
+    "ordinary",
+    "repeated_range",
+    "sequential_range",
+]
+
+
+class WorkloadCollectionPermit(StrictModel):
+    """Immutable manifest-v3 approval, distinct from the v2 adapter permit."""
+
+    validation_permit_version: Literal[3] = 3
+    permit_id: CanonicalUuid
+    profile: WorkloadPermitProfile
+    run_id: SafeId
+    manifest_sha256: Sha256
+    manifest_file_sha256: Sha256
+    workload_config_sha256: Sha256
+    workload_config_file_sha256: Sha256
+    execution_plan_sha256: Sha256
+    execution_plan_file_sha256: Sha256
+    workload_truth_sha256: Sha256
+    workload_truth_file_sha256: Sha256
+    truth_binding_sha256: Sha256
+    truth_binding_file_sha256: Sha256
+    fixture_catalog_sha256: Sha256
+    fixture_catalog_file_sha256: Sha256
+    semantic_view_sha256: Sha256
+    validated_code_head_sha256: GitObjectId
+    validated_merge_commit_sha256: GitObjectId
+    validated_tree_sha256: GitObjectId
+    provider_package_sha256: Sha256
+    provider_sha256: Sha256
+    collector_sha256: Sha256
+    validator_sha256: Sha256
+    runbook_sha256: Sha256
+    adapter_wrapper_sha256: Sha256
+    cleaner_wrapper_sha256: Sha256
+    interpreter_path: str
+    interpreter_sha256: Sha256
+    bounded_validation_attestation_sha256: Sha256 | None = None
+    operation_indexes: tuple[Annotated[int, Field(ge=0, strict=True)], ...]
+    intent_ids: tuple[Sha256, ...]
+    operation_ids: tuple[Sha256, ...]
+    roles: tuple[WorkloadValidationRole, ...]
+    original_relative_ms: tuple[Annotated[int, Field(ge=0, strict=True)], ...]
+    execution_start_time: datetime
+    execution_relative_ms: tuple[Annotated[int, Field(ge=0, strict=True)], ...]
+    schedule_tolerance_s: Annotated[int, Field(ge=0, le=59, strict=True)]
+    status: Literal["approved"] = "approved"
+    expires_at: datetime
+
+    _execution_start_utc = field_validator("execution_start_time")(_utc)
+    _expires_utc = field_validator("expires_at")(_utc)
+
+    @model_validator(mode="after")
+    def exact_profile_shape(self) -> WorkloadCollectionPermit:
+        selected = len(self.operation_indexes)
+        if (
+            selected == 0
+            or len(self.intent_ids) != selected
+            or len(self.operation_ids) != selected
+            or len(self.roles) != selected
+            or len(self.original_relative_ms) != selected
+            or len(self.execution_relative_ms) != selected
+        ):
+            raise ValueError(
+                "workload permit selection fields must have equal nonzero length"
+            )
+        if len(set(self.operation_indexes)) != selected:
+            raise ValueError("workload permit operation indexes must be unique")
+        if len(set(self.intent_ids)) != selected:
+            raise ValueError("workload permit intent IDs must be unique")
+        if len(set(self.operation_ids)) != selected:
+            raise ValueError("workload permit operation IDs must be unique")
+        if self.operation_indexes != tuple(sorted(self.operation_indexes)):
+            raise ValueError("workload permit operations must remain in plan order")
+        if self.original_relative_ms != tuple(sorted(self.original_relative_ms)):
+            raise ValueError("original plan timestamps must remain ordered")
+        if self.execution_relative_ms != tuple(sorted(self.execution_relative_ms)):
+            raise ValueError("permit execution timestamps must remain ordered")
+        if self.profile == "bounded_validation":
+            if self.bounded_validation_attestation_sha256 is not None:
+                raise ValueError(
+                    "bounded permit must not bind a prior bounded attestation"
+                )
+            if not 1 <= selected <= 3:
+                raise ValueError(
+                    "bounded validation requires one to three operations"
+                )
+            expected_roles = (
+                "ordinary",
+                "repeated_range",
+                "sequential_range",
+            )[:selected]
+            if self.roles != expected_roles:
+                raise ValueError(
+                    "bounded validation roles must be the canonical relation prefix"
+                )
+        else:
+            if self.bounded_validation_attestation_sha256 is None:
+                raise ValueError(
+                    "full collection permit requires bounded PASS attestation"
+                )
+            if self.operation_indexes != tuple(range(selected)):
+                raise ValueError(
+                    "full collection operations must be complete and in original order"
+                )
+            if self.roles != tuple("ordinary" for _ in range(selected)):
+                raise ValueError("full collection does not use bounded validation roles")
+        return self
+
+
+WorkloadValidationPermit = WorkloadCollectionPermit
+
+
+class WorkloadEvidenceBinding(StrictModel):
+    """Harness-owned v3 lineage from the plan occurrence to immutable raw evidence."""
+
+    workload_evidence_binding_version: Literal[1] = 1
+    run_id: SafeId
+    permit_sha256: Sha256
+    execution_plan_sha256: Sha256
+    operation_index: int = Field(ge=0)
+    intent_id: Sha256
+    operation_id: Sha256
+    role: WorkloadValidationRole | None = None
+    original_relative_ms: int = Field(ge=0)
+    scheduled_at_utc: datetime
+    offered_at_utc: datetime
+    event_id: CanonicalUuid
+    producer_epoch: ProducerEpoch
+    producer_sequence: int = Field(gt=0)
+    raw_jsonl_path: str
+    raw_jsonl_sha256: Sha256
+    raw_line_number: int = Field(gt=0)
+    raw_record_sha256: Sha256
+    observed_sha256: Sha256
+
+    _scheduled_utc = field_validator("scheduled_at_utc")(_utc)
+    _offered_utc = field_validator("offered_at_utc")(_utc)
+    _raw_path = field_validator("raw_jsonl_path")(_safe_relative)
 
 
 CleanupRootKind = Literal[
@@ -626,6 +771,33 @@ class ProviderInvocationRecord(StrictModel):
     _created_utc = field_validator("created_at")(_utc)
 
 
+class WorkloadProviderInvocationRecord(StrictModel):
+    provider_invocation_version: Literal[3] = 3
+    run_id: SafeId
+    manifest_sha256: Sha256
+    permit_sha256: Sha256
+    execution_plan_sha256: Sha256
+    provider_package_sha256: Sha256
+    provider_package_path: Literal[".approved-tools/provider-package.zip"]
+    provider_snapshot_path: Literal[".approved-tools/checkpoint-provider"]
+    provider_snapshot_sha256: Sha256
+    collector_sha256: Sha256
+    validator_sha256: Sha256
+    runbook_sha256: Sha256
+    adapter_wrapper_sha256: Sha256
+    cleaner_wrapper_sha256: Sha256
+    interpreter_path: str
+    interpreter_sha256: Sha256
+    validated_code_head_sha256: GitObjectId
+    validated_merge_commit_sha256: GitObjectId
+    validated_tree_sha256: GitObjectId
+    argv_contract: tuple[str, ...]
+    actions: tuple[str, ...]
+    created_at: datetime
+
+    _created_utc = field_validator("created_at")(_utc)
+
+
 class LiveProviderDeclaration(StrictModel):
     live_provider_declaration_version: Literal[1] = 1
     run_id: SafeId
@@ -673,6 +845,104 @@ class LiveProviderDeclaration(StrictModel):
         if not value:
             raise ValueError("provider content evidence must not be empty")
         return value
+
+
+class WorkloadProviderDeclaration(LiveProviderDeclaration):
+    live_provider_declaration_version: Literal[3] = 3
+    permit: CleanupEvidenceReference
+    provider_artifact: CleanupEvidenceReference
+    runbook_artifact: CleanupEvidenceReference
+    adapter_wrapper_artifact: CleanupEvidenceReference
+    cleaner_wrapper_artifact: CleanupEvidenceReference
+    permit_sha256: Sha256
+    execution_plan_sha256: Sha256
+    workload_truth_sha256: Sha256
+    truth_binding_sha256: Sha256
+    operation_indexes: tuple[int, ...]
+    operation_ids: tuple[Sha256, ...]
+    workload_evidence: CleanupEvidenceReference
+    validated_code_head_sha256: GitObjectId
+    validated_merge_commit_sha256: GitObjectId
+    validated_tree_sha256: GitObjectId
+    runbook_sha256: Sha256
+    adapter_wrapper_sha256: Sha256
+    cleaner_wrapper_sha256: Sha256
+
+
+class WorkloadBoundedValidationAttestation(StrictModel):
+    bounded_validation_manifest_version: Literal[3] = 3
+    validation_run_id: SafeId
+    permit_sha256: Sha256
+    manifest_sha256: Sha256
+    manifest_file_sha256: Sha256
+    workload_config_file_sha256: Sha256
+    execution_plan_sha256: Sha256
+    execution_plan_file_sha256: Sha256
+    workload_truth_sha256: Sha256
+    workload_truth_file_sha256: Sha256
+    truth_binding_sha256: Sha256
+    truth_binding_file_sha256: Sha256
+    fixture_catalog_sha256: Sha256
+    fixture_catalog_file_sha256: Sha256
+    semantic_view_sha256: Sha256
+    operation_indexes: tuple[int, int, int]
+    intent_ids: tuple[Sha256, Sha256, Sha256]
+    operation_ids: tuple[Sha256, Sha256, Sha256]
+    roles: tuple[
+        Literal["ordinary"],
+        Literal["repeated_range"],
+        Literal["sequential_range"],
+    ]
+    reconciliation_sha256: Sha256
+    provider_manifest_sha256: Sha256
+    imported_manifest_sha256: Sha256
+    cleaned_manifest_sha256: Sha256
+    workload_evidence_sha256: Sha256
+    validated_code_head_sha256: GitObjectId
+    validated_merge_commit_sha256: GitObjectId
+    validated_tree_sha256: GitObjectId
+    provider_package_sha256: Sha256
+    provider_sha256: Sha256
+    collector_sha256: Sha256
+    validator_sha256: Sha256
+    runbook_sha256: Sha256
+    adapter_wrapper_sha256: Sha256
+    cleaner_wrapper_sha256: Sha256
+    interpreter_path: str
+    interpreter_sha256: Sha256
+    completed_at: datetime
+    expires_at: datetime
+    status: Literal["passed"]
+
+    _completed_utc = field_validator("completed_at")(_utc)
+    _expires_utc = field_validator("expires_at")(_utc)
+
+    @model_validator(mode="after")
+    def valid_freshness(self):
+        if self.completed_at >= self.expires_at:
+            raise ValueError(
+                "bounded attestation must complete before its expiry"
+            )
+        return self
+
+
+class WorkloadLiveFinalizationDeclaration(StrictModel):
+    live_finalization_version: Literal[3] = 3
+    run_id: SafeId
+    permit_sha256: Sha256
+    manifest_sha256: Sha256
+    execution_plan_sha256: Sha256
+    workload_truth_sha256: Sha256
+    truth_binding_sha256: Sha256
+    semantic_view_sha256: Sha256
+    reconciliation_sha256: Sha256
+    provider_manifest_sha256: Sha256
+    imported_manifest_sha256: Sha256
+    cleaned_manifest_sha256: Sha256
+    bounded_attestation_sha256: Sha256
+    validated_code_head_sha256: GitObjectId
+    validated_merge_commit_sha256: GitObjectId
+    validated_tree_sha256: GitObjectId
 
 
 class DatasetArtifact(StrictModel):
@@ -1160,6 +1430,117 @@ class CollectionManifest(StrictModel):
         return self
 
 
+class WorkloadCollectionManifest(StrictModel):
+    manifest_version: Literal[3] = 3
+    run_id: SafeId
+    run_ref: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
+    data_kind: Literal["synthetic"] = "synthetic"
+    experiment_kind: Literal["controlled"] = "controlled"
+    representative_production_demand: Literal[False] = False
+    protocol: Literal["NFSv4.1"] = "NFSv4.1"
+    operation: Literal["READ"] = "READ"
+    warmer_enabled: Literal[False] = False
+    cluster_id: SafeId
+    namespace: SafeId
+    volume_id: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
+    export_id: int = Field(ge=0)
+    cluster_manifest_sha256: Sha256
+    fixture_catalog_sha256: Sha256
+    event_schema_sha256: Sha256
+    budget_evidence_sha256: Sha256
+    execution_config_sha256: Sha256
+    execution_plan_sha256: Sha256
+    semantic_view_id: SafeId
+    semantic_view_sha256: Sha256
+    seed: int = Field(ge=0)
+    start_time: datetime
+    end_time: datetime
+    planned_operation_count: int = Field(gt=0)
+    max_concurrency: Literal[1] = 1
+    checkpoint_interval_s: Literal[900] = 900
+    checkpoint_tolerance_s: int = Field(default=30, ge=0, le=300)
+    operation_schedule_tolerance_s: int = Field(default=30, ge=0, le=59)
+    clock_skew_tolerance_s: int = Field(default=5, ge=0, le=30)
+    pre_read_plus_read_guardrail_ms: int = Field(default=5000, gt=0)
+    fixture_distribution: Literal["explicit_repeating_plan"] = "explicit_repeating_plan"
+    range_distribution: Literal["explicit_repeating_plan"] = "explicit_repeating_plan"
+    range_bytes: tuple[int, ...]
+    range_offsets: tuple[int, ...]
+    untagged_correlation_window_s: int = Field(default=120, gt=0)
+    client_id: SafeId
+    tag_mode: Literal["empty"] = "empty"
+    tag_contract_status: Literal["proposed-unverified"] = "proposed-unverified"
+    allowed_exclusion_reasons: tuple[str, ...] = ()
+    evidence_mode: Literal["offline_simulated_fixture"] = "offline_simulated_fixture"
+    software: SoftwareVersions
+    stop_rules: StopRules
+    retention: RetentionPolicy
+    limitations: tuple[str, ...] = (
+        "Offline simulated controlled workload; not live collection evidence.",
+        "Synthetic READ rows are plumbing and planted-pattern diagnostics only.",
+        "No completed read proves cache residency or performance benefit.",
+    )
+
+    _start_utc = field_validator("start_time")(_utc)
+    _end_utc = field_validator("end_time")(_utc)
+
+    @field_validator("range_bytes")
+    @classmethod
+    def valid_ranges(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if value != (4096,):
+            raise ValueError("workload collection requires one 4096-byte range size")
+        return value
+
+    @field_validator("range_offsets")
+    @classmethod
+    def valid_offsets(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if not value or len(value) != len(set(value)) or any(item < 0 for item in value):
+            raise ValueError("range_offsets must be unique nonnegative values")
+        if any(item % 4096 for item in value):
+            raise ValueError("range_offsets must be 4096-byte aligned")
+        return value
+
+    @field_validator("allowed_exclusion_reasons")
+    @classmethod
+    def exclusion_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(
+            not re.fullmatch(r"[a-z][a-z0-9_-]*", item) for item in value
+        ):
+            raise ValueError("exclusion reasons must be unique lower-case identifiers")
+        return value
+
+    @model_validator(mode="after")
+    def controlled_run(self) -> WorkloadCollectionManifest:
+        expected_run_ref = hashlib.sha256(self.run_id.encode("utf-8")).hexdigest()[:32]
+        if self.run_ref != expected_run_ref:
+            raise ValueError("run_ref must be sha256(run_id UTF-8)[:32]")
+        duration = (self.end_time - self.start_time).total_seconds()
+        if duration <= 0 or duration > 24 * 60 * 60:
+            raise ValueError("workload duration must be in (0, 24 hours]")
+        return self
+
+
+CollectionRunManifest = CollectionManifest | WorkloadCollectionManifest
+
+
+def parse_collection_manifest(value: str | bytes) -> CollectionRunManifest:
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = item
+        return result
+
+    document = json.loads(value, object_pairs_hook=unique_object)
+    version = document.get("manifest_version") if isinstance(document, dict) else None
+    if version == 2:
+        return CollectionManifest.model_validate(document)
+    if version == 3:
+        return WorkloadCollectionManifest.model_validate(document)
+    raise ValueError(f"unsupported collection manifest version: {version!r}")
+
+
 class CleanupScheduleRecord(StrictModel):
     cleanup_schedule_version: Literal[1] = 1
     run_id: SafeId
@@ -1583,6 +1964,15 @@ class ReconciliationReport(StrictModel):
         if self.success == has_failures:
             raise ValueError("reconciliation success conflicts with failure details")
         return self
+
+
+class WorkloadReconciliationReport(ReconciliationReport):
+    reconciliation_version: Literal[3] = 3
+    permit_sha256: Sha256
+    execution_plan_sha256: Sha256
+    operation_indexes: tuple[int, ...]
+    operation_ids: tuple[Sha256, ...]
+    workload_evidence_sha256: Sha256
 
 
 class CollectorSourceFile(StrictModel):
