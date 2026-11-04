@@ -63,3 +63,31 @@ def describe(directory):
         raise click.ClickException(str(exc)) from exc
     click.echo(f"{manifest['dataset_id']} from {manifest['parent']['dataset_id']}")
     click.echo(summary)
+
+
+@main.command("read-snapshots")
+@click.option(
+    "--input", "input_dir", required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Dataset cleaned with --semantic-view read-demand-v1.",
+)
+@click.option("--out", required=True, type=click.Path(path_type=Path))
+@click.option("--tick-s", type=int, default=900, show_default=True)
+@click.option("--seed", type=int, default=0, show_default=True)
+def read_snapshots(input_dir, out, tick_s, seed):
+    """Build read-demand-v1 training snapshots (features, candidates, labels, splits)."""
+    from predictive_cache.prep.read_snapshots import ReadSnapshotConfig, build_read_snapshots
+
+    try:
+        manifest = build_read_snapshots(
+            input_dir, out, ReadSnapshotConfig(tick_s=tick_s, seed=seed)
+        )
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Built {manifest['dataset_id']} at {out}")
+    for split, c in manifest["counts"].items():
+        click.echo(
+            f"  {split:5s} ticks={c['ticks']} rows={c['rows']} positives={c['positives']} "
+            f"unknown_dropped={c['unknown_dropped']} "
+            f"candidate_coverage={manifest['candidate_coverage'][split]}"
+        )

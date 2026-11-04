@@ -235,6 +235,14 @@ are answered from eligible READ rows:
 
 ## Snapshot, package and serving gate
 
+**Builder:** `pcache-prep read-snapshots --input <READ-clean> --out <dir>`
+(`predictive_cache.prep.read_snapshots`, #114) writes the snapshot layout of
+data-prep §8.4 with these bindings, using the candidates and co-read table
+above. It is parity-tested against `ReadDemandEngine` for every feature and
+label. The ClearML task `src/predictive_cache/clearml/read_snapshots.py`
+runs raw Dataset → READ clean → snapshots Dataset. Downloading and running a
+trained model: [run-model-locally](../ml/run-model-locally.md).
+
 Legacy package version 1 and its payload file set remain unchanged. Legacy
 manifests without semantic keys retain generic-v1 behavior. A package that
 declares `read-demand-v1` must bind all of:

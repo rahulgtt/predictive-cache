@@ -301,6 +301,32 @@ pcache-model fake-snapshots --out DIR [--seed N] [--days N]   # schema-valid fix
     are written to `serving_policy`. The other policy values come from
     config.
 
+### 6.4 Gradient-boosted trees (`gbdt-v1`, `gbdt-rank-v1`)
+
+This is rung 4 of the model PRD. Both are `Scorer`s
+(`predictive_cache.ml.gbdt`) over the package's raw feature columns, with
+no preprocessing. Trees handle scale and nulls natively.
+
+- **Training:** LightGBM (`ml` extra; on macOS also `brew install libomp`).
+  `gbdt-v1` is binary log-loss with `sample_weight`, so its scores are
+  probabilities. `gbdt-rank-v1` is LambdaRank grouped by `snapshot_id`
+  (per-tick ordering), so its scores are not probabilities. Both
+  early-stop on val (log-loss, NDCG@10). `pcache-train` picks
+  `num_leaves` from `train.gbdt.num_leaves_grid` (default `[15, 63]`) by
+  the val primary metric, like the logreg `C` sweep. Defaults:
+  `learning_rate` 0.05, `rounds` 1000, `early_stopping` 50,
+  `min_data_in_leaf` 200.
+- **Package:** `model.json` holds the trees as flat JSON arrays (`feature`,
+  `threshold`, `default_left`, `missing`, `left`, `right`, `value`). It is
+  never a pickle or a LightGBM binary.
+- **Serving:** pure numpy. The scorer reproduces LightGBM's numerical
+  split and missing-value rules, parity-tested against `Booster.predict`.
+  Loading a package or hot-swapping it in the Controller (§8.6) therefore
+  needs no LightGBM. `explain` uses path (Saabas) contributions.
+- **Swap compatibility:** a package is swappable for another exactly when
+  its feature version and serving contract match (§5, §8.6). The model
+  type never matters.
+
 ## 7. Evaluation (`pcache-eval`)
 
 ### 7.1 Per-tick selection

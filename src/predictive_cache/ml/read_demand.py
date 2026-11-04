@@ -196,9 +196,9 @@ class ReadDemandEngine:
                 [
                     event
                     for event in rows
-                    if (now - event.event_time).total_seconds() <= 86400
+                    if 0 <= (now - event.event_time).total_seconds() <= 86400
                 ],
-                key=lambda event: event.event_time,
+                key=lambda event: (event.event_time, event.event_id),
             )
             result["coread_from_anchor_24h"] = sum(
                 previous.file_id == anchor_file_id
