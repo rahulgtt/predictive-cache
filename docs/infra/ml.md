@@ -240,6 +240,34 @@ and enqueue it. Each package is registered as an output model tagged
 `candidate`; its `package_id` is in the model metadata. Fixture and
 synthetic results are plumbing evidence only.
 
+### Evaluation task
+
+`pcache-eval` (ML spec §7) freezes candidate packages, then scores them
+**once** on the test split against the best baseline chosen on validation
+data. Packages can be local files or registry models:
+
+```bash
+export CLEARML_CONFIG_FILE=...   # see §2
+uv run pcache-eval freeze --snapshots-dataset <snapshots-dataset-id> \
+    --packages clearml://<model-id> --packages clearml://<baseline-model-id> ... --out freeze/freeze.json
+uv run pcache-eval run --snapshots-dataset <snapshots-dataset-id> --split val --freeze freeze/freeze.json --out eval-val
+uv run pcache-eval run --snapshots-dataset <snapshots-dataset-id> --split test --freeze freeze/freeze.json --out eval-test
+```
+
+- **Before reading any test row**, the test run verifies the package set,
+  every package digest, the evaluation config and the test-data hashes.
+- **A second test run of the same freeze is refused.** It needs
+  `--rerun-reason`, which is printed in the report.
+  - Tracked runs are recorded in ClearML, so the refusal holds even if the
+    local ledger is deleted. Any run, even with `--no-track`, checks
+    ClearML when a server is configured.
+  - An **untracked** test run is recorded only in the local ledger
+    (`test_runs.jsonl` next to `freeze.json`). Use tracked runs for
+    anything you report.
+- **Model tags:** registry models move `candidate` → `frozen` →
+  `evaluated`.
+- Fixture and synthetic results are plumbing evidence only.
+
 ## 6. Not decided yet
 
 - **Pipelines** (datagen → clean → snapshots → train → eval → register):

@@ -19,6 +19,7 @@ from ..tracking import (
     ClearMLTracker,
     NullTracker,
     Tracker,
+    fail_and_exit,
     get_dataset_copy,
     on_clearml_agent,
     tracking_enabled,
@@ -28,9 +29,7 @@ from .train import ALL_MODELS, TrainConfig, load_train_config, train
 
 def _fail(tracker: Tracker, message: str) -> None:
     """Mark a tracked run failed (so ClearML never shows it completed), then exit non-zero."""
-    tracker.fail(message)
-    tracker.close()
-    raise click.ClickException(message)
+    fail_and_exit(tracker, message)
 
 
 @click.command()
