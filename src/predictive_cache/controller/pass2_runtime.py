@@ -150,6 +150,10 @@ class Pass2Scheduler:
         self._previous_monotonic: float | None = None
 
         self.schedule, self.schedule_sha256 = load_schedule(config.schedule_path)
+        if parse_utc_z(self.schedule.snapshot["prediction_cutoff"]) > config.run_start:
+            raise Pass2RuntimeError(
+                "schedule prediction cutoff is later than the Pass-2 run start"
+            )
         self._validate_schedule_rates()
         self.root_fd = require_secure_directory(config.dispatcher_root)
         try:
@@ -386,9 +390,18 @@ class Pass2Scheduler:
             "target_map_id": target_map_id,
             "target_map_sha256": target_map_sha256,
         }
+        name = f"{item.prediction_id}.json"
+        try:
+            existing = load_secure_json(self.audit_fd, name, max_bytes=64 * 1024)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if existing != record:
+                raise Pass2RuntimeError("Pass-2 audit record conflicts with state")
+            return
         if not atomic_write_json(
             self.audit_fd,
-            f"{item.prediction_id}.json",
+            name,
             record,
             no_overwrite=True,
         ):
@@ -448,8 +461,28 @@ class Pass2Scheduler:
         active = self.state.get("active_publication")
         active_ids = set(active.get("prediction_ids", ())) if isinstance(active, dict) else set()
         items = [item for item in self._pending_items() if item.prediction_id in active_ids]
-        if items:
-            self._mark_items(items, status="skipped", reason=reason, at=now)
+        for item in items:
+            name = f"{item.prediction_id}.json"
+            try:
+                existing = load_secure_json(self.audit_fd, name, max_bytes=64 * 1024)
+            except FileNotFoundError:
+                self._mark_items([item], status="skipped", reason=reason, at=now)
+                continue
+            if (
+                not isinstance(existing, dict)
+                or existing.get("run_id") != self.config.run_id
+                or existing.get("schedule_id") != self.schedule.schedule_id
+                or existing.get("prediction_id") != item.prediction_id
+                or existing.get("volume_id") != item.volume_id
+                or existing.get("file_id") != item.file_id
+                or existing.get("status") not in {"published", "skipped"}
+            ):
+                raise Pass2RuntimeError("Pass-2 audit record conflicts with state")
+            self.state["items"][item.prediction_id].update(
+                status=existing["status"],
+                reason=existing.get("reason"),
+                plan_id=existing.get("plan_id"),
+            )
         self.state["status"] = "ambiguous"
         self.state["terminal_reason"] = reason
         self._write_state()
@@ -574,17 +607,8 @@ class Pass2Scheduler:
 
         requested_bytes = sum(raw["length"] for _, raw in selected)
         if self._rate_conflict(now, len(selected), requested_bytes):
-            selected_items = [item for item, _ in selected]
-            self._mark_items(
-                selected_items,
-                status="skipped",
-                reason="rate_budget_conflict",
-                at=now,
-                target_map_id=target_map.target_map_id,
-                target_map_sha256=target_map_sha256,
-            )
             self._write_state()
-            return 0, len(items)
+            return 0, len(items) - len(selected)
 
         plan_raw = {
             "schema_version": 2,
@@ -706,7 +730,9 @@ class Pass2Scheduler:
             release_at = due_at - timedelta(seconds=self.config.publish_lead_seconds)
             if now < release_at:
                 continue
-            if now > due_at:
+            if now > due_at + timedelta(
+                seconds=self.config.clock_tolerance_seconds
+            ):
                 self._mark_items(items, status="skipped", reason="late_prediction", at=now)
                 continue
             self._publish_group(offset, items, now)
@@ -721,15 +747,34 @@ class Pass2Scheduler:
         result = self.step()
         while not once and result.status == "running":
             now = _utc(self._now(), "clock")
-            releases = [
-                self.config.run_start
-                + timedelta(seconds=item.warm_offset_s)
-                - timedelta(seconds=self.config.publish_lead_seconds)
-                for item in self._pending_items()
+            pending = self._pending_items()
+            releases = []
+            due_times = []
+            for item in pending:
+                due_at = self.config.run_start + timedelta(
+                    seconds=item.warm_offset_s
+                )
+                due_times.append(due_at)
+                releases.append(
+                    due_at
+                    - timedelta(seconds=self.config.publish_lead_seconds)
+                )
+            rate_expiries = [
+                parse_utc_z(entry["published_at"])
+                + timedelta(seconds=RATE_WINDOW_SECONDS)
+                for entry in self.state["reservations"]
             ]
             delay = self.config.poll_seconds
-            if releases:
-                delay = min(delay, max(0.0, (min(releases) - now).total_seconds()))
+            future_events = [
+                event
+                for event in (*releases, *due_times, *rate_expiries)
+                if event > now
+            ]
+            if future_events:
+                delay = min(
+                    delay,
+                    (min(future_events) - now).total_seconds(),
+                )
             self._sleep(max(0.001, delay))
             result = self.step()
         return result

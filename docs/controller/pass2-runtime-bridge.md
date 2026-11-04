@@ -38,10 +38,10 @@ due_at = pass2_run_start + warm_offset_s
 `12-significant-digits`. The schedule must not contain paths, exports,
 endpoints, or NFS handles.
 
-This consumer was developed in parallel with the schedule producer. Before
-combining branches, compare its exact parser fields with
-`predictive_cache.ml.read_demand_schedule`; field additions or renamed
-provenance members require an explicit contract update.
+The parser is aligned with the landed producer in
+`predictive_cache.ml.read_demand_schedule`. Field additions or renamed
+provenance members require an explicit contract update and focused producer
+and consumer tests.
 
 ## Owner target map
 
@@ -69,9 +69,12 @@ out-of-range bindings produce no plan item.
 
 The operator supplies an explicit UTC `--run-start`. A prediction becomes
 publishable at `due_at - publish_lead_seconds` and becomes late after
-`due_at`. Publication uses the actual wall time as plan `created_at`; the
-deadline is `created_at + plan_ttl_seconds`. The target must remain valid
-through that deadline.
+`due_at` plus the configured clock-tolerance window. The scheduler wakes at
+release, due, and local rate-reservation expiry boundaries so a coarse poll
+cannot skip the only publishable instant. Publication uses the actual wall
+time as plan `created_at`; the deadline is
+`created_at + plan_ttl_seconds`. The target must remain valid through that
+deadline.
 
 Predictions sharing one `warm_offset_s` are published in one plan. Plan and
 task IDs are deterministic. `plan.max_bytes` is exactly the sum of item
@@ -130,8 +133,9 @@ State and audit files are owner-only under
 `pass2-runs/<run_id>/`. Audit records contain logical identities and hashes,
 not handles. Plan files necessarily contain the approved execution handle.
 
-This is hackathon control-plane plumbing. It does not prove that the parallel
-producer emits a byte-for-byte compatible schedule, that a target survives a
-server restart, that NFS handle mode works live, that bytes remain cached, or
-that warming helps foreground demand. No live collection or NFS read is part
-of this path.
+This is hackathon control-plane plumbing. Focused producer and consumer tests
+cover the landed schedule shape, but no approved full Pass-1-to-Pass-2 run has
+been recorded. The bridge does not prove that a target survives a server
+restart, that NFS handle mode works live, that bytes remain cached, or that
+warming helps foreground demand. No live collection or NFS read is part of
+this path.

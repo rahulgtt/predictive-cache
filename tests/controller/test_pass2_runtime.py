@@ -195,6 +195,7 @@ def _config(
     publish_lead_seconds: int = 0,
     max_bytes_per_min: int = 4096,
     max_items_per_min: int = 1,
+    poll_seconds: float = 0.1,
 ) -> Pass2RuntimeConfig:
     return Pass2RuntimeConfig(
         schedule_path=schedule,
@@ -206,6 +207,7 @@ def _config(
         plan_ttl_seconds=120,
         max_bytes_per_min=max_bytes_per_min,
         max_items_per_min=max_items_per_min,
+        poll_seconds=poll_seconds,
         clock_tolerance_seconds=0.01,
     )
 
@@ -362,6 +364,136 @@ def test_pass2_rejects_schedule_that_cannot_fit_configured_rate_window(tmp_path)
             now=lambda: RUN_START,
             monotonic=lambda: 100.0,
         )
+
+
+def test_pass2_rejects_prediction_cutoff_after_run_start(tmp_path):
+    document = _schedule_document()
+    cutoff = (RUN_START + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    document["snapshot"]["prediction_cutoff"] = cutoff
+    document["items"][0]["prediction_cutoff"] = cutoff
+    _seal_schedule(document)
+    schedule = tmp_path / "schedule.json"
+    schedule.write_text(canonical_json(document) + "\n")
+    root = _dispatcher_root(tmp_path)
+
+    with pytest.raises(Pass2RuntimeError, match="cutoff"):
+        Pass2Scheduler(
+            _config(schedule, tmp_path / "unused-target-map.json", root),
+            now=lambda: RUN_START,
+            monotonic=lambda: 100.0,
+        )
+
+
+def test_pass2_retries_temporary_rate_conflict_until_due_time(tmp_path):
+    document = _schedule_document()
+    document["policy"].update(max_items=2, max_bytes=8192)
+    document["policy_sha256"] = hashlib.sha256(
+        canonical_json(document["policy"]).encode()
+    ).hexdigest()
+    document["budget"].update(max_items=2, max_bytes=8192)
+    document["time_basis"].update(warm_start_offset_s=10, warm_spacing_s=60)
+    second = deepcopy(document["items"][0])
+    second.update(
+        prediction_id="prediction-2",
+        rank=2,
+        file_id="file-2",
+        warm_offset_s=70,
+        score=0.5,
+    )
+    document["items"].append(second)
+    document["admitted_items"] = 2
+    document["requested_bytes"] = 8192
+    _seal_schedule(document)
+    schedule = tmp_path / "schedule.json"
+    schedule.write_text(canonical_json(document) + "\n")
+    target_map = _write_target_map(
+        tmp_path,
+        document["schedule_id"],
+        valid_until=RUN_START + timedelta(seconds=240),
+        file_ids=("file-1", "file-2"),
+    )
+    root = _dispatcher_root(tmp_path)
+    clock = Clock(RUN_START + timedelta(seconds=10))
+
+    with Pass2Scheduler(
+        _config(
+            schedule,
+            target_map,
+            root,
+            publish_lead_seconds=5,
+            poll_seconds=10,
+        ),
+        now=clock.now,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    ) as scheduler:
+        result = scheduler.run()
+
+    assert clock.value == RUN_START + timedelta(seconds=70)
+    assert result.status == "completed"
+    assert result.skipped_items == 0
+    assert result.published_plans == 2
+    assert result.published_items == 2
+
+
+def test_pass2_restart_reconciles_existing_matching_audit(tmp_path):
+    schedule, document = _write_schedule(tmp_path)
+    target_map = _write_target_map(
+        tmp_path,
+        document["schedule_id"],
+        valid_until=RUN_START + timedelta(seconds=180),
+    )
+    root = _dispatcher_root(tmp_path)
+    clock = Clock(RUN_START)
+    config = _config(schedule, target_map, root)
+    with Pass2Scheduler(
+        config,
+        now=clock.now,
+        monotonic=clock.monotonic,
+    ):
+        pass
+
+    state_path = root / "pass2-runs/pass2-run-1/state.json"
+    state = json.loads(state_path.read_text())
+    state["status"] = "publishing"
+    state["active_publication"] = {
+        "plan_id": "plan-recovered",
+        "prediction_ids": ["prediction-1"],
+    }
+    state_path.write_text(canonical_json(state) + "\n")
+    audit = {
+        "schema_version": 1,
+        "run_id": "pass2-run-1",
+        "schedule_id": document["schedule_id"],
+        "prediction_id": "prediction-1",
+        "volume_id": "vol-1",
+        "file_id": "file-1",
+        "warm_offset_s": 10,
+        "status": "published",
+        "reason": "published",
+        "recorded_at": RUN_START.isoformat().replace("+00:00", "Z"),
+        "plan_id": "plan-recovered",
+        "target_map_id": "target-map-1",
+        "target_map_sha256": "a" * 64,
+    }
+    audit_path = root / "pass2-runs/pass2-run-1/audit/prediction-1.json"
+    fd = os.open(audit_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, (canonical_json(audit) + "\n").encode())
+    finally:
+        os.close(fd)
+
+    with Pass2Scheduler(
+        config,
+        now=clock.now,
+        monotonic=clock.monotonic,
+    ) as restarted:
+        result = restarted.stats()
+
+    recovered = json.loads(state_path.read_text())
+    assert result.status == "ambiguous"
+    assert recovered["items"]["prediction-1"]["status"] == "published"
+    assert json.loads(audit_path.read_text()) == audit
 
 
 def test_pass2_plan_is_exactly_accepted_by_dispatcher_dry_run(tmp_path):

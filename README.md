@@ -193,8 +193,12 @@ scores one exact validation tick from an existing `read-demand-v1` snapshot
 with a verified trained package and writes a deterministic, hash-addressed
 JSON schedule. The schedule contains logical identities and byte ranges but no
 NFS handles. It is a two-pass batch artifact, not live ingestion or a running
-Controller. Target resolution, Dispatcher publication, Warmer execution and
-NFS reads remain Pass-2 consumer work.
+Controller. The
+[Pass-2 runtime bridge](docs/controller/pass2-runtime-bridge.md) binds those
+logical identities to a fresh owner-only approved target map and publishes
+short-lived schema-v2 plans near their due times. The existing Dispatcher can
+consume those plans in dry-run mode; live Warmer execution and NFS reads remain
+separately gated.
 
 ## Manual NFS range reader
 
