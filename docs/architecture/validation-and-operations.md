@@ -284,9 +284,10 @@ choice for this hackathon is vCenter. Confirm the topology, permissions, capacit
 observability with the owners. Do not assume that historical inventory,
 endpoints, or service configurations are unchanged.
 
-Do not build or run tests in local checkouts. Use `strider-dev` or
-`strider-dev2` and the designated CUFS and Chimera build containers; initialize
-submodules before testing where applicable. Use existing CI-integrated
+Do not build or run tests for this project in local checkouts or on
+`strider-dev` / `strider-dev2`. Use `nas-vm` and the designated CUFS or
+Chimera build containers; initialize submodules before testing where
+applicable. Use existing CI-integrated
 harnesses for SMB regression and unit tests rather than external-fixture-only
 tests that normally skip in PR CI.
 

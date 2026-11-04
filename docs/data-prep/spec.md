@@ -9,6 +9,11 @@
 
 ## 1. Purpose
 
+Read the [README glossary](../../README.md#basic-terms) and
+[file-B example](../../README.md#example-a-feature-row-and-a-label) first.
+The README teaches the concepts; this spec defines the detailed v1 cleaning,
+feature, label and snapshot contracts within its design rules.
+
 `pcache-prep` turns access events into model-ready tables:
 
 1. **Clean**: produce a trusted, versioned demand dataset from raw events.
@@ -54,6 +59,52 @@ synthetic input are plumbing and planted-pattern evidence only.
 The PRD's cold-open target and the team plan's demand target are not settled
 yet. Both are implemented behind `labels.target` so the Evaluation story
 decides with evidence (§15).
+
+### 1.3 Worked example: from file B to a training row
+
+A **tick** is a scheduled prediction time, written as `t`. A **snapshot**
+records what was known about the candidate files at that time, together with
+the answers learned afterward for training or evaluation. It is a table of
+model examples, not a filesystem backup snapshot. The live model receives
+the features without those later answers.
+
+Consider the README's fictional file B. For this example, use a tick at
+`2026-11-03T09:00:00Z`, the default `demand` target, no lead time, and a
+five-minute prediction window. Assume B is an eligible candidate and all
+inputs below were known before the tick. These are selected columns, not a
+complete snapshot row or a real measurement.
+
+| Column | Example value | Role |
+| --- | --- | --- |
+| `volume_id` | `vol-001` | Identifies the volume; not a model feature. |
+| `file_id` | `file-b` | Identifies B; not a model feature. |
+| `t` | `2026-11-03T09:00:00Z` | Identifies the prediction time; not a model feature. |
+| `opens_5m` | `0` | Feature: successful opens in the previous five minutes. |
+| `opens_15m` | `0` | Feature: successful opens in the previous fifteen minutes. |
+| `secs_since_last_open` | `1200` | Feature: seconds since B's last successful open. |
+| `file_size` | `1048576` | Feature: latest known size in bytes. |
+
+The feature values together form B's **feature row**. The v1 open-count
+features count successful opens; they do not claim that each open consumed
+bytes. Labels below require demand as defined in §7.
+
+Afterward, attach a **label** to this earlier row:
+
+| What happened in `[09:00:00, 09:05:00)` UTC? | Label |
+| --- | --- |
+| A qualifying foreground read consumed B's data at 09:03. | `1`: yes, B was needed. |
+| There was no qualifying demand, the whole window was observed, and no open had unknown consumption. | `0`: no, B was not needed in that window. |
+| No qualifying demand was observed, but collection had a gap or an open had unknown consumption. | Unknown; do not guess `0`. |
+
+This assumes the label facts arrive before the next split boundary and
+the tick passes the boundary checks (§7, §8.2). A positive label needs
+qualifying demand, not a fully observed window. An unknown label is dropped
+from the snapshot rows and counted in the output statistics (§8.5).
+The 09:03 read never becomes an input to the 09:00 prediction.
+
+Actual tick scheduling follows §8.1; the full feature list is in §5.2 and
+the output schema is in §8.5. The alternative `cold_open` target has extra
+history requirements (§7); the simple labels above describe `demand` only.
 
 ## 2. Pipeline and boundaries
 

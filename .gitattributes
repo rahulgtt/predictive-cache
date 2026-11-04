@@ -1,1 +1,3 @@
 *.pdf binary
+chimera/*.patch whitespace=-trailing-space
+plan.md whitespace=-trailing-space

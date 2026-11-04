@@ -411,3 +411,37 @@ class Manifest(StrictModel):
     limitations: list[str] = Field(default_factory=list)
 
     _utc = field_validator("created_at", mode="before")(utc_datetime)
+
+
+class DataOnlyCounts(StrictModel):
+    """Counts observable from delivered events and catalogs, without oracle truth."""
+
+    events: int = Field(ge=0)
+    files: int = Field(ge=0)
+    actors: int = Field(ge=0)
+    by_operation: dict[str, int]
+    by_origin: dict[str, int]
+
+
+class DataOnlyManifest(StrictModel):
+    """Published ClearML source contract for the cleaner, excluding test truth."""
+
+    manifest_version: Literal[1] = 1
+    publication_kind: Literal["data_only"] = "data_only"
+    stage: Literal["events"] = "events"
+    dataset_id: str
+    data_kind: Literal["synthetic"] = "synthetic"
+    generator: GeneratorInfo
+    event_schema_version: Literal[1] = 1
+    seed: int = Field(ge=0)
+    preset: Literal["tiny", "small", "medium", "custom"]
+    config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    period: Period
+    volumes: list[str]
+    counts: DataOnlyCounts
+    known_gaps: list[KnownGap] = Field(default_factory=list)
+    files: list[FileEntry]
+    created_at: datetime
+    limitations: list[str] = Field(default_factory=list)
+
+    _utc = field_validator("created_at", mode="before")(utc_datetime)

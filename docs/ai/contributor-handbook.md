@@ -6,24 +6,33 @@ These procedures remain applicable; this move changes organization, not policy.
 
 ## Project in one paragraph
 
-Hackathon Team 32: **Predictive Cache** for Strider. A Strider cluster serves
-SMB/NFS clients through the Chimera protocol gateway, backed by CUFS. CUFS
-caches data locally and faults cold data in from the cloud/S3 backend over
+Hackathon Team 32: **Predictive Cache** for Strider. Chimera receives
+SMB/NFS file requests from clients and passes them to CUFS. CUFS
+caches data locally and fetches missing data from the cloud/S3 backend over
 the WAN. This project predicts which files/ranges will be hot from historical
 access patterns and pre-warms them on the cluster, so first opens do not wait
 on the backend. The MVP has two deployables:
 
-- **Predictive Cache Controller** handles ingestion, features, models,
-  planning and feedback.
+- **Predictive Cache Controller** receives read records, builds model
+  inputs, scores files, chooses warming tasks and checks later demand.
 - **Cache Warmer** performs bounded, read-only NFS reads that execute plans.
+
+Use the [README glossary](../../README.md#basic-terms) for shared terminology.
+Its examples explain the concepts; the [data-preparation spec](../data-prep/spec.md)
+and [ML spec](../ml/spec.md) define the detailed v1 data and runtime contracts
+within the README's design rules.
 
 Our team owns the ML side: event memory/state, feature extraction, model
 training, inference and evaluation. We also work with the protocol (CUFS),
 telemetry (o11y) and performance lanes.
 
-> **Status:** design proposal. No Controller, Warmer, pipeline or benchmark
-> code exists yet. [README.md](../../README.md) is the source of truth for
-> architecture, contracts, gates and terminology. Don't duplicate it here.
+> **Status:** design proposal. Synthetic data/cleaning, a controlled collection
+> harness, Chimera importer, offline dispatcher and standalone
+> [experimental manual NFS reader](../manual-warmer.md) exist, but no
+> Controller, automated live Warmer service, representative dataset or
+> validated performance result exists.
+> [README.md](../../README.md) is the source of truth for architecture,
+> contracts, gates and terminology.
 > Update it when the design changes.
 
 ## Repository layout
@@ -31,13 +40,20 @@ telemetry (o11y) and performance lanes.
 | Path | Purpose |
 | --- | --- |
 | `README.md` | Design, system model, contracts, modeling and benchmark plan, gates. |
+| `chimera/` | Reviewed external Chimera event-source patch and sanitized provenance. |
+| `contracts/` | Canonical repository-safe cluster provenance and event-schema bytes used by controlled collection manifests. |
+| `cufs/` | CUFS package/ABI provenance and PoC-only build compatibility artifacts. |
+| `src/predictive_cache/collection/` | Offline controlled READ workload, checkpoint validation and reconciliation harness. |
+| `src/predictive_cache/dispatcher/` | Offline schema-v2 plan claiming, validation, execution and result persistence. |
+| `src/predictive_cache/sources/chimera/` | Controlled Chimera v2 event importer for the cleaner source layout. |
+| `src/predictive_cache/warmer/` | Experimental, standalone manual NFSv4.1 range reader. |
 | `AGENTS.md` | This file: working conventions for agents and contributors. |
 | `docs/` | Markdown documentation: design docs, architecture notes, decision records, findings and investigation write-ups. |
 | `artifacts/pdf/` | Shareable PDF exports and reference handouts. |
 | `.github/` | PR template and issue forms. |
 | Private scratch | Git-ignored personal workspace specified by the root agent instructions. |
 
-New code directories (e.g. controller, warmer, ML pipeline) should be added
+New code directories (e.g. controller, ML pipeline) should be added
 as the work lands and listed in this table.
 
 ## Non-negotiable design rules
@@ -70,9 +86,11 @@ These come from [README.md](../../README.md). Any code, issue or PR must respect
 - Use `cluster-manager` to locate/inspect the target Strider cluster. Use the
   **Kind** backend for provisioning unless told otherwise. Don't assume
   historical cluster inventory is still valid.
-- For CUFS, Chimera and other Strider components, **do not build or run tests
-  in local checkouts**. Use `strider-dev` / `strider-dev2` and the designated
-  build containers. Initialize submodules first.
+- For this project, **do not build or run tests in local checkouts**. Use
+  `nas-vm` and the designated CUFS or Chimera build container, not
+  `strider-dev` / `strider-dev2`. Initialize submodules first where applicable.
+- Use existing CI-integrated harnesses for SMB regression and unit tests,
+  rather than external-fixture-only tests that normally skip in PR CI.
 - ML experiment tracking, datasets, models and training/eval runs use the
   team ClearML server. See [ML platform](../infra/ml.md) for endpoints,
   SDK setup, naming conventions and the data policy. Never commit ClearML
