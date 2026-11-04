@@ -789,7 +789,7 @@ skip records a reason:
 | # | Skip reason | Rule |
 | --- | --- | --- |
 | 1 | `ineligible` | `view.is_eligible(file)` is false |
-| 2 | `recently_read` | `secs_since_last_open < recent_skip_s` (300). Likely still cached. |
+| 2 | `recently_read` | READ serving: `secs_since_last_read < recent_skip_s` (300). Generic OPEN replay uses `secs_since_last_open`. This is a recency heuristic, not proof of cache residency. |
 | 3 | `cooldown` | Planned within `cooldown_s` (1800) |
 | 4 | `below_threshold` | `score < min_score` (chosen on val, §6.3) |
 | 5 | `unknown_size` | `file_size` null |
@@ -797,15 +797,29 @@ skip records a reason:
 | 7 | `budget` | Taken in `(score desc, file_id asc)` order while items < `max_items` and Σ length ≤ `max_bytes`. An item that doesn't fit is skipped and the walk continues. |
 
 - **Range:** `offset 0`, `length = min(file_size, range_cap)` (16 MiB, the
-  Warmer cap). Choosing ranges other than the prefix is later work (§15).
+  Warmer cap), further capped by the resolved target's size when known.
+  A known-empty file is skipped. Candidate sizes must already be known as
+  of the tick; target metadata does not fill an unknown demand feature.
+  Choosing ranges other than the prefix is later work (§15).
 - **Retry allowance:** 0. Each item's `max_bytes` equals its `length`, and
   the plan's `max_bytes` = Σ item lengths. The dispatcher never retries; a
   retry is a new `task_id` with `supersedes`.
-- **Target validity:** `target_valid_until = min(t + target_valid_s,
-  deadline)`, where `target_valid_s` defaults to 120 and the dispatcher
-  caps it at 300 s after `created_at`.
-- **Deadline:** `t + horizon_s`. Because `lead_s = 0` in v1, items may
-  start at once. The dispatcher must not start an item after the deadline.
+- **Prediction horizon:** `horizon_s` stays unchanged in the active package
+  and prediction records (default 300 s). It describes future demand, not
+  how long a warming instruction may execute.
+- **Target validity:** for each admitted item, `target_valid_until =
+  min(t + target_valid_s, seen_at + target_max_age_s, t + 300 s)`.
+  `target_valid_s` defaults to 120. The resolver must supply its explicit
+  age bound; missing, future-dated or already expired targets are skipped.
+  This is a Controller freshness limit, not an NFS handle expiry guarantee.
+- **Execution deadline:** `min(t + horizon_s, every admitted item's
+  target_valid_until)`. With fresh targets and defaults, predictions look
+  ahead five minutes while the plan expires after two minutes. A target
+  near its age limit shortens the whole plan further. Never extend target
+  validity or shorten the model horizon to make a plan pass validation.
+  Because `lead_s = 0` in v1, items may start at once. The existing dispatcher
+  requires `created_at < deadline <= target_valid_until <= created_at + 300 s`
+  for every valid item; it must not start an item after the deadline.
 - **Selector parity:** with rules 2–6 disabled, the planner's selection
   equals §7.1's byte selection. That is a test. The full policy is measured
   by policy replay (§7.7).
@@ -835,8 +849,8 @@ extra fields reject the whole plan.
 
 ```json
 {"schema_version": 2, "run_id": "<controller.run_id>", "plan_id": "<controller_id>-20261103T090000Z",
- "model_version": "logreg-v1@3f2a9c1d0b7e4a51", "created_at": "2026-11-03T09:00:00.120000Z",
- "deadline": "2026-11-03T09:05:00.000000Z", "max_bytes": 16777216,
+ "model_version": "logreg-v1@3f2a9c1d0b7e4a51", "created_at": "2026-11-03T09:00:00.000000Z",
+ "deadline": "2026-11-03T09:02:00.000000Z", "max_bytes": 16777216,
  "items": [{"task_id": "<plan_id>-001", "volume_id": "vol-0001", "file_id": "<64-hex file_id>",
             "export_name": "<export name>", "export_id": "<export id>", "target_fh_b64": "<unpadded base64url>",
             "target_valid_until": "2026-11-03T09:02:00.000000Z", "offset": 0, "length": 16777216,
@@ -854,6 +868,12 @@ extra fields reject the whole plan.
   instead (§8.11).
 
 - **Empty plans** are not written. The tick is counted instead.
+- **Publication accounting:** the standalone planner keeps one bounded pending
+  publication and advances cooldown/sequence only after successful durable
+  publication. A collision or write failure latches publication off for manual
+  reconciliation: a rename may have succeeded before directory `fsync` failed.
+  An exception is not evidence that no plan became visible. This in-memory
+  safeguard does not implement restart recovery or the full tick loop.
 - **File handles** appear only in plan files and the in-memory target map
   (and its owner-only checkpoint), never in predictions, logs, metrics,
   datasets or ClearML. Plan and result files are mode `0600`, in `0700`
@@ -1146,17 +1166,27 @@ class Ingestor:                                                  # stamping + qu
 # src/predictive_cache/dispatcher/schema.py  (#63, merged; authoritative for plan/task/result v2)
 # Plan.model_validate(raw) / PlanItem / result models: the planner validates with these in tests.
 
-# src/predictive_cache/controller/planner.py  (#60)
+# src/predictive_cache/controller/planner.py  (#60, standalone READ component)
+# Public signatures and examples: docs/controller/planner.md; source owns exact API.
 @dataclass(frozen=True)
-class Target:
-    export_id: str; export_name: str; target_fh_b64: str; file_size: int | None; seen_at: datetime
-class TargetMap(Protocol):                                       # §8.11 (built by #59, used by #60)
-    def observe(self, event: dict) -> None: ...                  # raw nfs4_read_v2 with identity_valid=true, any origin
-    def resolve(self, volume_id: str, file_id: str, t: datetime) -> Target | None: ...
-    def mark_stale(self, volume_id: str, file_id: str) -> None: ...
-class CatalogTargetMap: ...                                      # replay only: deterministic fake handles from the datagen catalog
-def plan(scored: pa.Table, view: CandidateView, targets: TargetMap, cooldown: "Cooldown",
-         cfg: PlannerConfig, t: datetime, model_version: str, run_id: str) -> tuple[dict | None, pa.Table]: ...   # (plan, decisions)
+class ScoredCandidate:
+    volume_id: str; file_id: str; score: float
+    secs_since_last_read: float; file_size: int | None
+    candidate_sources: tuple[str, ...] = ()
+class TargetResolver(Protocol):                                  # structural seam to §8.11's map
+    target_max_age_s: int
+    def resolve(self, volume_id: str, file_id: str, t: datetime) -> ResolvedTarget | None: ...
+# ResolvedTarget includes volume_id/file_id, export_id:int, export_name,
+# target_fh_b64, file_size and seen_at. Convert export_id to str only in plan v2.
+# Retain the exact resolved version privately; stale feedback invalidates that
+# version only, so an old result cannot invalidate a newer refresh.
+class PlannerConfig: ...                                        # lower-only item/byte caps and bounded sinks
+class Selection: ...                                            # private plan/bindings plus handle-free predictions
+def select_plan(...): ...                                       # pure selection -> Selection
+class PlannerPublisher:
+    def publish(...): ...                                       # private atomic files, cooldown/sequence on success
+# No live tick/FeatureStore wiring or durable restart recovery in this component.
+# Catalog-derived fake targets are for dispatcher dry-run fixtures only.
 
 # src/predictive_cache/controller/loop.py     (#60)
 class Controller:

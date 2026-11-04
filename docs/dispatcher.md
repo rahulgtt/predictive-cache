@@ -70,6 +70,15 @@ cannot exceed 300 seconds from plan creation. Because the dispatcher never
 retries automatically, each task's `max_bytes` must equal its requested
 `length`; another attempt requires a new explicit `task_id`.
 
+For every valid item the dispatcher requires
+`created_at < deadline <= target_valid_until <= created_at + 300 s`.
+The Controller's demand prediction horizon is separate from this execution
+window. The live planner caps the plan deadline at the earliest admitted
+item's validity limit (and the prediction horizon), rather than extending
+handle validity to fit a forecast. Default fresh targets therefore allow
+120 seconds of execution for a 300-second demand prediction. See
+[ML spec §8.4](ml/spec.md#84-planner-v1).
+
 An explicit retry may include optional `supersedes` with the original
 `run_id`, `plan_id`, and `task_id`. The old tuple is never cleared, reused, or
 overwritten; lineage is retained in the new task state.
