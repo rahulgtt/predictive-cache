@@ -7,8 +7,9 @@ users wait for it to arrive from cloud storage.
 > generation and cleaning, the controlled collection harness, Chimera v2
 > importer, strict current-run finalizer, explicit pre-finalizer historical
 > compatibility path, narrow READ-demand inference snapshot and baseline
-> package/plan publisher, offline plan-file dispatcher, and experimental
-> standalone manual NFS range reader are implemented. The Controller,
+> package/plan publisher, offline plan-file dispatcher, experimental standalone
+> manual NFS range reader, and bounded event collector are implemented. The
+> complete Controller,
 > automated live Warmer
 > integration, representative data collection and real-workload performance
 > claims remain gated work. Generated records model fictional activity and
@@ -16,12 +17,16 @@ users wait for it to arrive from cloud storage.
 > system; they do not establish that the required telemetry or cache controls
 > already work.
 
+An experimental [event collector](docs/controller/collector.md) supports
+normalized-v1 HTTP ingestion and replay.
+
 The narrow datagen-to-Dispatcher path has passed focused tests, Ruff, and one
 controlled offline `skipped/dry_run` integration on `nas-vm`; it issued zero
 bytes and did not start the Warmer. The separately approved one-READ
 Dispatcher-to-Warmer validation remains unrun. This is plumbing evidence only,
 not model-quality, cache-residency, performance, or production-readiness
-evidence.
+evidence. Live READ-only feature semantics and FeatureStore integration remain
+dependent on #104 and #30.
 
 ## Run the datagen foundation
 
