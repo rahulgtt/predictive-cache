@@ -11,7 +11,7 @@ dependencies = ["numpy>=2,<3", "pyarrow>=19,<24", "pydantic>=2.10,<3", "pyyaml>=
 
 [project.optional-dependencies]
 clearml = ["clearml>=2.1,<2.2"]
-ml = ["scikit-learn>=1.5,<2"]
+ml = ["scikit-learn>=1.5,<2", "lightgbm>=4.5,<5"]
 warmer = [
     "pynfs @ git+https://github.com/truenas/pynfs.git@87b2d81d0b38ec7a9d73b7d38bf9559b73b853d9",
 ]

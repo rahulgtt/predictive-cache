@@ -24,7 +24,8 @@ from ..tracking import (
     on_clearml_agent,
     tracking_enabled,
 )
-from .train import ALL_MODELS, TrainConfig, load_train_config, train
+from .scorer import registered_model_types
+from .train import TrainConfig, load_train_config, train
 
 
 def _fail(tracker: Tracker, message: str) -> None:
@@ -52,7 +53,7 @@ def _fail(tracker: Tracker, message: str) -> None:
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="YAML with a spec §11.2 `train:` section.",
 )
-@click.option("--models", help=f"Comma-separated subset of: {', '.join(ALL_MODELS)}.")
+@click.option("--models", help=f"Comma-separated subset of: {', '.join(registered_model_types())}.")
 @click.option("--tag", "tags", multiple=True, help="Extra ClearML tags, e.g. '#56'.")
 @click.option("--project", default="predictive-cache/train", show_default=True)
 @click.option("--task-name", default=None, help="Default: train:<models>.")
@@ -88,7 +89,7 @@ def main(
             project,
             task_name or f"train:{'+'.join(cfg.models)}",
             ["#56", *tags],
-            requirements=("scikit-learn",),
+            requirements=("scikit-learn", "lightgbm"),
         )
         # Only the dataset ID is a task parameter: local paths never go to the server, and
         # on an agent (no CLI arguments) this is where the cloned/edited value comes from.

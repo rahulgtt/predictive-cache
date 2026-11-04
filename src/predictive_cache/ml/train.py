@@ -20,6 +20,7 @@ import numpy as np
 
 from ..tracking import NullTracker, Tracker
 from .baselines import HotsetScorer
+from .gbdt import GbdtScorer
 from .hashing import canonical_json
 from .logreg import LogRegScorer, training_features
 from .metrics import PRIMARY_METRIC, Budget, default_budgets, evaluate
@@ -52,6 +53,11 @@ class TrainConfig:
     C_grid: list[float] = field(default_factory=lambda: [0.01, 0.1, 1.0, 10.0])
     max_iter: int = 2000
     hotset_top_n: int = 500
+    gbdt_num_leaves_grid: list[int] = field(default_factory=lambda: [15, 63])
+    gbdt_learning_rate: float = 0.05
+    gbdt_rounds: int = 1000
+    gbdt_early_stopping: int = 50
+    gbdt_min_data_in_leaf: int = 200
     primary: str = PRIMARY_METRIC
     tick_s: int = 60
     recent_skip_s: int = 300
@@ -77,12 +83,18 @@ class TrainConfig:
             flat["max_iter"] = int(logreg["max_iter"])
         if "top_n" in data.get("hotset", {}):
             flat["hotset_top_n"] = int(data["hotset"]["top_n"])
+        gbdt = data.get("gbdt", {})
+        if "num_leaves_grid" in gbdt:
+            flat["gbdt_num_leaves_grid"] = [int(n) for n in gbdt["num_leaves_grid"]]
+        for key in ("learning_rate", "rounds", "early_stopping", "min_data_in_leaf"):
+            if key in gbdt:
+                flat[f"gbdt_{key}"] = type(getattr(cls, f"gbdt_{key}"))(gbdt[key])
         if "primary" in data:
             flat["primary"] = str(data["primary"])
         for key, value in data.get("serving_policy", {}).items():
             if key in cls.__dataclass_fields__:
                 flat[key] = value
-        unknown = set(data) - {"models", "logreg", "hotset", "primary", "serving_policy"}
+        unknown = set(data) - {"models", "logreg", "hotset", "gbdt", "primary", "serving_policy"}
         if unknown:
             raise ValueError(f"unknown train config keys: {', '.join(sorted(unknown))}")
         cfg = cls(**flat)
@@ -94,6 +106,8 @@ class TrainConfig:
             scorer_class(model)  # raises KeyError for unknown model types
         if not self.C_grid or any(c <= 0 for c in self.C_grid):
             raise ValueError("C_grid must contain positive values")
+        if not self.gbdt_num_leaves_grid or any(n < 2 for n in self.gbdt_num_leaves_grid):
+            raise ValueError("gbdt_num_leaves_grid must contain values >= 2")
         if not all(0 <= q < 1 for q in self.min_score_quantiles):
             raise ValueError("min_score_quantiles must be in [0, 1)")
         if not 0 < self.min_score_keep <= 1:
@@ -164,6 +178,26 @@ def _build(model_type, features, train, val, universe, budget, cfg, tracker):
                 chosen, chosen_value = candidate, value
         return chosen, dict(chosen.params)
     scorer = scorer_class(model_type)()
+    if isinstance(scorer, GbdtScorer):
+        chosen, chosen_value = None, None
+        for index, leaves in enumerate(sorted(cfg.gbdt_num_leaves_grid)):
+            candidate = type(scorer)(features)
+            candidate.fit(
+                train,
+                val,
+                {
+                    "num_leaves": leaves,
+                    "learning_rate": cfg.gbdt_learning_rate,
+                    "rounds": cfg.gbdt_rounds,
+                    "early_stopping": cfg.gbdt_early_stopping,
+                    "min_data_in_leaf": cfg.gbdt_min_data_in_leaf,
+                },
+            )
+            value = _primary_value(val, universe, candidate.score(val), budget, cfg.primary)
+            tracker.scalar(f"val leaves sweep ({cfg.primary})", f"{model_type} leaves={leaves}", value or 0.0, index)
+            if chosen is None or (value or 0.0) > (chosen_value or 0.0):
+                chosen, chosen_value = candidate, value
+        return chosen, {k: v for k, v in chosen.params.items() if k != "importance_gain"}
     if isinstance(scorer, HotsetScorer):
         scorer.fit(train, None, {"top_n": cfg.hotset_top_n})
         return scorer, {"top_n": cfg.hotset_top_n}
