@@ -5,8 +5,10 @@ users wait for it to arrive from cloud storage.
 
 > **Status: design proposal, not an implemented service.** Synthetic data
 > generation and cleaning, the controlled collection harness, Chimera v2
-> importer, offline plan-file dispatcher, and experimental standalone manual
-> NFS range reader are implemented. The Controller, automated live Warmer
+> importer, strict current-run finalizer, explicit pre-finalizer historical
+> compatibility path, offline plan-file dispatcher, and experimental
+> standalone manual NFS range reader are implemented. The Controller,
+> automated live Warmer
 > integration, representative data collection and real-workload performance
 > claims remain gated work. Generated records model fictional activity and
 > never read personal files. Diagrams and examples below describe the intended

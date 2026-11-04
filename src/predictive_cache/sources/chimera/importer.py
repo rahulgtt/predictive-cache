@@ -181,6 +181,8 @@ def _validation_permit(
     manifest: CollectionManifest,
     manifest_bytes: bytes,
     catalog: FixtureCatalog,
+    *,
+    evaluated_at: datetime | None = None,
 ) -> AdapterValidationPermit:
     data = read_bytes(path)
 
@@ -223,7 +225,7 @@ def _validation_permit(
         or permit.collector_sha256 != APPROVED_COLLECTOR_SHA256
         or permit.validator_sha256 != APPROVED_VALIDATOR_SHA256
         or permit.runbook_sha256 != APPROVED_VALIDATION_RUNBOOK_SHA256
-        or permit.expires_at <= datetime.now(UTC)
+        or permit.expires_at <= (evaluated_at or datetime.now(UTC))
     ):
         raise ValueError("validation permit does not match approved provenance")
     return permit
@@ -729,6 +731,7 @@ def import_dataset(
     checkpoints_path: Path,
     out_dir: Path,
     validation_permit_path: Path | None = None,
+    validation_permit_reference_time: datetime | None = None,
     format: str = "parquet",
 ) -> Manifest:
     """Import one immutable controlled collection run atomically."""
@@ -752,6 +755,7 @@ def import_dataset(
             manifest,
             input_bytes["run_manifest"],
             catalog,
+            evaluated_at=validation_permit_reference_time,
         )
         if validation_permit_path is not None
         else None
