@@ -141,6 +141,13 @@ find "$PCACHE_DATASET_ROOT" -maxdepth 1 -type f -printf '%f\n' | sort
 (cd "$PCACHE_DATASET_ROOT" && sha256sum --status -c SHA256SUMS)
 ```
 
+Training and serving compatibility is governed separately by the additive
+[`read-demand-v1` semantic contract](docs/data-prep/read-demand-v1.md).
+It projects successful NFSv4.1 READs without inventing OPEN/CLOSE, handles or
+application sessions, and binds snapshots/model packages to exact semantic,
+feature-schema and serving-contract hashes. Generic datagen v1 remains
+available for lifecycle fixtures.
+
 ## Manual NFS range reader
 
 The [manual Warmer guide](docs/manual-warmer.md) describes the standalone,

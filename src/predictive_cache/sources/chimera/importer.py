@@ -34,6 +34,10 @@ from predictive_cache.collection.provenance import (
 )
 from predictive_cache.datagen.io import canonical_json, sha256, source_revision, write_table
 from predictive_cache.datagen.schema import Manifest, normalize_rows
+from predictive_cache.semantics.read_demand import (
+    SEMANTIC_VIEW_ID,
+    SEMANTIC_VIEW_SHA256,
+)
 
 from .contract import (
     ChimeraEvent,
@@ -807,6 +811,9 @@ def import_dataset(
         "event_schema_sha256": manifest.event_schema_sha256,
         "input_sha256": input_hashes,
         "event_source_sha256": dict(sorted(source_hashes.items())),
+        "semantic_view_id": SEMANTIC_VIEW_ID,
+        "semantic_view_sha256": SEMANTIC_VIEW_SHA256,
+        "source_evidence_mode": "controlled_demand",
     }
     config_sha = hashlib.sha256(canonical_json(config).encode()).hexdigest()
     out = Path(out_dir).absolute()
@@ -874,6 +881,9 @@ def import_dataset(
             "run_id": manifest.run_id,
             "chimera_image_sha256": manifest.software.chimera_image_sha256,
             "event_schema_sha256": manifest.event_schema_sha256,
+            "semantic_view_id": SEMANTIC_VIEW_ID,
+            "semantic_view_sha256": SEMANTIC_VIEW_SHA256,
+            "source_evidence_mode": "controlled_demand",
             **{f"{name}_sha256": digest for name, digest in input_hashes.items()},
         }
         counts = {
@@ -910,9 +920,10 @@ def import_dataset(
                 "controlled synthetic run; correlation tags do not establish foreground origin",
                 "fixture catalog validates identities but is not copied because it lacks the "
                 "datagen catalog metadata contract",
-                "handle_id is unavailable; each read becomes an orphan open group",
+                "handle/session lifecycle is unavailable and read-demand-v1 does not reconstruct it",
                 "ingest_time is collector durable_at; Chimera sink_time_ns remains diagnostic",
                 "cache outcome and latency are unavailable and remain null",
+                "controlled demand remains synthetic plumbing evidence",
             ],
         }
         output_manifest = Manifest.model_validate(manifest_data)

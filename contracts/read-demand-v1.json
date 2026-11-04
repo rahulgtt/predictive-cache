@@ -1,0 +1,56 @@
+{
+  "forbidden": [
+    "OPEN/CLOSE demand",
+    "read-to-open coalescing",
+    "handle duration",
+    "application session inference",
+    "WRITE/CREATE/REMOVE",
+    "NFSv3/SMB/S3/READ_PLUS",
+    "cold_open labels"
+  ],
+  "identity_scope": [
+    "volume_id",
+    "file_id"
+  ],
+  "loss": {
+    "complete": "eligible for negative labels after the full horizon",
+    "incomplete": "affected labels are unknown",
+    "unknown": "affected labels are unknown or package activation blocks"
+  },
+  "metadata": {
+    "dir_id": "nullable; verified catalog join only",
+    "file_size": "nullable; verified producer or catalog join only",
+    "rename_replacement": "unresolved in production; stale identity blocks execution"
+  },
+  "operation": "READ",
+  "protocol": "NFSv4.1",
+  "provenance": {
+    "controlled_demand": "synthetic plumbing evidence only",
+    "demand_class": [
+      "foreground",
+      "controlled_demand",
+      "fixture_demand",
+      "warmer",
+      "unknown"
+    ],
+    "origin": [
+      "foreground",
+      "warmer",
+      "synthetic",
+      "unknown"
+    ],
+    "real_demand": "foreground + trusted origin + complete coverage only"
+  },
+  "semantic_view_id": "read-demand-v1",
+  "success": "result=ok and 0 <= bytes_read <= bytes_requested",
+  "time": {
+    "event_time": "UTC operation completion time",
+    "known_at": "UTC durable availability time; features order by known_at"
+  },
+  "units": {
+    "bytes_read": "bytes returned",
+    "bytes_requested": "bytes",
+    "file_size": "bytes",
+    "offset": "bytes"
+  }
+}

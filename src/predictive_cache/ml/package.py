@@ -233,8 +233,58 @@ def write_package(
         else:
             shutil.copyfile(coaccess_path, staging / "coaccess.parquet")
         _write_parquet(staging / "smoke.parquet", smoke)
+        semantic_meta = dict(meta.get("semantic", {}))
+        if semantic_meta.get("semantic_view_id") == "read-demand-v1":
+            from predictive_cache.semantics.read_demand import (
+                SEMANTIC_VIEW_ID,
+                SEMANTIC_VIEW_SHA256,
+            )
+
+            from .read_demand import (
+                READ_DEMAND_FEATURE_SCHEMA_SHA256,
+                READ_DEMAND_SERVING_CONTRACT,
+                READ_DEMAND_SERVING_CONTRACT_SHA256,
+                validate_feature_names,
+            )
+            from .read_demand import feature_schema as canonical_feature_schema
+
+            if dict(feature_schema) != canonical_feature_schema():
+                raise PackageError(
+                    "invalid_semantic_view", "read-demand feature schema is not canonical"
+                )
+            if config != READ_DEMAND_SERVING_CONTRACT:
+                raise PackageError(
+                    "invalid_semantic_view", "read-demand serving contract is not canonical"
+                )
+            semantic_meta["semantic_view_id"] = SEMANTIC_VIEW_ID
+            semantic_meta["semantic_view_sha256"] = SEMANTIC_VIEW_SHA256
+            semantic_meta["feature_schema_sha256"] = (
+                READ_DEMAND_FEATURE_SCHEMA_SHA256
+            )
+            semantic_meta["serving_contract_sha256"] = (
+                READ_DEMAND_SERVING_CONTRACT_SHA256
+            )
+            if policy.get("target") != "demand":
+                raise PackageError("invalid_serving_policy", "read-demand requires demand target")
+            if feature_version != "read-demand-fv1":
+                raise PackageError("invalid_semantic_view", "read-demand requires read-demand-fv1")
+            validate_feature_names(columns)
         manifest = {
             "package_version": PACKAGE_VERSION,
+            **(
+                {
+                    "semantic_view_id": semantic_meta["semantic_view_id"],
+                    "semantic_view_sha256": semantic_meta.get("semantic_view_sha256"),
+                    "feature_schema_sha256": semantic_meta.get(
+                        "feature_schema_sha256"
+                    ),
+                    "serving_contract_sha256": semantic_meta.get(
+                        "serving_contract_sha256"
+                    ),
+                }
+                if semantic_meta.get("semantic_view_id")
+                else {}
+            ),
             "model_type": scorer.model_type,
             "feature_version": feature_version,
             "feature_columns": list(columns),
@@ -291,6 +341,7 @@ def load_package(
     path: Path,
     expected_feature_version: str,
     expected_contract_sha256: str | None = None,
+    expected_semantic_view_id: str | None = None, expected_semantic_view_sha256: str | None = None, expected_feature_schema_sha256: str | None = None, available_feature_names: set[str] | None = None,
     *,
     extract_dir: Path | None = None,
 ) -> LoadedPackage:
@@ -300,10 +351,10 @@ def load_package(
         unexpected = sorted(p.name for p in path.iterdir() if p.name not in PACKAGE_FILES)
         if unexpected:
             raise PackageError("unexpected_file", ", ".join(unexpected))
-        return _verify(path, expected_feature_version, expected_contract_sha256, owns_root=False)
+        return _verify(path, expected_feature_version, expected_contract_sha256, owns_root=False, expected_semantic_view_id=expected_semantic_view_id, expected_semantic_view_sha256=expected_semantic_view_sha256, expected_feature_schema_sha256=expected_feature_schema_sha256, available_feature_names=available_feature_names)
     root = _extract(path, extract_dir)
     try:
-        return _verify(root, expected_feature_version, expected_contract_sha256, owns_root=True)
+        return _verify(root, expected_feature_version, expected_contract_sha256, owns_root=True, expected_semantic_view_id=expected_semantic_view_id, expected_semantic_view_sha256=expected_semantic_view_sha256, expected_feature_schema_sha256=expected_feature_schema_sha256, available_feature_names=available_feature_names)
     except BaseException:
         shutil.rmtree(root, ignore_errors=True)
         raise
@@ -314,7 +365,7 @@ def _verify(
     expected_feature_version: str,
     expected_contract_sha256: str | None,
     *,
-    owns_root: bool,
+    owns_root: bool, expected_semantic_view_id=None, expected_semantic_view_sha256=None, expected_feature_schema_sha256=None, available_feature_names=None,
 ) -> LoadedPackage:
     # 1. files exist and hashes match
     if not (root / "package.json").is_file():
@@ -322,6 +373,48 @@ def _verify(
     manifest = _read_json(root / "package.json")
     if not isinstance(manifest, dict):
         raise PackageError("bad_json", "package.json must be an object")
+    semantic = manifest.get("semantic_view_id")
+    if expected_semantic_view_id is not None and semantic != expected_semantic_view_id:
+        raise PackageError("semantic_view_mismatch", str(semantic))
+    if semantic == "read-demand-v1":
+        from .read_demand import (
+            READ_DEMAND_FEATURE_SCHEMA_SHA256,
+            READ_DEMAND_SERVING_CONTRACT,
+            READ_DEMAND_SERVING_CONTRACT_SHA256,
+        )
+        from .read_demand import feature_schema as canonical_feature_schema
+
+        if available_feature_names is None:
+            raise PackageError("feature_profile_required", "read-demand activation requires available feature names")
+        if expected_semantic_view_id is None or expected_semantic_view_sha256 is None or expected_feature_schema_sha256 is None:
+            raise PackageError("semantic_activation_required", "read-demand activation requires expected semantic ID and hash")
+        required = ("semantic_view_sha256", "feature_schema_sha256", "serving_contract_sha256")
+        if manifest.get("feature_version") != "read-demand-fv1" or any(
+            not manifest.get(key) for key in required
+        ):
+            raise PackageError("invalid_semantic_view", "missing read-demand semantic keys")
+    if expected_semantic_view_sha256 and manifest.get("semantic_view_sha256") != expected_semantic_view_sha256:
+        raise PackageError("semantic_hash_mismatch", str(manifest.get("semantic_view_sha256")))
+    unavailable = set(manifest.get("feature_columns", ()))
+    if available_feature_names is not None and unavailable - set(available_feature_names):
+        raise PackageError("unavailable_feature", "package feature is unavailable")
+    if semantic == "read-demand-v1":
+        if expected_feature_schema_sha256 and manifest.get("feature_schema_sha256") != expected_feature_schema_sha256:
+            raise PackageError("schema_hash_mismatch", "feature schema differs from expected snapshot")
+        config = manifest.get("serving_contract", {}).get("config", {})
+        if expected_feature_schema_sha256 != READ_DEMAND_FEATURE_SCHEMA_SHA256:
+            raise PackageError("schema_hash_mismatch", "runtime feature schema is not canonical")
+        if manifest.get("feature_schema_sha256") != READ_DEMAND_FEATURE_SCHEMA_SHA256:
+            raise PackageError("schema_hash_mismatch", "package feature schema is not canonical")
+        if config != READ_DEMAND_SERVING_CONTRACT:
+            raise PackageError("invalid_semantic_view", "serving contract is not canonical")
+        if (
+            manifest.get("serving_contract_sha256")
+            != READ_DEMAND_SERVING_CONTRACT_SHA256
+        ):
+            raise PackageError("semantic_hash_mismatch", "serving contract is not canonical")
+        if manifest.get("serving_policy", {}).get("target") != "demand":
+            raise PackageError("invalid_serving_policy", "read-demand requires demand target")
     files = manifest.get("files")
     if not isinstance(files, dict) or set(files) != set(PAYLOAD_FILES):
         raise PackageError("missing_file", "manifest.files must list exactly the payload files")
@@ -331,6 +424,14 @@ def _verify(
         if sha256(root / name) != files[name]:
             raise PackageError("hash_mismatch", name)
 
+    if semantic == "read-demand-v1":
+        if _read_json(root / "feature_schema.json") != canonical_feature_schema():
+            raise PackageError("schema_hash_mismatch", "feature schema payload is not canonical")
+        if (
+            contract_sha256(manifest.get("serving_contract", {}).get("config", {}))
+            != READ_DEMAND_SERVING_CONTRACT_SHA256
+        ):
+            raise PackageError("semantic_hash_mismatch", "serving contract hash does not recompute")
     # 2. package_id
     if manifest.get("package_id") != compute_package_id(manifest):
         raise PackageError("bad_package_id", str(manifest.get("package_id")))

@@ -42,6 +42,12 @@ FEATURE_KINDS: dict[str, str] = {
     "coacc_max_conf": "ratio",
     "coacc_sum_conf": "ratio",
     "coacc_max_lift": "lift",
+    "read_count_5m": "count", "read_count_15m": "count", "read_count_1h": "count",
+    "read_count_24h": "count", "read_count_7d": "count", "returned_bytes_5m": "bytes",
+    "returned_bytes_1h": "bytes", "returned_bytes_24h": "bytes", "returned_bytes_7d": "bytes",
+    "distinct_read_ranges_1h": "count", "distinct_read_ranges_24h": "count",
+    "secs_since_last_read": "seconds", "read_days_7d": "count", "volume_read_share_1h": "ratio",
+    "coread_from_anchor_24h": "count", "file_size_bytes": "bytes",
 }
 FILL = {"seconds": SECONDS_CAP, "count": 0.0, "bytes": 0.0, "ratio": 0.0, "lift": 0.0}
 CLIP = 10.0

@@ -30,6 +30,11 @@ The **same feature-store code** runs in the snapshot builder and in the live
 Controller. That is the main defence against train/serve skew and leakage.
 
 Input today is datagen output ([datagen spec](../datagen/spec.md) §3, §5);
+
+For the READ-only hackathon MVP, the additive
+[`read-demand-v1` contract](read-demand-v1.md) overrides lifecycle-dependent
+feature/label semantics without rewriting generic v1. Its cleaner mode emits
+first-class READ rows and zero reconstructed lifecycle rows.
 later it is a real source mapped to the same event schema
 ([#25](https://github.com/rahulgtt/predictive-cache/issues/25)). Results on
 synthetic input are plumbing and planted-pattern evidence only.

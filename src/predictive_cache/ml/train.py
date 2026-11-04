@@ -33,6 +33,7 @@ from .snapshots import (
     read_feature_schema,
     read_manifest,
     serving_contract,
+    verify_read_demand_manifest,
 )
 
 MIB = 2**20
@@ -182,6 +183,18 @@ def train(
     manifest = read_manifest(snapshots_dir)
     schema = read_feature_schema(snapshots_dir)
     contract = serving_contract(manifest)
+    verify_read_demand_manifest(snapshots_dir, manifest)
+    if manifest.get("semantic_view_id") == "read-demand-v1":
+        from predictive_cache.semantics.read_demand import SEMANTIC_VIEW_SHA256
+
+        from .package import contract_sha256
+        if manifest.get("semantic_view_sha256") != SEMANTIC_VIEW_SHA256:
+            raise ValueError("read-demand semantic hash mismatch")
+        schema_hash = hashlib.sha256((snapshots_dir / "feature_schema.json").read_bytes()).hexdigest()
+        if manifest.get("feature_schema_sha256") != schema_hash:
+            raise ValueError("snapshot feature schema hash mismatch")
+        if manifest.get("serving_contract_sha256") != contract_sha256(contract["config"]):
+            raise ValueError("snapshot serving contract hash mismatch")
     labels = manifest.get("labels", {})
     features = training_features(schema)
     budget = _primary_budget(cfg.primary)
@@ -247,6 +260,9 @@ def train(
             val_rows.slice(0, 50),
             {
                 "serving_contract": {"config": contract["config"]},
+                "semantic": ({
+                    "semantic_view_id": manifest.get("semantic_view_id"),
+                } if manifest.get("semantic_view_id") else {}),
                 "serving_policy": policy,
                 "data": data,
                 "training": {

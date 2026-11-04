@@ -16,6 +16,27 @@ def fields(*items):
 
 
 EVENTS_CLEAN = EVENT_SCHEMA.append(pa.field("effective_time", TS)).append(pa.field("known_at", TS))
+READ_EVENTS = fields(
+    ("schema_version", pa.int16()),
+    ("event_id", S),
+    ("event_time", TS),
+    ("known_at", TS),
+    ("volume_id", S),
+    ("file_id", S),
+    ("dir_id", S),
+    ("offset", INT),
+    ("bytes_requested", INT),
+    ("bytes_read", INT),
+    ("file_size", INT),
+    ("origin", S),
+    ("demand_class", S),
+    ("origin_trust", S),
+    ("coverage_status", S),
+    ("metadata_status", S),
+    ("data_kind", S),
+    ("protocol", S),
+    ("operation", S),
+)
 EXCLUDED = fields(*[(f.name, f.type) for f in EVENT_SCHEMA], ("reason", S), ("detail", S))
 OPENS = fields(
     ("open_id", S),
@@ -73,6 +94,7 @@ COVERAGE = fields(
 )
 SCHEMAS = {
     "events_clean": EVENTS_CLEAN,
+    "read_events": READ_EVENTS,
     "excluded": EXCLUDED,
     "opens": OPENS,
     "open_ranges": OPEN_RANGES,

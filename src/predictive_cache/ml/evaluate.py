@@ -37,7 +37,9 @@ from .snapshots import (
     load_universe,
     manifest_sha256,
     read_manifest,
+    runtime_available_features,
     serving_contract,
+    verify_read_demand_manifest,
 )
 
 FREEZE_VERSION = 1
@@ -175,13 +177,16 @@ def _load_all(
     refs: list[str], snapshots_dir: Path, tracker: Tracker
 ) -> list[tuple[str, Path, LoadedPackage]]:
     manifest = read_manifest(snapshots_dir)
+    verify_read_demand_manifest(snapshots_dir, manifest)
     contract = serving_contract(manifest).get("sha256")
     version = manifest.get("feature_version", "fv1")
     out = []
     for ref in refs:
         path = resolve_ref(ref, tracker)
         try:
-            out.append((ref, path, load_package(path, version, contract)))
+            semantic_id = manifest.get("semantic_view_id")
+            available = runtime_available_features(manifest) if semantic_id else None
+            out.append((ref, path, load_package(path, version, contract, expected_semantic_view_id=semantic_id, expected_semantic_view_sha256=manifest.get("semantic_view_sha256"), expected_feature_schema_sha256=manifest.get("feature_schema_sha256"), available_feature_names=available)))
         except PackageError as exc:
             _close(out)
             raise EvalError("package_invalid", f"{ref}: {exc}") from exc

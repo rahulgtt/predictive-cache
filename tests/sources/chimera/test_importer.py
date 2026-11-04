@@ -34,7 +34,14 @@ from predictive_cache.collection.provenance import (
     APPROVED_VALIDATOR_SHA256,
 )
 from predictive_cache.datagen.io import canonical_json
+from predictive_cache.prep.clean.io import read_rows
+from predictive_cache.prep.clean.pipeline import run_clean
 from predictive_cache.prep.cli import main as prep_main
+from predictive_cache.prep.config import CleanConfig
+from predictive_cache.semantics.read_demand import (
+    SEMANTIC_VIEW_ID,
+    SEMANTIC_VIEW_SHA256,
+)
 from predictive_cache.sources.chimera.cli import main
 from predictive_cache.sources.chimera.importer import (
     _validate_catalog,
@@ -357,6 +364,42 @@ def _fixture(tmp_path: Path) -> dict[str, Path]:
         )
     _jsonl(paths["checkpoints"], checkpoints)
     return paths
+
+
+def test_read_demand_clean_retains_controlled_reads_without_fabricating_opens(tmp_path: Path):
+    paths = _fixture(tmp_path / "evidence")
+    imported = tmp_path / "imported"
+    manifest = import_dataset(
+        event_sources_path=paths["event_sources"],
+        observed_path=paths["observed"],
+        run_manifest_path=paths["run_manifest"],
+        offered_ledger_path=paths["offered_ledger"],
+        fixture_catalog_path=paths["fixture_catalog"],
+        checkpoints_path=paths["checkpoints"],
+        out_dir=imported,
+        format="jsonl",
+    )
+    assert manifest.generator.runtime["semantic_view_id"] == SEMANTIC_VIEW_ID
+    assert manifest.generator.runtime["semantic_view_sha256"] == SEMANTIC_VIEW_SHA256
+    cleaned = tmp_path / "cleaned"
+    result = run_clean(
+        imported,
+        CleanConfig(),
+        cleaned,
+        format="jsonl",
+        semantic_view=SEMANTIC_VIEW_ID,
+    )
+    assert result["counts"]["read_events"] == 5
+    assert result["counts"]["opens"] == 0
+    assert result["counts"]["open_ranges"] == 0
+    rows = [
+        row
+        for entry in result["files"]
+        if entry["path"].startswith("read_events/")
+        for row in read_rows(cleaned / entry["path"])
+    ]
+    assert {row["demand_class"] for row in rows} == {"controlled_demand"}
+    assert {row["origin"] for row in rows} == {"synthetic"}
 
 
 def _reseal_raw(paths: dict[str, Path]) -> None:
