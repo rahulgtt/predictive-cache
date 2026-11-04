@@ -10,6 +10,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from predictive_cache.semantics.read_demand import SEMANTIC_VIEW_SHA256
+
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 GitObjectId = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 SafeId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
@@ -702,6 +704,27 @@ class LiveAdapterRuntime(StrictModel):
     offered_ledger_sha256: Sha256
     fixture_catalog_sha256: Sha256
     checkpoints_sha256: Sha256
+    semantic_view_id: Literal["read-demand-v1"] | None = None
+    semantic_view_sha256: Sha256 | None = None
+    source_evidence_mode: Literal[
+        "controlled_demand", "offline_simulated_fixture"
+    ] | None = None
+
+    @model_validator(mode="after")
+    def semantic_view_binding(self):
+        values = (
+            self.semantic_view_id,
+            self.semantic_view_sha256,
+            self.source_evidence_mode,
+        )
+        if any(value is not None for value in values) and any(
+            value is None for value in values
+        ):
+            raise ValueError("adapter semantic view fields must be complete")
+        if self.semantic_view_id is not None:
+            if self.semantic_view_sha256 != SEMANTIC_VIEW_SHA256:
+                raise ValueError("adapter semantic view hash mismatch")
+        return self
 
 
 class LiveAdapterGenerator(StrictModel):

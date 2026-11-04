@@ -24,7 +24,18 @@ def _dimension(value, missing="unknown"):
     return value if isinstance(value, str) and value else missing
 
 
-def build_report(input_rows, kept, excluded, opens, coverage, counts, margin_s, catalog_misses):
+def build_report(
+    input_rows,
+    kept,
+    excluded,
+    opens,
+    coverage,
+    counts,
+    margin_s,
+    catalog_misses,
+    read_events=None,
+):
+    read_events = read_events or []
     by_volume_day = defaultdict(lambda: {"input": 0, "kept": 0, "excluded": 0})
     exclusions_by_volume_day_reason = Counter()
     for label, rows in (("input", input_rows), ("kept", kept), ("excluded", excluded)):
@@ -97,8 +108,16 @@ def build_report(input_rows, kept, excluded, opens, coverage, counts, margin_s, 
             if opens
             else 0.0,
         },
-        "successful_returned_bytes": sum(r["bytes_read"] or 0 for r in opens),
-        "distinct_bytes": sum(r["distinct_bytes_read"] or 0 for r in opens),
+        "successful_returned_bytes": (
+            sum(r["bytes_read"] or 0 for r in read_events)
+            if read_events
+            else sum(r["bytes_read"] or 0 for r in opens)
+        ),
+        "distinct_bytes": (
+            sum(r["bytes_read"] or 0 for r in read_events)
+            if read_events
+            else sum(r["distinct_bytes_read"] or 0 for r in opens)
+        ),
         "catalog_misses": catalog_misses,
         "origin_mix": dict(sorted(origins.items())),
         "app_mix": dict(sorted(apps.items())),

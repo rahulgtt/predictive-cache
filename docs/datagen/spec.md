@@ -51,6 +51,11 @@ Consumers depend **only** on the output layout (§3) and schemas (§5):
 | Tests and recovery checks **only** | `truth/` |
 
 `truth/` is never read by feature, model, planner or Controller code.
+
+The additive [`read-demand-v1` projection](../data-prep/read-demand-v1.md)
+does not change these generic schemas or default dataset hashes. The
+`project-read-demand` command writes a separate READ-only projection and
+separate generator truth outside the source dataset.
 Reading it outside tests and evaluation reports is a leakage bug.
 
 ### 1.3 Planner objective neutrality

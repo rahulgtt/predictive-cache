@@ -30,12 +30,22 @@ def main():
 @click.option(
     "--format", "output_format", type=click.Choice(["parquet", "jsonl"]), default="parquet"
 )
+@click.option(
+    "--semantic-view",
+    type=click.Choice(["generic-v1", "read-demand-v1"]),
+    default="generic-v1",
+)
 @click.option("--overwrite", is_flag=True)
-def clean(input_dir, out, config_path, output_format, overwrite):
+def clean(input_dir, out, config_path, output_format, semantic_view, overwrite):
     """Clean a datagen-compatible dataset without reading its truth tables."""
     try:
         manifest = run_clean(
-            input_dir, load_config(config_path), out, format=output_format, overwrite=overwrite
+            input_dir,
+            load_config(config_path),
+            out,
+            format=output_format,
+            overwrite=overwrite,
+            semantic_view=semantic_view,
         )
     except (ValueError, OSError, TypeError, KeyError) as exc:
         raise click.ClickException(str(exc)) from exc

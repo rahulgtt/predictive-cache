@@ -69,3 +69,20 @@ def describe(directory):
         f"{manifest.data_kind}; seed={manifest.seed}"
     )
     click.echo(report)
+
+
+@main.command("project-read-demand")
+@click.argument("directory", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--out", required=True, type=click.Path(path_type=Path))
+def project_read_demand(directory, out):
+    """Write an additive read-demand-v1 projection and separate generator truth."""
+    from .read_projection import project_dataset
+
+    try:
+        manifest = project_dataset(directory, out)
+    except (ValueError, OSError, TypeError, KeyError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"Projected {manifest['counts']['read_events']} successful READ rows "
+        f"as {manifest['projection']} at {out}"
+    )

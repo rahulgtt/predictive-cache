@@ -8,16 +8,25 @@ from predictive_cache.datagen.schema import normalize_rows
 from predictive_cache.prep.config import CleanConfig
 
 
-def classify_event(event: dict, known_at: datetime, cfg: CleanConfig) -> str | None:
+def classify_event(
+    event: dict,
+    known_at: datetime,
+    cfg: CleanConfig,
+    *,
+    semantic_view: str = "generic-v1",
+    admit_controlled_synthetic: bool = False,
+) -> str | None:
     """Return the first applicable reason; duplicate detection belongs to the caller."""
     try:
         row = normalize_rows("events", [event])[0]
     except (ValueError, TypeError, KeyError, OverflowError):
         return "schema_invalid"
+    if semantic_view == "read-demand-v1" and row["operation"] != "read":
+        return "operation_unsupported"
     origin = row["origin"]
     if origin == "warmer":
         return "origin_warmer"
-    if origin == "synthetic":
+    if origin == "synthetic" and not admit_controlled_synthetic:
         return "origin_synthetic"
     if origin in (None, "unknown"):
         return "origin_unknown"

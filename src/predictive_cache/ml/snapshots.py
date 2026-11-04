@@ -48,6 +48,12 @@ def coaccess_path(root: Path) -> Path | None:
 
 
 def serving_contract(manifest: dict) -> dict:
+    if manifest.get("semantic_view_id") == "read-demand-v1":
+        required = ("semantic_view_sha256", "feature_schema_sha256", "serving_contract_sha256")
+        if manifest.get("feature_version") != "read-demand-fv1" or any(
+            not manifest.get(key) for key in required
+        ):
+            raise SnapshotError("read-demand-v1 manifest lacks required semantic keys")
     contract = manifest.get("serving_contract")
     if not isinstance(contract, dict) or not isinstance(contract.get("config"), dict):
         raise SnapshotError("snapshots manifest lacks serving_contract.config (data-prep §8.6)")
@@ -93,3 +99,87 @@ def load_universe(root: Path) -> pa.Table:
     if table is None:
         raise SnapshotError(f"{root} has no universe table")
     return table
+
+
+def verify_read_demand_manifest(root: Path, manifest: dict) -> dict:
+    """Verify all read-demand bindings against shared semantics and snapshot bytes."""
+    if manifest.get("semantic_view_id") != "read-demand-v1":
+        return manifest
+    from predictive_cache.semantics.read_demand import SEMANTIC_VIEW_SHA256
+
+    from .package import contract_sha256
+    from .read_demand import (
+        READ_DEMAND_FEATURE_SCHEMA_SHA256,
+        READ_DEMAND_SERVING_CONTRACT,
+        READ_DEMAND_SERVING_CONTRACT_SHA256,
+        feature_schema,
+    )
+
+    if manifest.get("semantic_view_sha256") != SEMANTIC_VIEW_SHA256:
+        raise SnapshotError("read-demand semantic hash mismatch")
+    schema = read_feature_schema(root)
+    if schema != feature_schema():
+        raise SnapshotError("read-demand feature schema is not canonical")
+    if manifest.get("feature_schema_sha256") != READ_DEMAND_FEATURE_SCHEMA_SHA256:
+        raise SnapshotError("read-demand feature schema hash mismatch")
+    contract = serving_contract(manifest)
+    if contract["config"] != READ_DEMAND_SERVING_CONTRACT:
+        raise SnapshotError("read-demand serving contract is not canonical")
+    if (
+        manifest.get("serving_contract_sha256")
+        != READ_DEMAND_SERVING_CONTRACT_SHA256
+        or contract_sha256(contract["config"])
+        != READ_DEMAND_SERVING_CONTRACT_SHA256
+    ):
+        raise SnapshotError("read-demand serving contract hash mismatch")
+    runtime_available_features(manifest)
+    return manifest
+
+
+def runtime_available_features(manifest: dict) -> set[str]:
+    """Validate the explicit serving capability profile for read-demand-v1."""
+    if manifest.get("semantic_view_id") != "read-demand-v1":
+        return set()
+    from .read_demand import runtime_available_features as expected_features
+
+    capabilities = manifest.get("runtime_capabilities")
+    claimed = manifest.get("runtime_available_features")
+    if not isinstance(capabilities, dict) or not isinstance(claimed, list):
+        raise SnapshotError("read-demand snapshot lacks runtime capability profile")
+    expected = expected_features(
+        verified_file_size=capabilities.get("verified_file_size") is True,
+        anchor_context=capabilities.get("anchor_context") is True,
+    )
+    if set(claimed) != set(expected):
+        raise SnapshotError("read-demand runtime feature profile mismatch")
+    return set(claimed)
+
+
+def build_read_demand_feature_rows(
+    events: list[dict],
+    coverage: list[dict],
+    ticks: list,
+    candidates: list[dict],
+) -> list[dict]:
+    """Build offline snapshot rows with the same engine used by live updates."""
+    from .read_demand import ReadDemandEngine
+
+    engine = ReadDemandEngine()
+    for row in coverage:
+        engine.update_coverage(row["volume_id"], row["hour_start"], row["status"])
+    ordered = sorted(events, key=lambda row: (row["known_at"], row["event_id"]))
+    cursor = 0
+    result = []
+    for tick in ticks:
+        while cursor < len(ordered) and ordered[cursor]["known_at"] <= tick:
+            engine.update(ordered[cursor])
+            cursor += 1
+        for candidate in candidates:
+            features = engine.features(
+                tick,
+                volume_id=candidate["volume_id"],
+                file_id=candidate["file_id"],
+                anchor_file_id=candidate.get("anchor_file_id"),
+            )
+            result.append({"t": tick, **candidate, **features})
+    return result

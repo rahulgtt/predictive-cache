@@ -37,6 +37,11 @@ scoring, evaluation and Controller runtime contracts within the README's design 
 
 The historical snapshot interval and the live prediction interval are
 separate settings: data-prep's `snapshots.tick_s` initially uses 900 seconds,
+
+Model packages used with the READ-only MVP must satisfy the
+[`read-demand-v1` semantic and hash gate](../data-prep/read-demand-v1.md).
+Generic `fv1` open/session/write names are not aliases for READ features;
+the separate `read-demand-fv1` registry uses explicit READ names.
 while the live package's `serving_policy.tick_s` initially uses 60 seconds.
 Both use the same feature rules at their respective prediction times.
 

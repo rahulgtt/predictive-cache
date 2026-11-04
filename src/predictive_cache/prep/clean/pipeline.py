@@ -23,6 +23,11 @@ from predictive_cache.prep.clean.rules import classify_event
 from predictive_cache.prep.clean.schema import EXCLUDED
 from predictive_cache.prep.config import CleanConfig
 from predictive_cache.prep.coverage import build_coverage, utc
+from predictive_cache.semantics.read_demand import (
+    SEMANTIC_VIEW_ID,
+    SEMANTIC_VIEW_SHA256,
+    ReadDemandEvent,
+)
 
 
 def _safe_volume(value) -> str:
@@ -61,6 +66,12 @@ def _sort_instant(value):
         return datetime.min.replace(tzinfo=UTC)
 
 
+def _event_coverage_status(event, coverage_by_hour) -> str:
+    hour = event["event_time"].replace(minute=0, second=0, microsecond=0)
+    status = coverage_by_hour.get((event["volume_id"], hour), "unknown")
+    return "unknown" if status == "no_counters" else status
+
+
 def _partitioned(stage, name, rows, suffix, date_field, entries, volumes, fallback_day):
     grouped = defaultdict(list)
     for row in rows:
@@ -84,6 +95,8 @@ def _partitioned(stage, name, rows, suffix, date_field, entries, volumes, fallba
             )
         elif name == "opens":
             group.sort(key=lambda r: (r["open_time"], r["open_id"]))
+        elif name == "read_events":
+            group.sort(key=lambda r: (r["known_at"], r["event_id"]))
         else:
             group.sort(key=lambda r: (r["open_id"], r["offset"], r["known_at"]))
         relative = f"{name}/volume_id={volume}/date={day}/part-00000.{suffix}"
@@ -179,10 +192,13 @@ def run_clean(
     *,
     format: str = "parquet",
     overwrite: bool = False,
+    semantic_view: str = "generic-v1",
 ) -> dict:
     """Clean one source dataset, leaving a complete output or no output."""
     if format not in {"parquet", "jsonl"}:
         raise ValueError("format must be parquet or jsonl")
+    if semantic_view not in {"generic-v1", SEMANTIC_VIEW_ID}:
+        raise ValueError("semantic_view must be generic-v1 or read-demand-v1")
     source, out = Path(input_dir).resolve(), Path(out_dir).absolute()
     if source == out or out.is_relative_to(source):
         raise ValueError("output must be outside the input dataset")
@@ -197,6 +213,14 @@ def run_clean(
     if parent["event_schema_version"] != 1:
         raise ValueError("unsupported input event schema")
     records, counters, catalog_paths = _source_rows(source, parent)
+    runtime = parent.get("generator", {}).get("runtime", {})
+    source_evidence_mode = runtime.get("source_evidence_mode")
+    admit_controlled_synthetic = (
+        semantic_view == SEMANTIC_VIEW_ID
+        and runtime.get("semantic_view_id") == SEMANTIC_VIEW_ID
+        and runtime.get("semantic_view_sha256") == SEMANTIC_VIEW_SHA256
+        and source_evidence_mode == "controlled_demand"
+    )
     records.sort(key=_event_sort)
     seen = set()
     kept, excluded = [], []
@@ -216,22 +240,74 @@ def run_clean(
             excluded.append({**event, "reason": "duplicate", "detail": None})
             continue
         known = event["ingest_time"]
-        reason = classify_event(event, known, cfg)
+        reason = classify_event(
+            event,
+            known,
+            cfg,
+            semantic_view=semantic_view,
+            admit_controlled_synthetic=admit_controlled_synthetic,
+        )
         if reason:
             excluded.append({**event, "reason": reason, "detail": None})
             continue
         kept.append({**event, "known_at": known, "effective_time": min(event["event_time"], known)})
     kept.sort(key=lambda r: (r["known_at"], r["event_id"]))
-    tracker = HandleTracker(cfg)
-    opens, ranges, meta = [], [], []
+    coverage = build_coverage(parent, counters, cfg)
+    coverage_by_hour = {
+        (row["volume_id"], row["hour_start"]): row["status"] for row in coverage
+    }
+    tracker = None if semantic_view == SEMANTIC_VIEW_ID else HandleTracker(cfg)
+    opens, ranges, meta, read_events = [], [], [], []
     for event in kept:
-        opens.extend(
-            update["row"]
-            for update in tracker.advance(event["known_at"] - timedelta(microseconds=1))
-        )
-        tracker.push(event)
+        if tracker is not None:
+            opens.extend(
+                update["row"]
+                for update in tracker.advance(event["known_at"] - timedelta(microseconds=1))
+            )
+            tracker.push(event)
         operation = event["operation"]
-        if operation == "read":
+        if semantic_view == SEMANTIC_VIEW_ID:
+            demand_class = (
+                "controlled_demand"
+                if admit_controlled_synthetic
+                else "fixture_demand"
+                if parent["data_kind"] == "synthetic"
+                else "foreground"
+            )
+            origin_trust = (
+                "client_asserted"
+                if admit_controlled_synthetic
+                else "fixture"
+                if parent["data_kind"] == "synthetic"
+                else "trusted"
+            )
+            has_metadata = event["dir_id"] is not None and event["file_size"] is not None
+            projected = ReadDemandEvent(
+                event_id=event["event_id"],
+                event_time=event["event_time"],
+                known_at=event["known_at"],
+                volume_id=event["volume_id"],
+                file_id=event["file_id"],
+                dir_id=event["dir_id"],
+                offset=event["offset"],
+                bytes_requested=event["bytes_requested"],
+                bytes_read=event["bytes_read"],
+                file_size=event["file_size"],
+                origin=event["origin"] or "unknown",
+                demand_class=demand_class,
+                origin_trust=origin_trust,
+                coverage_status=_event_coverage_status(event, coverage_by_hour),
+                metadata_status=(
+                    "missing"
+                    if not has_metadata
+                    else "fixture"
+                    if parent["data_kind"] == "synthetic"
+                    else "verified"
+                ),
+                data_kind=parent["data_kind"],
+            )
+            read_events.append(projected.model_dump(mode="python"))
+        elif operation == "read":
             ranges.append(
                 {
                     "open_id": tracker.key(event),
@@ -260,8 +336,8 @@ def run_clean(
                     )
                 }
             )
-    opens.extend(update["row"] for update in tracker.flush())
-    coverage = build_coverage(parent, counters, cfg)
+    if tracker is not None:
+        opens.extend(update["row"] for update in tracker.flush())
     catalog_files = []
     for path in catalog_paths:
         if path.startswith("catalog/files."):
@@ -277,13 +353,19 @@ def run_clean(
         "opens_open_missing": sum(r["open_missing"] for r in opens),
         "opens_close_missing": sum(r["close_missing"] for r in opens),
         "opens_bytes_inconsistent": sum(r["bytes_inconsistent"] for r in opens),
-        "late_reads_after_completion": tracker.late_reads_after_completion,
-        "unexpected_reads_in_summary_mode": tracker.unexpected_reads_in_summary_mode,
+        "late_reads_after_completion": (
+            tracker.late_reads_after_completion if tracker is not None else 0
+        ),
+        "unexpected_reads_in_summary_mode": (
+            tracker.unexpected_reads_in_summary_mode if tracker is not None else 0
+        ),
         "open_ranges": len(ranges),
         "meta_events": len(meta),
         "catalog_miss_files": catalog_misses["files"],
         "catalog_miss_events": catalog_misses["events"],
     }
+    if semantic_view == SEMANTIC_VIEW_ID:
+        counts["read_events"] = len(read_events)
     report = build_report(
         [r for r, _, _ in records],
         kept,
@@ -293,6 +375,7 @@ def run_clean(
         counts,
         cfg.coverage.skew_margin_s,
         catalog_misses,
+        read_events,
     )
     if out.exists() and not overwrite:
         raise ValueError("output already exists; use --overwrite")
@@ -314,6 +397,17 @@ def run_clean(
                 rows,
                 format,
                 field,
+                entries,
+                parent["volumes"],
+                utc(parent["period"]["start"]).date().isoformat(),
+            )
+        if semantic_view == SEMANTIC_VIEW_ID:
+            _partitioned(
+                stage,
+                "read_events",
+                read_events,
+                format,
+                "known_at",
                 entries,
                 parent["volumes"],
                 utc(parent["period"]["start"]).date().isoformat(),
@@ -384,6 +478,15 @@ def run_clean(
             "files": sorted(entries, key=lambda r: r["path"]),
             "created_at": datetime.now(UTC),
         }
+        if semantic_view == SEMANTIC_VIEW_ID:
+            manifest.update(
+                {
+                    "semantic_view_id": SEMANTIC_VIEW_ID,
+                    "semantic_view_sha256": SEMANTIC_VIEW_SHA256,
+                    "source_evidence_mode": source_evidence_mode
+                    or ("fixture_demand" if parent["data_kind"] == "synthetic" else "foreground"),
+                }
+            )
         (stage / "manifest.json").write_text(canonical_json(manifest) + "\n")
         if out.exists():
             backup = Path(tempfile.mkdtemp(prefix=f".{out.name}-backup-", dir=out.parent))
