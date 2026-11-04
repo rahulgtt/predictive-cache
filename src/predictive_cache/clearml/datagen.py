@@ -24,6 +24,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", type=Path, help="Fresh output directory; otherwise temporary")
     parser.add_argument("--local", action="store_true", help="Run here while tracking in ClearML")
     parser.add_argument("--no-track", action="store_true", help="Run here without ClearML")
+    parser.add_argument("--dataset-version", help="ClearML Dataset version, e.g. 2.0.0")
+    parser.add_argument(
+        "--tag", action="append", default=[], help="Extra tag for the task and Dataset (repeat)"
+    )
     return parser
 
 
@@ -67,9 +71,18 @@ def main(argv: list[str] | None = None) -> None:
             else {}
         )
         cfg = Config.model_validate(task.connect_configuration(scenario, name="scenario"))
+        # Stored on the task so a worker (which gets no CLI arguments) or a cloned run uses them.
+        publish = task.connect(
+            {"dataset_version": args.dataset_version or "", "tags": ",".join(args.tag)},
+            name="publish",
+        )
+        dataset_version = str(publish.get("dataset_version") or "") or None
+        extra_tags = tuple(
+            t.strip() for t in str(publish.get("tags") or "").split(",") if t.strip()
+        )
         if local:
             task.set_repo(repo="https://github.com/rahulgtt/predictive-cache.git")
-            task.add_tags(f"seed:{cfg.seed}")
+            task.add_tags([f"seed:{cfg.seed}", *extra_tags])
         if not args.local:
             task.execute_remotely(queue_name=args.queue, clone=False)
 
@@ -97,7 +110,9 @@ def main(argv: list[str] | None = None) -> None:
             )
             from predictive_cache.clearml.datasets import publish_data_only
 
-            dataset_id = publish_data_only(out, manifest, task.get_output_destination())
+            dataset_id = publish_data_only(
+                out, manifest, task.get_output_destination(), dataset_version, extra_tags
+            )
             task.connect({"synthetic_dataset_id": dataset_id}, name="outputs")
             print(
                 f"ClearML task {task.id} uploaded test-only artifact and data-only Dataset {dataset_id}"

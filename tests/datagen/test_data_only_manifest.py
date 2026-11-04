@@ -52,3 +52,42 @@ def test_projected_known_gap_still_masks_zero_drop_hour(tmp_path):
     }
     rows = build_coverage(projected.model_dump(mode="python"), [counter], CleanConfig())
     assert rows[0]["status"] == "incomplete"
+
+
+def test_publish_passes_version_and_extra_tags(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from predictive_cache.clearml.datasets import publish_data_only
+
+    created = {}
+
+    class FakeDataset:
+        id = "fake-dataset-id"
+
+        @classmethod
+        def create(cls, **kwargs):
+            created.update(kwargs)
+            return cls()
+
+        def add_files(self, path):
+            return sum(1 for p in __import__("pathlib").Path(path).rglob("*") if p.is_file())
+
+        def upload(self, show_progress=False):
+            return None
+
+        def finalize(self):
+            return True
+
+    monkeypatch.setitem(sys.modules, "clearml", types.SimpleNamespace(Dataset=FakeDataset))
+    root = tmp_path / "generated"
+    manifest = run(load_config(preset="tiny"), root)
+    assert publish_data_only(root, manifest, "http://files", "2.0.0", ("size:small",)) == (
+        "fake-dataset-id"
+    )
+    assert created["dataset_version"] == "2.0.0"
+    assert created["dataset_tags"] == ["data:synthetic", "seed:42", "#71", "size:small"]
+    created.clear()
+    publish_data_only(root, manifest, "http://files")
+    assert created["dataset_version"] is None
+    assert created["dataset_tags"] == ["data:synthetic", "seed:42", "#71"]
