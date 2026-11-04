@@ -32,6 +32,13 @@ from .models import (
     OfferedOperation,
     PreReadHealth,
     ReconciliationReport,
+    WorkloadCollectionManifest,
+)
+from .workload import (
+    WorkloadExecutionPlan,
+    checkpoint_schedule,
+    execution_plan_sha256,
+    run_bound_operation_id,
 )
 
 _LIBC = ctypes.CDLL(None)
@@ -419,6 +426,99 @@ def planned_operations(
     return operations
 
 
+def planned_workload_operations(
+    manifest: WorkloadCollectionManifest,
+    catalog: FixtureCatalog,
+    plan: WorkloadExecutionPlan,
+) -> list[tuple[int, FixtureEntry, int, int, str]]:
+    if catalog_sha256(catalog) != manifest.fixture_catalog_sha256:
+        raise ValueError("fixture catalog checksum mismatch")
+    if execution_plan_sha256(plan) != manifest.execution_plan_sha256:
+        raise ValueError("execution plan checksum mismatch")
+    if plan.fixture_catalog_sha256 != manifest.fixture_catalog_sha256:
+        raise ValueError("execution plan fixture catalog checksum mismatch")
+    if plan.workload_config_sha256 != manifest.execution_config_sha256:
+        raise ValueError("execution plan config checksum mismatch")
+    if plan.semantic_view_id != manifest.semantic_view_id or (
+        plan.semantic_view_sha256 != manifest.semantic_view_sha256
+    ):
+        raise ValueError("execution plan semantic view mismatch")
+    if plan.planned_operation_count != manifest.planned_operation_count:
+        raise ValueError("execution plan operation count mismatch")
+    if any(
+        (
+            plan.operation_schedule_tolerance_s
+            != manifest.operation_schedule_tolerance_s,
+            plan.seed != manifest.seed,
+            plan.untagged_correlation_window_s
+            != manifest.untagged_correlation_window_s,
+            (plan.range_bytes,) != manifest.range_bytes,
+            plan.range_offsets != manifest.range_offsets,
+        )
+    ):
+        raise ValueError("execution plan controls differ from the run manifest")
+    if plan.duration_ms != int(
+        (manifest.end_time - manifest.start_time).total_seconds() * 1000
+    ):
+        raise ValueError("execution plan duration mismatch")
+    fixtures = {fixture.fixture_id: fixture for fixture in catalog.fixtures}
+    plan_hash = execution_plan_sha256(plan)
+    operations = []
+    for index, intent in enumerate(plan.intents):
+        fixture = fixtures.get(intent.fixture_id)
+        if fixture is None:
+            raise ValueError("execution plan references a fixture outside the catalog")
+        if any(
+            (
+                fixture.volume_id != manifest.volume_id,
+                fixture.export_id != manifest.export_id,
+                intent.offset not in manifest.range_offsets,
+                intent.count not in manifest.range_bytes,
+                intent.offset + intent.count > fixture.size_bytes,
+            )
+        ):
+            raise ValueError("execution plan range is outside the frozen manifest/catalog")
+        operations.append(
+            (
+                index,
+                fixture,
+                intent.offset,
+                intent.count,
+                run_bound_operation_id(
+                    manifest.run_id,
+                    plan_hash,
+                    intent.intent_id,
+                ),
+            )
+        )
+    return operations
+
+
+def _validate_repeated_offer_spacing(
+    manifest: WorkloadCollectionManifest,
+    offered: list[OfferedOperation],
+) -> None:
+    minimum = timedelta(
+        seconds=(
+            manifest.untagged_correlation_window_s
+            + manifest.operation_schedule_tolerance_s
+        )
+    )
+    previous: dict[tuple[str, str, int, int], datetime] = {}
+    for operation in offered:
+        key = (
+            operation.volume_id,
+            operation.file_id,
+            operation.offset,
+            operation.count,
+        )
+        if key in previous and operation.offered_at_utc - previous[key] <= minimum:
+            raise ValueError(
+                "identical workload ranges must exceed correlation plus schedule tolerance"
+            )
+        previous[key] = operation.offered_at_utc
+
+
 def correlate_untagged_events(
     manifest: CollectionManifest,
     offered: list[OfferedOperation],
@@ -746,11 +846,12 @@ class CollectionRunner:
 
     def run(
         self,
-        manifest: CollectionManifest,
+        manifest: CollectionManifest | WorkloadCollectionManifest,
         catalog: FixtureCatalog,
         evidence_dir: Path,
         executor: ReadExecutor,
         *,
+        execution_plan: WorkloadExecutionPlan | None = None,
         simulated_timing: bool = False,
         checkpoint_provider: CheckpointProvider | None = None,
         persistent_stop: Callable[[], str | None] | None = None,
@@ -771,12 +872,23 @@ class CollectionRunner:
         results = evidence_dir / "execution.jsonl"
         existing = read_models(ledger, OfferedOperation) if ledger.exists() else []
         completed_results = read_models(results, ExecutionResult) if results.exists() else []
-        expected = planned_operations(manifest, catalog)
+        if isinstance(manifest, WorkloadCollectionManifest):
+            if execution_plan is None:
+                raise ValueError("workload manifest v3 requires its execution plan")
+            expected = planned_workload_operations(manifest, catalog, execution_plan)
+        else:
+            if execution_plan is not None:
+                raise ValueError("manifest v2 must not receive a workload execution plan")
+            expected = planned_operations(manifest, catalog)
         if operation_limit is not None:
+            if isinstance(manifest, WorkloadCollectionManifest):
+                raise ValueError("workload manifest v3 has no approved bounded permit")
             if operation_limit < 1 or operation_limit > 3:
                 raise ValueError("bounded validation permits one to three operations")
             expected = expected[:operation_limit]
         live_mount = isinstance(executor, DirectMountExecutor)
+        if live_mount and isinstance(manifest, WorkloadCollectionManifest):
+            raise ValueError("workload manifest v3 is offline-only")
         if live_mount and checkpoint_provider is None:
             raise ValueError("controlled mount execution requires a checkpoint provider")
         if live_mount and existing:
@@ -802,6 +914,17 @@ class CollectionRunner:
         for actual, planned in zip(existing, expected, strict=False):
             if actual.operation_id != planned[4] or actual.operation_index != planned[0]:
                 raise ValueError("ledger identity mismatch on restart")
+            if isinstance(manifest, WorkloadCollectionManifest):
+                planned_at = manifest.start_time + timedelta(
+                    milliseconds=execution_plan.intents[planned[0]].relative_ms
+                )
+                if (
+                    abs((actual.offered_at_utc - planned_at).total_seconds())
+                    > manifest.operation_schedule_tolerance_s
+                ):
+                    raise ValueError("workload ledger timestamp differs from execution plan")
+        if isinstance(manifest, WorkloadCollectionManifest):
+            _validate_repeated_offer_spacing(manifest, existing)
         for operation, result in zip(existing, completed_results, strict=True):
             if operation.operation_id != result.operation_id:
                 raise ValueError("execution result identity mismatch on restart")
@@ -811,7 +934,11 @@ class CollectionRunner:
                 raise RuntimeError(f"prior foreground read error for {operation.operation_id}")
             if result.latency_ms > manifest.stop_rules.latency_guardrail_ms:
                 raise RuntimeError(f"prior latency guardrail breach for {operation.operation_id}")
-        interval = 1.0 / manifest.offered_rate_per_s
+        interval = (
+            None
+            if isinstance(manifest, WorkloadCollectionManifest)
+            else 1.0 / manifest.offered_rate_per_s
+        )
         completed = len(existing)
         schedule_anchor_wall = self.now()
         schedule_anchor_monotonic_ns = self.monotonic_ns()
@@ -819,14 +946,10 @@ class CollectionRunner:
         checkpoint_path = evidence_dir / "checkpoints.jsonl"
         health_path = evidence_dir / "pre-read-health.jsonl"
         scheduled = [
-            manifest.start_time
-            + timedelta(seconds=manifest.checkpoint_interval_s * index)
-            for index in range(
-                int(
-                    (manifest.end_time - manifest.start_time).total_seconds()
-                    / manifest.checkpoint_interval_s
-                )
-                + 1
+            manifest.start_time + timedelta(milliseconds=relative_ms)
+            for relative_ms in checkpoint_schedule(
+                int((manifest.end_time - manifest.start_time).total_seconds() * 1000),
+                manifest.checkpoint_interval_s,
             )
         ]
         next_checkpoint = 0
@@ -865,8 +988,10 @@ class CollectionRunner:
                 next_checkpoint += 1
 
         for planned in expected[completed:]:
-            target_wall = manifest.start_time + timedelta(
-                seconds=planned[0] * interval
+            target_wall = manifest.start_time + (
+                timedelta(milliseconds=execution_plan.intents[planned[0]].relative_ms)
+                if isinstance(manifest, WorkloadCollectionManifest)
+                else timedelta(seconds=planned[0] * interval)
             )
             if simulated_timing:
                 offered_at = target_wall
@@ -978,7 +1103,19 @@ class CollectionRunner:
                         raise RuntimeError("pre-read health barrier failed")
                 stop_if_requested()
             append_model(ledger, operation)
+            if isinstance(manifest, WorkloadCollectionManifest):
+                _validate_repeated_offer_spacing(
+                    manifest,
+                    read_models(ledger, OfferedOperation),
+                )
             result = executor.read(operation)
+            if simulated_timing and result.executor_kind == "dry-run":
+                result = result.model_copy(
+                    update={
+                        "completed_at_utc": operation.offered_at_utc,
+                        "latency_ms": 0,
+                    }
+                )
             if checkpoint_provider is not None:
                 supervised_latency_ms = (
                     self.monotonic_ns() - supervised_started_ns

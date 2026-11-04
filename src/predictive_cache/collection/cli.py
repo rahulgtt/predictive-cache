@@ -21,7 +21,7 @@ import click
 import pyarrow.parquet as pq
 import yaml
 
-from predictive_cache.datagen.io import config_hash
+from predictive_cache.datagen.io import config_hash, read_table
 from predictive_cache.datagen.schema import normalize_rows
 from predictive_cache.prep.clean.pipeline import run_clean
 from predictive_cache.prep.clean.report import render_summary
@@ -43,6 +43,7 @@ from .harness import (
     catalog_sha256,
     checkpoint_stop_reasons,
     planned_operations,
+    planned_workload_operations,
     reconcile,
 )
 from .io import (
@@ -104,6 +105,8 @@ from .models import (
     PreReadHealth,
     ProviderInvocationRecord,
     ReconciliationReport,
+    WorkloadCollectionManifest,
+    parse_collection_manifest,
 )
 from .provenance import (
     APPROVED_ADAPTER_WRAPPER_SHA256,
@@ -144,10 +147,37 @@ from .provenance import (
     HISTORICAL_TOTAL_FILES,
     HISTORICAL_VALIDATION_ATTEMPTS,
 )
+from .workload import (
+    OfflineSimulatedRead,
+    WorkloadConfig,
+    WorkloadExecutionPlan,
+    WorkloadTruth,
+    WorkloadTruthBinding,
+    aggregate_recovery,
+    build_default_workload,
+    execution_plan_sha256,
+    validate_plan_truth,
+    workload_config_sha256,
+    workload_truth_sha256,
+    write_offline_importer_fixture,
+)
 
 
 def load_model(path: Path, model):
     return model.model_validate_json(path.read_text())
+
+
+def load_run_manifest(path: Path):
+    return parse_collection_manifest(path.read_bytes())
+
+
+def load_v2_manifest(path: Path, action: str) -> CollectionManifest:
+    manifest = load_run_manifest(path)
+    if isinstance(manifest, WorkloadCollectionManifest):
+        raise click.ClickException(
+            f"{action} does not support offline workload manifest v3"
+        )
+    return manifest
 
 
 def _load_json(path: Path) -> object:
@@ -1864,7 +1894,7 @@ def _revalidate_historical_run(
             fixture_catalog=evidence.fixture_catalog,
             content_sha256_by_operation=content_sha256_by_operation,
         )
-        manifest = load_model(manifest_path, CollectionManifest)
+        manifest = load_v2_manifest(manifest_path, "live row validation")
         fixture_catalog = load_model(fixture_catalog_path, FixtureCatalog)
         _validate_live_row_chain(
             roots,
@@ -2471,9 +2501,9 @@ def _validate_historical_attestation(
             or _historical_reference_hash(attempt.log, roots) != log_sha
         ):
             raise click.ClickException("historical validation attempt changed")
-        run_manifest = load_model(
+        run_manifest = load_v2_manifest(
             Path(roots[attempt.run_role].canonical_path) / "manifest.json",
-            CollectionManifest,
+            "historical validation",
         )
         if run_manifest.run_id != run_id:
             raise click.ClickException("historical validation run identity changed")
@@ -3072,12 +3102,136 @@ def main() -> None:
     """Prepare and validate controlled READ collection evidence."""
 
 
+@main.command("plan-workload")
+@click.option("--manifest-template", type=click.Path(path_type=Path), required=True)
+@click.option("--catalog", type=click.Path(path_type=Path), required=True)
+@click.option("--run-id", required=True)
+@click.option("--start-time", required=True, help="UTC ISO-8601 timestamp.")
+@click.option("--duration-s", type=click.IntRange(min=1), default=10_800, show_default=True)
+@click.option("--operation-count", type=click.IntRange(min=50))
+@click.option("--seed", type=click.IntRange(min=0), default=42, show_default=True)
+@click.option("--out", type=click.Path(path_type=Path), required=True)
+def plan_workload(
+    manifest_template: Path,
+    catalog: Path,
+    run_id: str,
+    start_time: str,
+    duration_s: int,
+    operation_count: int | None,
+    seed: int,
+    out: Path,
+) -> None:
+    """Create an offline-only deterministic READ workload bundle."""
+
+    from predictive_cache.semantics.read_demand import (
+        SEMANTIC_VIEW_ID,
+        SEMANTIC_VIEW_SHA256,
+    )
+
+    template = load_v2_manifest(manifest_template, "workload planning")
+    catalog_model = load_model(catalog, FixtureCatalog)
+    try:
+        start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise click.ClickException("--start-time must be an ISO-8601 timestamp") from error
+    if start.tzinfo is None or start.utcoffset() != timedelta(0):
+        raise click.ClickException("--start-time must be UTC-aware")
+    config = WorkloadConfig(
+        seed=seed,
+        duration_ms=duration_s * 1000,
+        operation_count=operation_count,
+    )
+    plan, truth = build_default_workload(
+        catalog_model,
+        config,
+        semantic_view_id=SEMANTIC_VIEW_ID,
+        semantic_view_sha256=SEMANTIC_VIEW_SHA256,
+    )
+    common = {
+        name: getattr(template, name)
+        for name in WorkloadCollectionManifest.model_fields
+        if hasattr(template, name)
+    }
+    manifest = WorkloadCollectionManifest.model_validate(
+        common
+        | {
+            "manifest_version": 3,
+            "run_id": run_id,
+            "run_ref": hashlib.sha256(run_id.encode()).hexdigest()[:32],
+            "fixture_catalog_sha256": catalog_sha256(catalog_model),
+            "execution_config_sha256": workload_config_sha256(config),
+            "execution_plan_sha256": execution_plan_sha256(plan),
+            "semantic_view_id": SEMANTIC_VIEW_ID,
+            "semantic_view_sha256": SEMANTIC_VIEW_SHA256,
+            "seed": seed,
+            "start_time": start,
+            "end_time": start + timedelta(seconds=duration_s),
+            "planned_operation_count": plan.planned_operation_count,
+            "fixture_distribution": "explicit_repeating_plan",
+            "range_distribution": "explicit_repeating_plan",
+            "range_bytes": (config.range_bytes,),
+            "range_offsets": config.range_offsets,
+            "tag_mode": "empty",
+        }
+    )
+    truth_binding = WorkloadTruthBinding(
+        execution_plan_sha256=manifest.execution_plan_sha256,
+        workload_truth_sha256=workload_truth_sha256(truth),
+        semantic_view_id=manifest.semantic_view_id,
+        semantic_view_sha256=manifest.semantic_view_sha256,
+    )
+    atomic_write_model(out / "workload-config.json", config)
+    atomic_write_model(out / "execution-plan.json", plan)
+    atomic_write_model(out / "workload-truth.json", truth)
+    atomic_write_model(out / "workload-truth-binding.json", truth_binding)
+    atomic_write_model(out / "manifest.json", manifest)
+    atomic_write_model(out / "fixture-catalog.json", catalog_model)
+    report = {
+        "report_version": 1,
+        "data_kind": "synthetic",
+        "evidence_mode": "offline_simulated_fixture",
+        "purpose": "planted_pattern_recovery_only",
+        "duration_s": duration_s,
+        "operations": plan.planned_operation_count,
+        "average_interval_s": duration_s / plan.planned_operation_count,
+        "average_rate_per_s": plan.planned_operation_count / duration_s,
+        "requested_bytes": plan.planned_operation_count * config.range_bytes,
+        "popularity_membership": {
+            "high": config.popularity_membership[0],
+            "medium": config.popularity_membership[1],
+            "low": config.popularity_membership[2],
+        },
+        "popularity_operations": dict(
+            Counter(item.popularity_tier for item in truth.intent_truth)
+        ),
+        "coaccess_groups": len(truth.coaccess_groups),
+        "burst_windows": sum(window.kind == "burst" for window in truth.windows),
+        "quiet_windows": sum(window.kind == "quiet" for window in truth.windows),
+        "execution_config_sha256": manifest.execution_config_sha256,
+        "execution_plan_sha256": manifest.execution_plan_sha256,
+        "workload_truth_sha256": workload_truth_sha256(truth),
+        "limitations": [
+            "Offline synthetic workload; not live or representative demand.",
+            "No OPEN, CLOSE, handle or session facts are inferred from READ timing.",
+        ],
+    }
+    atomic_write_bytes(
+        out / "workload-report.json",
+        (canonical_json(report) + "\n").encode(),
+    )
+    click.echo(canonical_json(report))
+
+
 @main.command("init")
 @click.option("--manifest", type=click.Path(path_type=Path), required=True)
 @click.option("--catalog", type=click.Path(path_type=Path), required=True)
 @click.option("--cluster-provenance", type=click.Path(path_type=Path), required=True)
 @click.option("--event-schema", type=click.Path(path_type=Path), required=True)
 @click.option("--budget-evidence", type=click.Path(path_type=Path), required=True)
+@click.option("--execution-plan", type=click.Path(path_type=Path))
+@click.option("--workload-config", type=click.Path(path_type=Path))
+@click.option("--workload-truth", type=click.Path(path_type=Path))
+@click.option("--workload-truth-binding", type=click.Path(path_type=Path))
 @click.option("--out", type=click.Path(path_type=Path), required=True)
 def init(
     manifest: Path,
@@ -3085,10 +3239,14 @@ def init(
     cluster_provenance: Path,
     event_schema: Path,
     budget_evidence: Path,
+    execution_plan: Path | None,
+    workload_config: Path | None,
+    workload_truth: Path | None,
+    workload_truth_binding: Path | None,
     out: Path,
 ) -> None:
     """Freeze a validated manifest and fixture catalog in a private run directory."""
-    manifest_model = load_model(manifest, CollectionManifest)
+    manifest_model = load_run_manifest(manifest)
     catalog_model = load_model(catalog, FixtureCatalog)
     if catalog_sha256(catalog_model) != manifest_model.fixture_catalog_sha256:
         raise click.ClickException("fixture catalog checksum mismatch")
@@ -3098,6 +3256,105 @@ def init(
         raise click.ClickException("event schema checksum mismatch")
     if sha256(budget_evidence) != manifest_model.budget_evidence_sha256:
         raise click.ClickException("budget evidence checksum mismatch")
+    workload_models = None
+    if isinstance(manifest_model, WorkloadCollectionManifest):
+        from predictive_cache.semantics.read_demand import (
+            SEMANTIC_VIEW_ID,
+            SEMANTIC_VIEW_SHA256,
+        )
+
+        if (
+            manifest_model.semantic_view_id != SEMANTIC_VIEW_ID
+            or manifest_model.semantic_view_sha256 != SEMANTIC_VIEW_SHA256
+        ):
+            raise click.ClickException(
+                "workload manifest semantic view differs from read-demand-v1"
+            )
+        if None in (
+            execution_plan,
+            workload_config,
+            workload_truth,
+            workload_truth_binding,
+        ):
+            raise click.ClickException(
+                "workload manifest v3 requires --execution-plan, "
+                "--workload-config, --workload-truth and --workload-truth-binding"
+            )
+        config_model = load_model(workload_config, WorkloadConfig)
+        plan_model = load_model(execution_plan, WorkloadExecutionPlan)
+        truth_model = load_model(workload_truth, WorkloadTruth)
+        validate_plan_truth(plan_model, truth_model)
+        truth_binding_model = load_model(
+            workload_truth_binding,
+            WorkloadTruthBinding,
+        )
+        regenerated_plan, regenerated_truth = build_default_workload(
+            catalog_model,
+            config_model,
+            semantic_view_id=manifest_model.semantic_view_id,
+            semantic_view_sha256=manifest_model.semantic_view_sha256,
+        )
+        if regenerated_plan != plan_model or regenerated_truth != truth_model:
+            raise click.ClickException(
+                "workload plan/truth differ from deterministic generation"
+            )
+        if workload_config_sha256(config_model) != manifest_model.execution_config_sha256:
+            raise click.ClickException("workload config checksum mismatch")
+        if any(
+            (
+                manifest_model.seed != config_model.seed,
+                manifest_model.checkpoint_interval_s
+                != config_model.checkpoint_interval_s,
+                manifest_model.operation_schedule_tolerance_s
+                != config_model.operation_schedule_tolerance_s,
+                manifest_model.untagged_correlation_window_s
+                != config_model.untagged_correlation_window_s,
+                manifest_model.range_bytes != (config_model.range_bytes,),
+                manifest_model.range_offsets != config_model.range_offsets,
+                manifest_model.planned_operation_count
+                != plan_model.planned_operation_count,
+                int(
+                    (manifest_model.end_time - manifest_model.start_time).total_seconds()
+                    * 1000
+                )
+                != plan_model.duration_ms,
+            )
+        ):
+            raise click.ClickException(
+                "workload manifest controls differ from the frozen config"
+            )
+        if execution_plan_sha256(plan_model) != manifest_model.execution_plan_sha256:
+            raise click.ClickException("execution plan checksum mismatch")
+        if plan_model.fixture_catalog_sha256 != manifest_model.fixture_catalog_sha256:
+            raise click.ClickException("execution plan catalog checksum mismatch")
+        if truth_model.execution_plan_sha256 != manifest_model.execution_plan_sha256:
+            raise click.ClickException("workload truth plan checksum mismatch")
+        if (
+            truth_binding_model.execution_plan_sha256
+            != manifest_model.execution_plan_sha256
+            or truth_binding_model.workload_truth_sha256
+            != workload_truth_sha256(truth_model)
+            or truth_binding_model.semantic_view_id != manifest_model.semantic_view_id
+            or truth_binding_model.semantic_view_sha256
+            != manifest_model.semantic_view_sha256
+        ):
+            raise click.ClickException("workload truth binding mismatch")
+        workload_models = (
+            config_model,
+            plan_model,
+            truth_model,
+            truth_binding_model,
+        )
+    elif any(
+        value is not None
+        for value in (
+            execution_plan,
+            workload_config,
+            workload_truth,
+            workload_truth_binding,
+        )
+    ):
+        raise click.ClickException("manifest v2 must not include workload-plan artifacts")
     atomic_write_bytes(
         out / "cluster-provenance-v1.json",
         cluster_provenance.read_bytes(),
@@ -3106,6 +3363,15 @@ def init(
     atomic_write_bytes(out / "budget-evidence-v1.json", budget_evidence.read_bytes())
     atomic_write_model(out / "manifest.json", manifest_model)
     atomic_write_model(out / "fixture-catalog.json", catalog_model)
+    if workload_models is not None:
+        config_model, plan_model, truth_model, truth_binding_model = workload_models
+        atomic_write_model(out / "workload-config.json", config_model)
+        atomic_write_model(out / "execution-plan.json", plan_model)
+        atomic_write_model(out / "workload-truth.json", truth_model)
+        atomic_write_model(
+            out / "workload-truth-binding.json",
+            truth_binding_model,
+        )
     click.echo(out)
 
 
@@ -3139,8 +3405,18 @@ def run(
         raise click.ClickException(
             "bounded validation requires mount mode plus adapter and cleaner commands"
         )
-    manifest = load_model(run_dir / "manifest.json", CollectionManifest)
+    manifest = load_run_manifest(run_dir / "manifest.json")
     catalog = load_model(run_dir / "fixture-catalog.json", FixtureCatalog)
+    execution_plan_model = (
+        load_model(run_dir / "execution-plan.json", WorkloadExecutionPlan)
+        if isinstance(manifest, WorkloadCollectionManifest)
+        else None
+    )
+    if isinstance(manifest, WorkloadCollectionManifest) and not dry_run:
+        raise click.ClickException(
+            "workload manifest v3 is offline-only; mount and bounded validation "
+            "require a separately reviewed plan-bound evidence chain"
+        )
     provider_interpreter = None
     adapter_fd = None
     cleaner_fd = None
@@ -3303,6 +3579,7 @@ def run(
             catalog,
             run_dir,
             executor,
+            execution_plan=execution_plan_model,
             simulated_timing=dry_run,
             checkpoint_provider=provider,
             persistent_stop=persistent_stop,
@@ -3333,12 +3610,220 @@ def run(
     click.echo(f"offered={count}")
 
 
+@main.command("simulate-workload-source")
+@click.option("--run-dir", type=click.Path(path_type=Path), required=True)
+@click.option("--out", type=click.Path(path_type=Path), required=True)
+def simulate_workload_source(run_dir: Path, out: Path) -> None:
+    """Create importer inputs from a completed offline workload dry run."""
+
+    manifest = load_run_manifest(run_dir / "manifest.json")
+    if not isinstance(manifest, WorkloadCollectionManifest):
+        raise click.ClickException(
+            "offline simulated source requires workload manifest v3"
+        )
+    plan = load_model(run_dir / "execution-plan.json", WorkloadExecutionPlan)
+    catalog = load_model(run_dir / "fixture-catalog.json", FixtureCatalog)
+    offered = read_models(run_dir / "offered.jsonl", OfferedOperation)
+    execution = read_models(run_dir / "execution.jsonl", ExecutionResult)
+    paths = write_offline_importer_fixture(
+        out,
+        manifest,
+        plan,
+        catalog,
+        offered,
+        execution,
+    )
+    click.echo(canonical_json({name: str(path) for name, path in paths.items()}))
+
+
+def _verified_dataset_rows(
+    root: Path,
+    manifest: dict,
+    prefix: str,
+    table: str | None,
+) -> list[dict]:
+    declared = {
+        entry["path"]: entry
+        for entry in manifest.get("files", [])
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+    }
+    actual = set()
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise click.ClickException("dataset artifacts must not contain symlinks")
+        if path.is_file() and path.name != "manifest.json":
+            actual.add(path.relative_to(root).as_posix())
+    if set(declared) != actual:
+        raise click.ClickException("dataset artifact inventory differs from its manifest")
+    rows = []
+    for relative, entry in declared.items():
+        path = root / relative
+        if sha256(path) != entry.get("sha256"):
+            raise click.ClickException(f"dataset artifact checksum mismatch: {relative}")
+        if table is not None and relative.startswith(prefix):
+            rows.extend(read_table(path, table).to_pylist())
+    return rows
+
+
+@main.command("recover-workload")
+@click.option("--run-dir", type=click.Path(path_type=Path), required=True)
+@click.option("--imported", type=click.Path(path_type=Path), required=True)
+@click.option("--cleaned", type=click.Path(path_type=Path), required=True)
+@click.option("--out", type=click.Path(path_type=Path), required=True)
+def recover_workload(
+    run_dir: Path,
+    imported: Path,
+    cleaned: Path,
+    out: Path,
+) -> None:
+    """Write aggregate planted-pattern diagnostics for an offline READ workload."""
+
+    manifest = load_run_manifest(run_dir / "manifest.json")
+    if not isinstance(manifest, WorkloadCollectionManifest):
+        raise click.ClickException("workload recovery requires manifest v3")
+    plan = load_model(run_dir / "execution-plan.json", WorkloadExecutionPlan)
+    truth = load_model(run_dir / "workload-truth.json", WorkloadTruth)
+    truth_binding = load_model(
+        run_dir / "workload-truth-binding.json",
+        WorkloadTruthBinding,
+    )
+    if (
+        truth_binding.execution_plan_sha256 != execution_plan_sha256(plan)
+        or truth_binding.workload_truth_sha256 != workload_truth_sha256(truth)
+        or truth_binding.semantic_view_id != manifest.semantic_view_id
+        or truth_binding.semantic_view_sha256 != manifest.semantic_view_sha256
+    ):
+        raise click.ClickException("workload truth binding mismatch")
+    catalog = load_model(run_dir / "fixture-catalog.json", FixtureCatalog)
+    offered = read_models(run_dir / "offered.jsonl", OfferedOperation)
+    imported_manifest_path = imported / "manifest.json"
+    cleaned_manifest_path = cleaned / "manifest.json"
+    imported_manifest = strict_json_loads(imported_manifest_path.read_text())
+    cleaned_manifest = strict_json_loads(cleaned_manifest_path.read_text())
+    imported_sha = sha256(imported_manifest_path)
+    cleaned_sha = sha256(cleaned_manifest_path)
+    plan_file_sha = sha256(run_dir / "execution-plan.json")
+    runtime = imported_manifest.get("generator", {}).get("runtime", {})
+    if (
+        imported_manifest.get("data_kind") != "synthetic"
+        or imported_manifest.get("counts", {}).get("events") != len(plan.intents)
+        or runtime.get("execution_plan_sha256") != plan_file_sha
+        or runtime.get("run_manifest_sha256")
+        != sha256(run_dir / "manifest.json")
+        or runtime.get("offered_ledger_sha256")
+        != sha256(run_dir / "offered.jsonl")
+        or runtime.get("source_evidence_mode") != manifest.evidence_mode
+    ):
+        raise click.ClickException("imported dataset does not bind the workload plan")
+    expected_offers = planned_workload_operations(manifest, catalog, plan)
+    if len(offered) != len(expected_offers):
+        raise click.ClickException("offered ledger count differs from the workload plan")
+    for operation, expected in zip(offered, expected_offers, strict=True):
+        index, fixture, offset, count, operation_id = expected
+        planned_at = manifest.start_time + timedelta(
+            milliseconds=plan.intents[index].relative_ms
+        )
+        if (
+            operation.operation_index != index
+            or operation.operation_id != operation_id
+            or operation.fixture_id != fixture.fixture_id
+            or operation.volume_id != fixture.volume_id
+            or operation.file_id != fixture.file_id
+            or operation.offset != offset
+            or operation.count != count
+            or abs((operation.offered_at_utc - planned_at).total_seconds())
+            > manifest.operation_schedule_tolerance_s
+        ):
+            raise click.ClickException("offered ledger differs from the workload plan")
+    imported_rows = _verified_dataset_rows(
+        imported,
+        imported_manifest,
+        "events/",
+        "events",
+    )
+    offered_by_event_id = {
+        str(uuid.UUID(int=int(operation.operation_id[:32], 16))): (
+            index,
+            operation,
+            plan.intents[index],
+        )
+        for index, operation in enumerate(offered)
+    }
+    recovered_reads = []
+    for event in imported_rows:
+        expected = offered_by_event_id.get(event.get("event_id"))
+        if expected is None:
+            continue
+        index, operation, intent = expected
+        if any(
+            (
+                event.get("operation") != "read",
+                event.get("result") != "ok",
+                event.get("origin") != "synthetic",
+                event.get("volume_id") != operation.volume_id,
+                event.get("file_id") != operation.file_id,
+                event.get("offset") != intent.offset,
+                event.get("bytes_requested") != intent.count,
+                event.get("bytes_read") != intent.count,
+            )
+        ):
+            continue
+        durable_at = event["ingest_time"]
+        delay_ms = round(
+            (durable_at - operation.offered_at_utc).total_seconds() * 1000
+        )
+        recovered_reads.append(
+            OfflineSimulatedRead(
+                run_id=manifest.run_id,
+                execution_plan_sha256=manifest.execution_plan_sha256,
+                intent_id=intent.intent_id,
+                operation_id=operation.operation_id,
+                fixture_id=intent.fixture_id,
+                volume_id=operation.volume_id,
+                file_id=operation.file_id,
+                offset=intent.offset,
+                count=intent.count,
+                offered_at_utc=operation.offered_at_utc,
+                durable_at_utc=durable_at,
+                durability_delay_ms=delay_ms,
+                source_sequence=index + 1,
+            )
+        )
+    parent = cleaned_manifest.get("parent", {})
+    if (
+        cleaned_manifest.get("data_kind") != "synthetic"
+        or parent.get("manifest_sha256") != imported_sha
+        or cleaned_manifest.get("counts", {}).get("kept_events") != 0
+        or cleaned_manifest.get("counts", {})
+        .get("excluded_by_reason", {})
+        .get("origin_synthetic")
+        != len(plan.intents)
+    ):
+        raise click.ClickException(
+            "cleaned dataset does not preserve synthetic exclusion and lineage"
+        )
+    _verified_dataset_rows(cleaned, cleaned_manifest, "", None)
+    report = aggregate_recovery(
+        plan,
+        truth,
+        recovered_reads,
+        imported_manifest_sha256=imported_sha,
+        cleaned_manifest_sha256=cleaned_sha,
+        cleaned_parent_manifest_sha256=parent["manifest_sha256"],
+    )
+    atomic_write_bytes(
+        out,
+        (canonical_json(report.model_dump(mode="json")) + "\n").encode(),
+    )
+    click.echo(report.model_dump_json())
+
+
 @main.command("checkpoint")
 @click.option("--run-dir", type=click.Path(path_type=Path), required=True)
 @click.option("--input", "input_path", type=click.Path(path_type=Path), required=True)
 def checkpoint(run_dir: Path, input_path: Path) -> None:
     """Validate collector checkpoints and fail on any stop condition."""
-    manifest = load_model(run_dir / "manifest.json", CollectionManifest)
+    manifest = load_v2_manifest(run_dir / "manifest.json", "checkpoint validation")
     checkpoints = read_models(input_path, Checkpoint)
     reasons = checkpoint_stop_reasons(manifest, checkpoints, run_dir)
     if reasons:
@@ -3358,6 +3843,7 @@ def reconcile_command(
     sources: Path,
 ) -> None:
     """Write an immutable exact-accounting report and fail discrepancies."""
+    load_v2_manifest(run_dir / "manifest.json", "reconciliation")
     checkpoint_models = read_models(checkpoints, Checkpoint)
     source_manifest = load_model(sources, CollectorFileManifest)
     report = reconcile(
@@ -4102,9 +4588,9 @@ def finalize_historical(
         run_id=attestation_model.run_id,
         finalized_at=finalized_at,
         delete_by=finalized_at + timedelta(days=7),
-        cleanup_owner=load_model(
+        cleanup_owner=load_v2_manifest(
             _historical_path(attestation_model.live.manifest, roots),
-            CollectionManifest,
+            "historical finalization",
         ).retention.cleanup_owner,
         attestation_sha256=attestation_sha256,
         deletion_approval_sha256=approval_sha256,
@@ -4140,7 +4626,7 @@ def finalize(
     cleanup_roots: tuple[str, ...],
 ) -> None:
     """Record actual validated-dataset finalization and the deletion deadline."""
-    manifest = load_model(run_dir / "manifest.json", CollectionManifest)
+    manifest = load_v2_manifest(run_dir / "manifest.json", "live finalization")
     _validate_full_profile(manifest)
     manifest_sha = sha256(run_dir / "manifest.json")
     if dataset_report.is_symlink() or not dataset_report.is_file():

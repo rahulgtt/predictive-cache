@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
@@ -1158,6 +1159,117 @@ class CollectionManifest(StrictModel):
         if latest_offer_s + self.operation_schedule_tolerance_s > duration:
             raise ValueError("offered_count exceeds the declared rate cap")
         return self
+
+
+class WorkloadCollectionManifest(StrictModel):
+    manifest_version: Literal[3] = 3
+    run_id: SafeId
+    run_ref: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
+    data_kind: Literal["synthetic"] = "synthetic"
+    experiment_kind: Literal["controlled"] = "controlled"
+    representative_production_demand: Literal[False] = False
+    protocol: Literal["NFSv4.1"] = "NFSv4.1"
+    operation: Literal["READ"] = "READ"
+    warmer_enabled: Literal[False] = False
+    cluster_id: SafeId
+    namespace: SafeId
+    volume_id: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
+    export_id: int = Field(ge=0)
+    cluster_manifest_sha256: Sha256
+    fixture_catalog_sha256: Sha256
+    event_schema_sha256: Sha256
+    budget_evidence_sha256: Sha256
+    execution_config_sha256: Sha256
+    execution_plan_sha256: Sha256
+    semantic_view_id: SafeId
+    semantic_view_sha256: Sha256
+    seed: int = Field(ge=0)
+    start_time: datetime
+    end_time: datetime
+    planned_operation_count: int = Field(gt=0)
+    max_concurrency: Literal[1] = 1
+    checkpoint_interval_s: Literal[900] = 900
+    checkpoint_tolerance_s: int = Field(default=30, ge=0, le=300)
+    operation_schedule_tolerance_s: int = Field(default=30, ge=0, le=59)
+    clock_skew_tolerance_s: int = Field(default=5, ge=0, le=30)
+    pre_read_plus_read_guardrail_ms: int = Field(default=5000, gt=0)
+    fixture_distribution: Literal["explicit_repeating_plan"] = "explicit_repeating_plan"
+    range_distribution: Literal["explicit_repeating_plan"] = "explicit_repeating_plan"
+    range_bytes: tuple[int, ...]
+    range_offsets: tuple[int, ...]
+    untagged_correlation_window_s: int = Field(default=120, gt=0)
+    client_id: SafeId
+    tag_mode: Literal["empty"] = "empty"
+    tag_contract_status: Literal["proposed-unverified"] = "proposed-unverified"
+    allowed_exclusion_reasons: tuple[str, ...] = ()
+    evidence_mode: Literal["offline_simulated_fixture"] = "offline_simulated_fixture"
+    software: SoftwareVersions
+    stop_rules: StopRules
+    retention: RetentionPolicy
+    limitations: tuple[str, ...] = (
+        "Offline simulated controlled workload; not live collection evidence.",
+        "Synthetic READ rows are plumbing and planted-pattern diagnostics only.",
+        "No completed read proves cache residency or performance benefit.",
+    )
+
+    _start_utc = field_validator("start_time")(_utc)
+    _end_utc = field_validator("end_time")(_utc)
+
+    @field_validator("range_bytes")
+    @classmethod
+    def valid_ranges(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if value != (4096,):
+            raise ValueError("workload collection requires one 4096-byte range size")
+        return value
+
+    @field_validator("range_offsets")
+    @classmethod
+    def valid_offsets(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if not value or len(value) != len(set(value)) or any(item < 0 for item in value):
+            raise ValueError("range_offsets must be unique nonnegative values")
+        if any(item % 4096 for item in value):
+            raise ValueError("range_offsets must be 4096-byte aligned")
+        return value
+
+    @field_validator("allowed_exclusion_reasons")
+    @classmethod
+    def exclusion_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(
+            not re.fullmatch(r"[a-z][a-z0-9_-]*", item) for item in value
+        ):
+            raise ValueError("exclusion reasons must be unique lower-case identifiers")
+        return value
+
+    @model_validator(mode="after")
+    def controlled_run(self) -> WorkloadCollectionManifest:
+        expected_run_ref = hashlib.sha256(self.run_id.encode("utf-8")).hexdigest()[:32]
+        if self.run_ref != expected_run_ref:
+            raise ValueError("run_ref must be sha256(run_id UTF-8)[:32]")
+        duration = (self.end_time - self.start_time).total_seconds()
+        if duration <= 0 or duration > 24 * 60 * 60:
+            raise ValueError("workload duration must be in (0, 24 hours]")
+        return self
+
+
+CollectionRunManifest = CollectionManifest | WorkloadCollectionManifest
+
+
+def parse_collection_manifest(value: str | bytes) -> CollectionRunManifest:
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = item
+        return result
+
+    document = json.loads(value, object_pairs_hook=unique_object)
+    version = document.get("manifest_version") if isinstance(document, dict) else None
+    if version == 2:
+        return CollectionManifest.model_validate(document)
+    if version == 3:
+        return WorkloadCollectionManifest.model_validate(document)
+    raise ValueError(f"unsupported collection manifest version: {version!r}")
 
 
 class CleanupScheduleRecord(StrictModel):
