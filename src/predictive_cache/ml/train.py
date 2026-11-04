@@ -252,6 +252,7 @@ def train(
     summary: dict = {"models": {}, "primary": cfg.primary, "data": data}
 
     for model_type in cfg.models:
+        is_trained_model = model_type in {"logreg-v1", "gbdt-v1", "gbdt-rank-v1"}
         scorer, params = _build(
             model_type, features, train_rows, val_rows, universe, budget, cfg, tracker
         )
@@ -298,8 +299,12 @@ def train(
                     "semantic_view_id": manifest.get("semantic_view_id"),
                 } if manifest.get("semantic_view_id") else {}),
                 "serving_policy": policy,
+                "trained": is_trained_model,
+                "data_kind": data_kind,
                 "data": data,
                 "training": {
+                    "trained": is_trained_model,
+                    "data_kind": data_kind,
                     "git_sha": git_sha,
                     "config_sha256": config_sha,
                     "params": params,
