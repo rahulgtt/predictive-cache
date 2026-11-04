@@ -15,6 +15,7 @@ from predictive_cache.ml.baselines import (
     FrequencyScorer,
     HotsetScorer,
     MruScorer,
+    ReadDemandFrequencyScorer,
 )
 from predictive_cache.ml.dummy import default_feature_schema, fixture_rows
 from predictive_cache.ml.metrics import Budget, select
@@ -57,6 +58,7 @@ def test_all_registered():
         "baseline-frequency",
         "baseline-hotset",
         "baseline-coaccess",
+        "baseline-read-frequency",
     }
 
 
@@ -83,6 +85,20 @@ def test_coaccess_formula_and_nulls():
     )
     assert CoaccessScorer().score(t).tolist() == pytest.approx([0.701, 0.05, 0.704, 0.2])
     assert ranking(CoaccessScorer(), t) == ["file-2", "file-0", "file-3", "file-1"]
+
+
+def test_read_demand_frequency_is_exact_and_fail_closed():
+    table = rows(read_count_24h=pa.array([3, 10, 3], pa.int64()))
+    assert ReadDemandFrequencyScorer().score(table).tolist() == [3.0, 10.0, 3.0]
+    assert ranking(ReadDemandFrequencyScorer(), table) == [
+        "file-1",
+        "file-0",
+        "file-2",
+    ]
+    with pytest.raises(ValueError, match="complete coverage"):
+        ReadDemandFrequencyScorer().score(
+            rows(read_count_24h=pa.array([1, None], pa.int64()))
+        )
 
 
 def test_missing_feature_column_rejected():
@@ -160,7 +176,10 @@ def test_hotset_unfitted_errors():
 # --- Packaging --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("cls", BASELINES)
+@pytest.mark.parametrize(
+    "cls",
+    (MruScorer, FrequencyScorer, HotsetScorer, CoaccessScorer),
+)
 def test_each_baseline_packages_and_reloads(tmp_path, cls):
     scorer = cls()
     if cls is HotsetScorer:

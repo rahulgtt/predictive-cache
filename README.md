@@ -6,8 +6,10 @@ users wait for it to arrive from cloud storage.
 > **Status: design proposal, not an implemented service.** Synthetic data
 > generation and cleaning, the controlled collection harness, Chimera v2
 > importer, strict current-run finalizer, explicit pre-finalizer historical
-> compatibility path, offline plan-file dispatcher, and experimental
-> standalone manual NFS range reader are implemented. The complete Controller,
+> compatibility path, narrow READ-demand inference snapshot and baseline
+> package/plan publisher, offline plan-file dispatcher, experimental standalone
+> manual NFS range reader, and bounded event collector are implemented. The
+> complete Controller,
 > automated live Warmer
 > integration, representative data collection and real-workload performance
 > claims remain gated work. Generated records model fictional activity and
@@ -16,8 +18,15 @@ users wait for it to arrive from cloud storage.
 > already work.
 
 An experimental [event collector](docs/controller/collector.md) supports
-normalized-v1 HTTP ingestion and replay. Live READ-only feature semantics and
-FeatureStore integration remain dependent on #104 and #30.
+normalized-v1 HTTP ingestion and replay.
+
+The narrow datagen-to-Dispatcher path has passed focused tests, Ruff, and one
+controlled offline `skipped/dry_run` integration on `nas-vm`; it issued zero
+bytes and did not start the Warmer. The separately approved one-READ
+Dispatcher-to-Warmer validation remains unrun. This is plumbing evidence only,
+not model-quality, cache-residency, performance, or production-readiness
+evidence. Live READ-only feature semantics and FeatureStore integration remain
+dependent on #104 and #30.
 
 ## Run the datagen foundation
 
@@ -166,6 +175,17 @@ It projects successful NFSv4.1 READs without inventing OPEN/CLOSE, handles or
 application sessions, and binds snapshots/model packages to exact semantic,
 feature-schema and serving-contract hashes. Generic datagen v1 remains
 available for lifecycle fixtures.
+
+The controlled
+[datagen-to-Warmer offline MVP](docs/experiments/datagen-to-warmer-mvp.md)
+builds the distinct `read-demand-v1-narrow-mvp` inference snapshot, packages
+the explicit non-trained `baseline-read-frequency`, publishes a bounded
+schema-v2 READ plan from an approved fixture target map, and exercises the
+existing Dispatcher only in `--no-real-reads --once` mode. This is synthetic
+contract-plumbing evidence only. It is not a trained model, full Controller,
+live Warmer integration, representative-data result, cache-residency proof, or
+performance claim. The documented offline `nas-vm` validation is complete;
+the separately approved one-READ Dispatcher-to-Warmer gate remains unrun.
 
 ## Manual NFS range reader
 

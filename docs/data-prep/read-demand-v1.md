@@ -175,6 +175,25 @@ feature only when the snapshot manifest declares
 `runtime_capabilities.anchor_context: true`, which means the Controller
 computes the anchor by this same rule.
 
+### Narrow offline MVP profile
+
+Issue #112 adds the deliberately distinct
+`read-demand-v1-narrow-mvp` inference-only profile for controlled synthetic
+integration. It is not the canonical complete candidate profile above. It
+uses only visible eligible `controlled_demand` and `fixture_demand` READ
+identities, requires complete `read_count_24h` coverage, and orders candidates
+by 24-hour count descending, recency, `file_id`, then `volume_id`. Incomplete
+required coverage omits the identity with
+`required_coverage_incomplete`; it never converts missing evidence to zero.
+
+The profile declares `verified_file_size=false` and
+`anchor_context=false`. It therefore cannot load file-size or
+`coread_from_anchor_24h` package requirements and has no OPEN/CLOSE,
+application-session, directory, project, lifecycle, write, or `cold_open`
+candidate source. Its profile and snapshot-serving identities are separately
+hashed and bound into the non-trained synthetic baseline package. See the
+[offline integration runbook](../experiments/datagen-to-warmer-mvp.md).
+
 ### Candidate sources
 
 `CandidateView` keeps its generic signature. Under this view its methods
