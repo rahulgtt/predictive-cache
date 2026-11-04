@@ -213,6 +213,24 @@ def test_verified_model_planner_dispatcher_feedback_and_health(rig, monkeypatch)
     assert "fixture-export" not in json.dumps(summary)
 
 
+def test_source_readiness_gate_suppresses_even_complete_fixture_history(rig):
+    item = rig(package=True)
+    result = item.tick(events=[event()], coverage=coverage(), source_gates={"memory_gap"})
+    assert result.scored and not result.plans_allowed
+    assert result.planned_items == result.results == 0
+    assert "memory_gap" in item.runtime.summary(T)["health"]["reasons"]
+    assert not list((item.root / "plans").glob("*.json"))
+
+
+@pytest.mark.parametrize("gates", ["memory_gap", {"no_model"}, ["private_source_payload"], [1]])
+def test_invalid_source_gates_fail_before_applying_reads(rig, gates):
+    item = rig()
+    with pytest.raises(ReadRuntimeError):
+        item.tick(events=[event()], source_gates=gates)
+    assert item.memory.stats()["events_received"] == 0
+    assert item.publisher.sequence == 0
+
+
 def test_synthetic_targets_keep_original_seen_at_and_expire(rig):
     item = rig()
     row = event()

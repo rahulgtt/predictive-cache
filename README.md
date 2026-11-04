@@ -30,7 +30,13 @@ The experimental [READ replay controller](docs/controller/read-replay-runtime.md
 connects bounded canonical READ memory, model scoring, the planner, Dispatcher
 dry-run results, feedback and health. `pcache-controller replay-read` accepts
 synthetic fixtures and invents execution handles; real reads cannot be enabled.
-Live collection, TargetMap integration and durable restart recovery remain gated.
+Live deployment and durable restart recovery remain gated.
+
+The [controlled Chimera bridge](docs/controller/chimera-read-bridge.md) accepts
+raw READ envelopes, refreshes the private TargetMap and forwards canonical
+controlled observations into the runtime with an explicit source gate. Coverage
+remains unknown, so this connection suppresses warming plans. It does not deploy
+a shipper or establish restart continuity or trusted foreground demand.
 
 The narrow datagen-to-Dispatcher path has passed focused tests, Ruff, and one
 controlled offline `skipped/dry_run` integration on `nas-vm`; it issued zero
