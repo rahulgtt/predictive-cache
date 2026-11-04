@@ -585,9 +585,9 @@ parity test uses fixtures where they are zero (§13).
   `contract_mismatch`). Predictions are still logged, and the tick is
   counted as `plans_suppressed`.
 
-Inputs: scored candidates with their features, `CandidateView`, a
-`PathResolver` and cooldown state. Rules apply in order, and every skip
-records a reason:
+Inputs: scored candidates with their features, `CandidateView`, the
+`TargetMap` (§8.11) and cooldown state. Rules apply in order, and every
+skip records a reason:
 
 | # | Skip reason | Rule |
 | --- | --- | --- |
@@ -596,14 +596,17 @@ records a reason:
 | 3 | `cooldown` | Planned within `cooldown_s` (1800) |
 | 4 | `below_threshold` | `score < min_score` (chosen on val, §6.3) |
 | 5 | `unknown_size` | `file_size` null |
-| 6 | `no_path` | `resolver.resolve(volume, file, t)` returned None, or the path fails the Warmer path rules: absolute; valid UTF-8; ≤ 4096 bytes; components non-empty and ≤ 255 bytes; no `.` or `..`. These rules are a shared function with the Warmer CLI. |
+| 6 | `no_target` | `targets.resolve(volume, file, t)` returned None: never seen live with `identity_valid = true`, the entry is too old (`target_max_age_s`), its export isn't allowlisted, or it was marked stale (§8.11). |
 | 7 | `budget` | Taken in `(score desc, file_id asc)` order while items < `max_items` and Σ length ≤ `max_bytes`. An item that doesn't fit is skipped and the walk continues. |
 
 - **Range:** `offset 0`, `length = min(file_size, range_cap)` (16 MiB, the
   Warmer cap). Choosing ranges other than the prefix is later work (§15).
-- **Retry allowance:** 0 in v1, so a plan's `max_bytes` = Σ item lengths.
-  This follows README §3, where `max_bytes` covers all attempts including
-  retries.
+- **Retry allowance:** 0. Each item's `max_bytes` equals its `length`, and
+  the plan's `max_bytes` = Σ item lengths. The dispatcher never retries; a
+  retry is a new `task_id` with `supersedes`.
+- **Target validity:** `target_valid_until = min(t + target_valid_s,
+  deadline)`, where `target_valid_s` defaults to 120 and the dispatcher
+  caps it at 300 s after `created_at`.
 - **Deadline:** `t + horizon_s`. Because `lead_s = 0` in v1, items may
   start at once. The dispatcher must not start an item after the deadline.
 - **Selector parity:** with rules 2–6 disabled, the planner's selection
@@ -626,22 +629,39 @@ name and renamed atomically.
  "planned": true, "skip_reason": null}
 ```
 
-**Warm plan** (`plans/<plan_id>.json`). README §3 shape, plus `created_at`
-and per-item `score`/`reasons`:
+**Warm plan** (`plans/<plan_id>.json`): **schema v2**, the contract the
+merged dispatcher accepts. The source of truth is
+[docs/dispatcher.md](../dispatcher.md#schema-v2-plan-contract) and the
+schema code `predictive_cache.dispatcher.schema`. The planner must
+validate with that code in tests and must not re-implement it. Missing or
+extra fields reject the whole plan.
 
 ```json
-{"schema_version": 1, "run_id": "<controller.run_id>", "plan_id": "<controller_id>-20261103T090000Z",
+{"schema_version": 2, "run_id": "<controller.run_id>", "plan_id": "<controller_id>-20261103T090000Z",
  "model_version": "logreg-v1@3f2a9c1d0b7e4a51", "created_at": "2026-11-03T09:00:00.120000Z",
- "deadline": "2026-11-03T09:05:00.000000Z", "max_bytes": 25165824,
- "items": [{"task_id": "<plan_id>-001", "volume_id": "vol-0001", "file_id": "file-000451",
-            "path": "/proj-amber-falcon/drawings/plan-0042.dwg", "offset": 0, "length": 16777216,
-            "score": 0.82, "reasons": ["coacc_max_conf:+0.83", "dir_opens_15m:+0.41"]}]}
+ "deadline": "2026-11-03T09:05:00.000000Z", "max_bytes": 16777216,
+ "items": [{"task_id": "<plan_id>-001", "volume_id": "vol-0001", "file_id": "<64-hex file_id>",
+            "export_name": "<export name>", "export_id": "<export id>", "target_fh_b64": "<unpadded base64url>",
+            "target_valid_until": "2026-11-03T09:02:00.000000Z", "offset": 0, "length": 16777216,
+            "max_bytes": 16777216, "score": 0.82, "reasons": ["coacc_max_conf:+0.83", "dir_opens_15m:+0.41"]}]}
 ```
 
+- Identifiers: 1–128 characters from `[A-Za-z0-9._:-]`
+  (`model_version` also allows `@`). Timestamps are UTC RFC 3339 ending
+  in `Z`.
+- Per item: `length ≤ 16 MiB` and `max_bytes == length`;
+  `target_valid_until ≤ created_at + 300 s`. The optional `operation` may
+  only be `"read"`; the optional `supersedes` holds `{run_id, plan_id,
+  task_id}` of the item being retried.
+- Paths are **not** part of v2. Plans carry opaque NFS file handles
+  instead (§8.11).
+
 - **Empty plans** are not written. The tick is counted instead.
-- **Paths:** appear only in plan files, never in predictions, logs or
-  metrics. Plan and result files are created with mode `0600`, and pruned
-  after `sinks.retention_days` (default 2).
+- **File handles** appear only in plan files and the in-memory target map
+  (and its owner-only checkpoint), never in predictions, logs, metrics,
+  datasets or ClearML. Plan and result files are mode `0600`, in `0700`
+  directories. The dispatcher keeps them as PoC evidence and doesn't
+  auto-prune (docs/dispatcher.md); retention is an operator decision.
 - **Warm results** (README §4) are written by the dispatcher (§8.10). The
   Controller only reads them to count completed bytes for metrics.
   Correlating them with later demand is a later story.
@@ -776,60 +796,71 @@ Nothing follows tags or "latest".
 
 ### 8.10 Plan-file dispatcher (Warmer side, #63)
 
-The component that turns plan files into Warmer reads. It is owned by the
-Warmer lane and runs next to the Warmer, separately stoppable from the
-Controller.
+Implemented in PR #84. **[docs/dispatcher.md](../dispatcher.md) is the
+authoritative contract**: claim/state layout, schema v2 plan and task
+files, result records, recovery, rate limits and the real-read gate. This
+section only summarises what the Controller can rely on:
 
-**Safety gate.** The manual Warmer is documented as not ready for a live
-pilot: it has no rate limit, pressure pause or global budget
-([manual-warmer](../manual-warmer.md)). So the dispatcher ships with
-`dispatcher.real_reads: false`, and uses a **fake reader** that records
-what it would read. Real reads require **all** of:
+- **Claim:** each plan is claimed atomically and processed once. Items run
+  sequentially (one global Warmer subprocess) in plan order.
+- **Skips:** an item with a valid `task_id` but an expired deadline or
+  `target_valid_until`, a malformed or unauthorized target, an
+  out-of-range request, or no rate-limit capacity before its deadline gets
+  a terminal `skipped` result with a precise reason. Later items continue.
+  Plan-level schema or identity errors reject the whole plan.
+- **Safety gate:** real NFS reads need `real_reads: true` **and** the
+  `enable-real-reads` file. Otherwise the dispatcher records
+  `skipped/dry_run` with actual bytes 0. Rolling limits default to 60 task
+  starts and 64 MiB per minute. Pressure pause is deferred (#63). Live
+  pilots still need the README feasibility sign-off.
+- **Results:** status, reason, requested and actual bytes, and
+  `bytes_read_is_lower_bound`, from the Warmer's terminal record. A
+  `completed` read proves execution only, not residency or benefit.
+  `stale`-handle errors feed back into the target map (§8.11).
+- **No automatic retry.** A restart with an in-flight task yields
+  `failed/ambiguous_manual_review`.
+- Warmer reads are observed with `origin = warmer` and excluded from demand
+  (§8.2). They still refresh the target map.
 
-- an explicit operator enable (`real_reads: true` **and** an enable file
-  present);
-- a global rate limit (`max_bytes_per_min`, `max_items_per_min`) and one
-  in-flight read per volume;
-- a pressure pause: the stop file, or a configured foreground-latency or
-  cache-headroom signal from the protocol lane;
-- the README feasibility/pilot gate signed off by the protocol and
-  performance owners.
+### 8.11 File identity and the target map (C5)
 
-Until then, plans exercise the loop end to end without touching NFS.
+The model and features identify files by **`(volume_id, file_id)`**; plans
+need an **NFS target**. Chimera `nfs4_read_v2` events carry both
+(`contracts/nfs4-read-v2.schema.json`):
 
-- **Claim:** atomically rename `plans/<plan_id>.json` into
-  `plans/claimed/`. A plan that is already claimed is skipped, so each
-  plan is processed once per dispatcher. v1 runs one dispatcher.
-- **Per item, in plan order:**
-  1. Stop if `now ≥ deadline`. The remaining items get status `skipped`,
-     reason `deadline`.
-  2. Stop if cumulative requested bytes + `length` > the plan's
-     `max_bytes`. Status `skipped`, reason `budget`.
-  3. **Revalidate the target** close to execution: the path passes the
-     shared Warmer path rules, it exists, and `offset + length ≤` the
-     current size. Otherwise status `skipped`, reason `stale_target`.
-     Identity beyond path + size isn't verifiable in v1 (§15).
-  4. Run one `pcache-warmer` invocation (≤ 16 MiB, its own timeout ≤
-     remaining time to the deadline).
-  5. Write one result record.
-- **Result** (`results/<plan_id>/<task_id>.json`, README §4 shape plus
-  `reason`):
+- `file_id` = SHA-256 over `"chimera-read-v2\0" ‖ mount_id ‖ len ‖
+  inner_fh`. It is a stable hash of the server-side file handle, the same
+  across export aliases and NFS file-handle key rotation. It is the
+  **model identity** everywhere: datagen, cleaning, features, training,
+  packages and plans. Datagen's `file-…` IDs are opaque stand-ins for the
+  same thing, so datagen and data prep need **no** change.
+- `export_id` + `target_fh` is the wrapped, export-specific handle needed
+  for a READ. It can change with export alias or key rotation, so it is an
+  **execution detail**, never a model identity.
 
-  ```json
-  {"schema_version": 1, "run_id": "…", "plan_id": "…", "task_id": "…", "status": "completed",
-   "reason": "ok", "bytes_requested": 16777216, "bytes_read": 16777216, "bytes_read_is_lower_bound": false,
-   "started_at": "…", "finished_at": "…"}
-  ```
+**`TargetMap`** (Controller memory, #59 builds it, #60 uses it):
 
-  `status` ∈ `completed | partial | skipped | failed | cancelled`.
-  `bytes_read` is taken from the Warmer's terminal record and never
-  assumed.
-- **Stop control:** a stop file (`dispatcher.stop_file`) or SIGTERM halts
-  new items. An in-flight item finishes or hits its timeout. The remaining
-  items are recorded as `cancelled`.
-- Files are mode `0600` and pruned after `retention_days`. Warmer reads
-  carry `origin = warmer` in the observation path, so their events are
-  excluded from demand (§8.2).
+- **Update:** on every live event with `identity_valid = true`, of any
+  origin including `warmer`, store
+  `(volume_id, file_id) → {export_id, target_fh_b64, file_size, seen_at}`.
+  The latest `seen_at` wins.
+- **`resolve(volume_id, file_id, t)`** returns the entry with
+  `export_name` from Controller config (`exports: {export_id: name}`, an
+  allowlist) if `t − seen_at ≤ target_max_age_s` (default 3600) and the
+  entry isn't marked stale. Otherwise it returns None, giving the
+  `no_target` skip.
+- **Stale feedback:** a dispatcher result with a stale or invalid handle
+  error marks the entry stale until a newer event refreshes it.
+- **Bounded:** an LRU over files seen within `target_max_age_s`. The map is
+  included in the `ControllerState` checkpoint (§8.7), owner-only `0600`.
+- **Never persisted elsewhere.** The v1 access-event schema deliberately
+  has no handle field, so cleaned and training datasets, features, logs and
+  ClearML never contain handles.
+- **Replay/testing:** `CatalogTargetMap` derives deterministic fake handles
+  from the datagen catalog. Use it only with the dispatcher's dry-run gate.
+- **Limitation:** handle persistence across server restart or failover and
+  live handle-mode reads are unverified (#40). Stale handles fail safely
+  (the Warmer reports an error, and the entry is marked stale).
 
 ## 9. ClearML tracking wrapper
 
@@ -915,17 +946,19 @@ class Ingestor:                                                  # stamping + qu
     def drain(self, now: datetime) -> list[Update]: ...
     def state(self) -> bytes: ...; def restore(self, data: bytes) -> None: ...      # §8.7
 
-# src/predictive_cache/warmer/paths.py        (shared with #40)
-def validate_warmer_path(path: str) -> str | None: ...           # None if valid, else reason
-
-# src/predictive_cache/dispatcher/            (#63)
-def run_dispatcher(cfg: DispatcherConfig, reader: Callable[[dict], dict]) -> None: ...   # reader = one Warmer invocation
+# src/predictive_cache/dispatcher/schema.py  (#63, merged; authoritative for plan/task/result v2)
+# Plan.model_validate(raw) / PlanItem / result models: the planner validates with these in tests.
 
 # src/predictive_cache/controller/planner.py  (#60)
-class PathResolver(Protocol):
-    def resolve(self, volume_id: str, file_id: str, t: datetime) -> str | None: ...
-class CatalogPathResolver: ...                                   # datagen catalog file_paths, valid_from <= t < valid_to
-def plan(scored: pa.Table, view: CandidateView, resolver: PathResolver, cooldown: "Cooldown",
+@dataclass(frozen=True)
+class Target:
+    export_id: str; export_name: str; target_fh_b64: str; file_size: int | None; seen_at: datetime
+class TargetMap(Protocol):                                       # §8.11 (built by #59, used by #60)
+    def observe(self, event: dict) -> None: ...                  # raw nfs4_read_v2 with identity_valid=true, any origin
+    def resolve(self, volume_id: str, file_id: str, t: datetime) -> Target | None: ...
+    def mark_stale(self, volume_id: str, file_id: str) -> None: ...
+class CatalogTargetMap: ...                                      # replay only: deterministic fake handles from the datagen catalog
+def plan(scored: pa.Table, view: CandidateView, targets: TargetMap, cooldown: "Cooldown",
          cfg: PlannerConfig, t: datetime, model_version: str, run_id: str) -> tuple[dict | None, pa.Table]: ...   # (plan, decisions)
 
 # src/predictive_cache/controller/loop.py     (#60)
@@ -1011,16 +1044,11 @@ controller:
   planner_caps: {max_items: null, max_bytes_mib: null}   # optional; can only lower the package policy
   model: {poll_s: 30, retry_s: 300, cache_dir: /var/lib/pcache/models}
   memory: {state_dir: /var/lib/pcache/state, checkpoint_s: 300, max_gap_s: 900, warmup_s: 3600}
-dispatcher:
-  plans_dir: /var/lib/pcache/out/plans
-  results_dir: /var/lib/pcache/out/results
-  stop_file: /var/lib/pcache/out/STOP
-  retention_days: 2
-  real_reads: false                  # fake reader until the §8.10 gate is met
-  enable_file: /var/lib/pcache/out/ENABLE_REAL_READS
-  max_bytes_per_min: 67108864
-  max_items_per_min: 20
-  warmer: {host: null, port: 2049, uid: null, gid: null}   # from the protocol lane; no defaults committed
+dispatcher: {}                       # configured per docs/dispatcher.md (real-read gate, rolling limits, trusted endpoint)
+targets:
+  exports: {}                        # export_id -> export_name allowlist (no defaults committed)
+  target_max_age_s: 3600
+  target_valid_s: 120                # <= 300 (dispatcher cap)
 ```
 
 ### 11.3 Pipelines (story #52, backlog)
@@ -1099,7 +1127,9 @@ The Controller uses the stdlib `http.server` (a threading server) for
 - warmer-origin events never reach the store.
 
 **Tick loop and planner (#60):**
-- planner skip reasons, including Warmer path rules;
+- planner skip reasons, including `no_target` (target map miss, too old, stale, export not allowlisted);
+- plans validate with `predictive_cache.dispatcher.schema` (v2): `max_bytes == length`, `target_valid_until ≤ created_at + 300 s`;
+- the target map is updated from live events (any origin), never written to datasets or logs, and marked stale by stale-handle results;
 - `max_bytes` and the 16 MiB cap;
 - cooldown;
 - the policy comes from the package, and config caps can only lower it;
@@ -1131,10 +1161,9 @@ The Controller uses the stdlib `http.server` (a threading server) for
 - the default `real_reads: false` uses the fake reader;
 - real reads stay refused without the enable file;
 - rate limits;
-- with a fake reader: deadline, budget and stale-target skips, stop
-  control (`cancelled`);
-- each plan is claimed once;
-- results validate against §8.10.
+- covered by the merged dispatcher test suite (`tests/dispatcher/`): claim
+  once, deadline/budget/target/rate-limit skips, stop control, v2 schema;
+- remaining gaps tracked in #63 (pressure pause; retention decision).
 
 **CI** runs unit and fixture tests and the `tiny` parity tests. `small`
 replays and benchmarks are local or nightly, and measured values are
@@ -1161,11 +1190,11 @@ tests/ml/  tests/controller/
 | [#57](https://github.com/rahulgtt/predictive-cache/issues/57) | #50 | Metrics | §7.1–7.3 |
 | [#58](https://github.com/rahulgtt/predictive-cache/issues/58) | #50 | `pcache-eval`, freeze, val/test runs, ledger, reports | §7.4–7.6, §11 |
 | [#77](https://github.com/rahulgtt/predictive-cache/issues/77) | #50 | `pcache-eval policy` replay (blocked on #60, #28) | §7.7 |
-| [#59](https://github.com/rahulgtt/predictive-cache/issues/59) | #51 | Event sources, streaming cleaning | §8.1–8.2 |
-| [#60](https://github.com/rahulgtt/predictive-cache/issues/60) | #51 | Tick loop, planner, resolver, sinks | §8.3–8.5 |
+| [#59](https://github.com/rahulgtt/predictive-cache/issues/59) | #51 | Event sources, streaming cleaning, target map updates | §8.1–8.2, §8.11 |
+| [#60](https://github.com/rahulgtt/predictive-cache/issues/60) | #51 | Tick loop, planner (v2 plans), sinks | §8.3–8.5, §8.11 |
 | [#61](https://github.com/rahulgtt/predictive-cache/issues/61) | #51 | Model pointer and hot swap | §8.6 |
 | [#62](https://github.com/rahulgtt/predictive-cache/issues/62) | #51 | Checkpoint, health/metrics, image, manifests | §8.7–8.9 |
-| [#63](https://github.com/rahulgtt/predictive-cache/issues/63) | #51 (Warmer lane) | Plan-file dispatcher | §8.10 |
+| [#63](https://github.com/rahulgtt/predictive-cache/issues/63) | #51 (Warmer lane) | Plan-file dispatcher (merged in PR #84) | §8.10, docs/dispatcher.md |
 
 **Order and parallelism:**
 - #54 first: the dummy package unblocks #60 and #61 on day one.
