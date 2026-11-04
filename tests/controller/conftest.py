@@ -90,3 +90,83 @@ def dataset(tmp_path):
         return root
 
     return make
+
+
+@pytest.fixture
+def raw_chimera():
+    import base64
+    import hashlib
+
+    VOLUME = "01" * 16
+    FILE = "02" * 32
+    HANDLE = base64.urlsafe_b64encode(b"private-fictional-handle").decode().rstrip("=")
+
+    def make(**changes):
+        row = dict(
+            schema="nfs4_read_v2",
+            local_id="11111111-1111-4111-8111-111111111111",
+            producer_epoch="22222222-2222-4222-8222-222222222222",
+            producer_sequence="1",
+            event_time_ns="1",
+            sink_time_ns="2",
+            target_created_ns="1",
+            volume_id=VOLUME,
+            file_id=FILE,
+            identity_valid=True,
+            export_name_b64="L3VudHJ1c3RlZA",
+            export_id=7,
+            target_fh=HANDLE,
+            operation_id="03" * 32,
+            client_ref="04" * 32,
+            session_ref="",
+            compound_op_index=1,
+            slot_id=1,
+            sequence_id=1,
+            compound_tag_b64="",
+            compound_tag_original_length=0,
+            compound_tag_truncated=False,
+            compound_tag_id=hashlib.sha256(b"").hexdigest(),
+            origin_claim="unknown",
+            origin_trust="client_asserted",
+            requested_offset="0",
+            requested_count=4096,
+            returned_bytes=4096,
+            nfs_status=0,
+            outcome="success",
+            eof=False,
+            file_size_valid=True,
+            file_size="65536",
+        )
+        row.update(changes)
+        return row
+
+    return make
+
+
+@pytest.fixture
+def raw_envelope(raw_chimera):
+    def make(*events, **changes):
+        rows = list(events) if events else [raw_chimera()]
+        sequences = [int(row["producer_sequence"]) for row in rows]
+        body = {
+            "schema": "nfs4_read_v2",
+            "pod_uid": "fixture-pod",
+            "producer_epoch": rows[0]["producer_epoch"],
+            "first_sequence": str(min(sequences)),
+            "last_sequence": str(max(sequences)),
+            "health": {
+                "scraped_at_ns": "100",
+                "last_synced_sequence": str(max(sequences)),
+                "barrier_ready": False,
+                "delivery_clean": True,
+                "queue_depth": 1,
+                "worker_in_flight": 1,
+                "dropped": dict.fromkeys(("queue", "encode", "sink", "rollback", "rotation"), 0),
+                "shipper_dropped": {"rotated_unsent": 0, "stale_epoch": 0},
+            },
+            "events": rows,
+        }
+        body.update(changes)
+        return body
+
+    return make

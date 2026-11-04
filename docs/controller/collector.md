@@ -13,8 +13,10 @@ The implemented producer emits raw `nfs4_read_v2` READ records. The existing
 [Chimera importer](../data-prep/chimera-v2-adapter.md) validates the collection
 evidence and converts them to normalized event-schema-v1 tables. This
 collector replays those normalized tables; its HTTP endpoint accepts normalized
-v1 arrays, not raw Chimera v2 records. It does not replace the importer or
-provide a live raw-event exporter/normalizer.
+v1 arrays in default generic mode. The opt-in
+[raw target-ingestion mode](target-map.md#raw-http-target-ingestion) accepts
+the raw envelope to refresh execution targets only; it does not replace the
+importer or provide live demand/feature normalization.
 
 The verified collection described in the
 [private dataset guide](../data-prep/owner-private-controlled-dataset.md)
@@ -81,7 +83,7 @@ unsupported Controller/model settings fail clearly with a sanitized error.
 Bind to loopback for container validation. HTTP itself supplies no TLS; a deployment
 needs an approved protected network or TLS termination and source authorization.
 
-The protocol is `POST /v1/events`, `Content-Type: application/json`, one
+In default generic mode, the protocol is `POST /v1/events`, `Content-Type: application/json`, one
 unambiguous `Content-Length`, and `Authorization: Bearer <secret>` with a
 JSON array of schema-v1 event objects. Chunked transfer is unsupported.
 
@@ -201,7 +203,7 @@ its separate `PCACHE_SMALL_INPUT` and `PCACHE_SMALL_CLEAN` inputs were not
 provided. The JSONL/Parquet importer-to-replay regression passed.
 
 These checks use already-collected metadata. They do not connect the running
-Chimera producer to HTTP, validate a raw-v2 streaming adapter, apply updates
+Chimera producer to HTTP, establish deployment of a raw-v2 shipper, apply updates
 to a real FeatureStore, or establish READ-demand feature/model parity. Those
 remain separate integration work under #34, #104 and #30. No new target-file
 I/O, warming or deployment was performed by this validation.

@@ -321,3 +321,101 @@ def test_cli_summary_exposes_tracker_failure_without_source_details(reason):
         reason if reason != "PRIVATE_SOURCE_VALUE" else "other"
     )
     assert "PRIVATE_SOURCE_VALUE" not in json.dumps(summary)
+
+
+@pytest.fixture
+def raw_receiver():
+    from predictive_cache.controller.ingest import ChimeraTargetIngestor
+    from predictive_cache.controller.targets import TargetMap
+
+    core = ChimeraTargetIngestor(
+        TargetMap({7: "test-ro"}),
+        allowed_volumes=["01" * 16],
+        shippers=["fixture-pod"],
+        queue_max=2,
+    )
+    source = HttpSource(("127.0.0.1", 0), token="fixture-token")
+    source.start(raw_sink=core.offer)
+    try:
+        yield source, core
+    finally:
+        source.stop()
+
+
+def test_raw_http_enqueues_then_updates_private_target(raw_receiver, raw_envelope, capsys):
+    from datetime import UTC, datetime, timedelta
+
+    source, core = raw_receiver
+    payload = json.dumps(raw_envelope()).encode()
+    status, body = request(source, payload)
+    assert status == 202
+    assert json.loads(body) == {"accepted": 1, "dropped": 0, "duplicate": 0}
+    assert core.targets.stats()["entries"] == 0
+    core.drain(datetime.now(UTC) + timedelta(seconds=1))
+    assert core.targets.resolve("01" * 16, "02" * 32, datetime.now(UTC)) is not None
+    assert json.loads(request(source, payload)[1]) == {"accepted": 0, "dropped": 0, "duplicate": 1}
+    assert core.stats()["updates_emitted"] == 0
+    assert not capsys.readouterr().out
+
+
+def test_raw_http_rejections_are_sanitized(raw_receiver, raw_envelope):
+    source, core = raw_receiver
+    payload = json.dumps(raw_envelope(pod_uid="PRIVATE_UNKNOWN_POD")).encode()
+    status, body = request(source, payload)
+    assert status == 403 and b"PRIVATE" not in body
+    assert request(source, b"[]")[0] == 400
+    assert request(source, payload, headers={"Authorization": "Bearer wrong"})[0] == 401
+    assert core.stats()["queue_depth"] == 0
+
+
+def test_raw_http_limit_is_applied_to_envelope(raw_envelope):
+    source = HttpSource(("127.0.0.1", 0), token="fixture-token", max_events=1)
+    called = []
+    source.start(raw_sink=lambda envelope: (called.append(envelope) or 0, 0, 0))
+    try:
+        body = raw_envelope()
+        body["events"] *= 2
+        assert request(source, json.dumps(body).encode())[0] == 413
+        assert called == []
+    finally:
+        source.stop()
+
+
+def test_raw_cli_mode_creates_map_without_demand(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+
+    from predictive_cache.controller import cli
+
+    calls = []
+
+    class FakeSource:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self, sink=None, *, raw_sink=None):
+            assert sink is None and raw_sink is not None
+            calls.append("raw-start")
+
+        def stop(self):
+            calls.append("stop")
+
+    def interrupt(_):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "HttpSource", FakeSource)
+    monkeypatch.setattr(cli.time, "sleep", interrupt)
+    monkeypatch.setenv("PCACHE_INGEST_TOKEN", "fixture-token")
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "controller:\n  ingest:\n    source: http\n    mode: chimera-targets\n"
+        "    allowed_volumes: [fixture-volume]\n    shippers: [fixture-pod]\n"
+        "    targets: {exports: {7: test-ro}}\n"
+    )
+    result = CliRunner().invoke(cli.main, ["run", "--config", str(config)])
+    assert result.exit_code == 0, result.output
+    summary = json.loads(result.output.splitlines()[-1])
+    assert summary["demand_enabled"] is False
+    assert summary["coverage_status"] == "unknown"
+    assert summary["restart_continuity"] is False
+    assert calls == ["raw-start", "stop"]
+    assert "fixture-token" not in result.output

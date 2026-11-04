@@ -18,7 +18,9 @@ users wait for it to arrive from cloud storage.
 > already work.
 
 An experimental [event collector](docs/controller/collector.md) supports
-normalized-v1 HTTP ingestion and replay.
+normalized-v1 HTTP ingestion and replay. Opt-in
+[raw target ingestion](docs/controller/target-map.md#raw-http-target-ingestion)
+feeds private execution targets without creating demand updates.
 
 The narrow datagen-to-Dispatcher path has passed focused tests, Ruff, and one
 controlled offline `skipped/dry_run` integration on `nas-vm`; it issued zero

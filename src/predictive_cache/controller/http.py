@@ -11,6 +11,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from .ingest import EnvelopeError
+
 
 class _DeadlineReader(io.RawIOBase):
     """Apply an absolute deadline, including clients trickling header bytes."""
@@ -167,6 +169,24 @@ class _Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeError, RecursionError):
             self._respond(400, {"error": 400})
             return
+        if isinstance(events, dict) and source.raw_sink is not None:
+            raw_events = events.get("events")
+            if isinstance(raw_events, list) and len(raw_events) > source.max_events:
+                self._respond(413, {"error": 413})
+                return
+            try:
+                accepted, dropped, duplicate = source.raw_sink(events)
+            except EnvelopeError as error:
+                self._respond(error.status, {"error": error.status})
+                return
+            except Exception:
+                self._respond(503, {"error": 503})
+                return
+            self._respond(202, {"accepted": accepted, "dropped": dropped, "duplicate": duplicate})
+            return
+        if source.sink is None:
+            self._respond(400, {"error": 400})
+            return
         if not isinstance(events, list) or any(not isinstance(row, dict) for row in events):
             self._respond(400, {"error": 400})
             return
@@ -223,16 +243,16 @@ class HttpSource:
         self.read_timeout_s = read_timeout_s
         self.server = None
         self.thread = None
-        self.sink = None
+        self.sink = self.raw_sink = None
 
     @property
     def bound_address(self):
         return self.server.server_address if self.server else None
 
-    def start(self, sink):
+    def start(self, sink=None, *, raw_sink=None):
         if self.server is not None:
             raise RuntimeError("HTTP source already started")
-        self.sink = sink
+        self.sink, self.raw_sink = sink, raw_sink
         self.server = _Server(self.address, self)
         self.thread = threading.Thread(
             target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
