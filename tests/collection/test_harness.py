@@ -28,6 +28,7 @@ from predictive_cache.collection.cli import (
     _artifact_rows,
     _cleanup_root,
     _external_file_evidence,
+    _historical_disposition_claim,
     _historical_root,
     _manifest_profile,
     _open_verified_fd,
@@ -88,6 +89,7 @@ from predictive_cache.collection.models import (
     HistoricalFrozenRootDeclaration,
     HistoricalIntegrationProvenance,
     HistoricalProviderEvidence,
+    HistoricalRetentionApproval,
     HistoricalRunEvidence,
     HistoricalValidationAttempt,
     HistoricalVerificationProvenance,
@@ -3813,11 +3815,38 @@ def _historical_finalization_fixture(tmp_path, monkeypatch):
             ),
         ),
     )
+    retention_approval = control / "historical-retention-approval.json"
+    atomic_write_model(
+        retention_approval,
+        HistoricalRetentionApproval(
+            status="approved",
+            approved_at=START + timedelta(days=2),
+            run_id=attestation_model.run_id,
+            attestation_sha256=sha256(attestation),
+            verification_commit=verification_commit,
+            verification_tree=verification_tree,
+            merge_confirmed=True,
+            targets={
+                role: HistoricalDeletionTarget(
+                    canonical_path=root.canonical_path,
+                    device=root.device,
+                    inode=root.inode,
+                    action="retain",
+                )
+                for role, root in historical_roots.items()
+            },
+            statement=(
+                "Approve indefinite retention of every exact historical evidence "
+                "root; do not create a deletion schedule or delete_by deadline."
+            ),
+        ),
+    )
     return {
         "roots": roots,
         "control": control,
         "attestation": attestation,
         "deletion_approval": deletion_approval,
+        "retention_approval": retention_approval,
         "executed_archive": executed_archive,
         "verification_archive": verification_archive,
         "verification_repo": verification_repo,
@@ -3828,7 +3857,7 @@ def _historical_finalization_fixture(tmp_path, monkeypatch):
     }
 
 
-def _historical_finalize_args(fixture):
+def _historical_finalize_args(fixture, *, retain_all=False):
     arguments = [
         "finalize-historical",
         "--attestation",
@@ -3841,8 +3870,16 @@ def _historical_finalize_args(fixture):
         str(fixture["verification_archive"]),
         "--frozen-root-declaration",
         str(fixture["frozen_declaration"]),
-        "--deletion-approval",
-        str(fixture["deletion_approval"]),
+        (
+            "--retention-approval"
+            if retain_all
+            else "--deletion-approval"
+        ),
+        str(
+            fixture["retention_approval"]
+            if retain_all
+            else fixture["deletion_approval"]
+        ),
         "--verification-repository",
         str(fixture["verification_repo"]),
         "--merged-ref",
@@ -3944,6 +3981,7 @@ def test_attest_historical_rejects_root_change_during_replay(
     from predictive_cache.collection import cli as collection_cli
 
     fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    original = collection_cli._validate_historical_attestation
     fixture["attestation"].unlink()
     original = collection_cli._validate_historical_attestation
 
@@ -4048,6 +4086,42 @@ def test_finalize_historical_rejects_authorization_swap_during_replay(
     assert message in result.output
 
 
+def test_finalize_historical_rejects_moved_merged_ref_during_replay(
+    tmp_path,
+    monkeypatch,
+):
+    from predictive_cache.collection import cli as collection_cli
+
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    original = collection_cli._validate_historical_attestation
+
+    def validate_then_move_ref(*args, **kwargs):
+        original(*args, **kwargs)
+        repository = fixture["verification_repo"]
+        (repository / "source.txt").write_text("moved ref\n")
+        subprocess.run(
+            ["git", "-C", repository, "add", "source.txt"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", repository, "commit", "-qm", "move ref"],
+            check=True,
+        )
+
+    monkeypatch.setattr(
+        collection_cli,
+        "_validate_historical_attestation",
+        validate_then_move_ref,
+    )
+    result = CliRunner().invoke(
+        main,
+        _historical_finalize_args(fixture, retain_all=True),
+    )
+    assert result.exit_code != 0
+    assert "verifier provenance changed" in result.output
+    assert not (fixture["control"] / "historical-disposition.json").exists()
+
+
 def test_finalize_historical_preserves_actual_topology(
     tmp_path,
     monkeypatch,
@@ -4072,6 +4146,234 @@ def test_finalize_historical_preserves_actual_topology(
             fixture["attestation"].read_text()
         ).roots
     )
+
+
+def test_finalize_historical_can_retain_all_without_deadline(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    result = CliRunner().invoke(
+        main,
+        _historical_finalize_args(fixture, retain_all=True),
+    )
+    assert result.exit_code == 0, result.output
+    record = json.loads(
+        (fixture["control"] / "historical-retention-record.json").read_text()
+    )
+    assert record["retention_policy"] == "retain_indefinitely"
+    assert record["delete_by"] is None
+    assert set(record["root_actions"].values()) == {"retain"}
+    assert not (fixture["control"] / "historical-cleanup-schedule.json").exists()
+    assert not (
+        fixture["control"] / "historical-deletion-inventory.json"
+    ).exists()
+
+
+def test_finalize_historical_requires_one_outcome_approval(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    arguments = _historical_finalize_args(fixture)
+    index = arguments.index("--deletion-approval")
+    del arguments[index : index + 2]
+    missing = CliRunner().invoke(main, arguments)
+    assert missing.exit_code != 0
+    assert "choose exactly one" in missing.output
+
+    both = _historical_finalize_args(fixture)
+    both.extend(
+        [
+            "--retention-approval",
+            str(fixture["retention_approval"]),
+        ]
+    )
+    conflicting = CliRunner().invoke(main, both)
+    assert conflicting.exit_code != 0
+    assert "choose exactly one" in conflicting.output
+
+
+def test_historical_retain_then_delete_is_terminal(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    retained = CliRunner().invoke(
+        main,
+        _historical_finalize_args(fixture, retain_all=True),
+    )
+    assert retained.exit_code == 0, retained.output
+    deleted = CliRunner().invoke(main, _historical_finalize_args(fixture))
+    assert deleted.exit_code != 0
+    assert "retention record conflicts" in deleted.output
+    assert not (fixture["control"] / "historical-cleanup-schedule.json").exists()
+
+
+def test_historical_delete_then_retain_is_terminal(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    deleted = CliRunner().invoke(main, _historical_finalize_args(fixture))
+    assert deleted.exit_code == 0, deleted.output
+    retained = CliRunner().invoke(
+        main,
+        _historical_finalize_args(fixture, retain_all=True),
+    )
+    assert retained.exit_code != 0
+    assert "deletion artifacts conflict" in retained.output
+    assert not (fixture["control"] / "historical-retention-record.json").exists()
+
+
+def test_historical_retain_blocks_cleanup_completion(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    retained = CliRunner().invoke(
+        main,
+        _historical_finalize_args(fixture, retain_all=True),
+    )
+    assert retained.exit_code == 0, retained.output
+    result = CliRunner().invoke(
+        main,
+        [
+            "complete-cleanup-historical",
+            "--schedule",
+            str(fixture["control"] / "historical-cleanup-schedule.json"),
+            "--completion",
+            str(fixture["control"] / "completion.json"),
+            "--out",
+            str(fixture["control"] / "completion-output.json"),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "forbidden by retain-all" in result.output
+
+
+def test_historical_disposition_claim_is_atomic(tmp_path, monkeypatch):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    roots = {
+        role: _historical_root(role, path)
+        for role, path in fixture["roots"].items()
+    }
+
+    def claim(outcome):
+        return _historical_disposition_claim(
+            fixture["control"],
+            outcome=outcome,
+            run_id="controlled-demo",
+            attestation_sha256=sha256(fixture["attestation"]),
+            approval_sha256=(
+                sha256(fixture["retention_approval"])
+                if outcome == "retain_all"
+                else sha256(fixture["deletion_approval"])
+            ),
+            verification_commit=fixture["verification_commit"],
+            verification_tree=HistoricalFinalizationAttestation.model_validate_json(
+                fixture["attestation"].read_text()
+            ).verification.tree,
+            roots=roots,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(claim, "retain_all"),
+            executor.submit(claim, "delete"),
+        ]
+    results = []
+    errors = []
+    for future in futures:
+        try:
+            results.append(future.result())
+        except click.ClickException as error:
+            errors.append(str(error))
+    assert len(results) == 1
+    assert errors == [
+        "historical disposition conflicts with existing terminal outcome"
+    ]
+
+
+def test_historical_same_outcome_duplicate_is_rejected(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    first = CliRunner().invoke(
+        main,
+        _historical_finalize_args(fixture, retain_all=True),
+    )
+    assert first.exit_code == 0, first.output
+    second = CliRunner().invoke(
+        main,
+        _historical_finalize_args(fixture, retain_all=True),
+    )
+    assert second.exit_code != 0
+    assert "already finalized" in second.output
+
+
+def test_historical_retain_resumes_incomplete_disposition(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    roots = {
+        role: _historical_root(role, path)
+        for role, path in fixture["roots"].items()
+    }
+    attestation = HistoricalFinalizationAttestation.model_validate_json(
+        fixture["attestation"].read_text()
+    )
+    _historical_disposition_claim(
+        fixture["control"],
+        outcome="retain_all",
+        run_id=attestation.run_id,
+        attestation_sha256=sha256(fixture["attestation"]),
+        approval_sha256=sha256(fixture["retention_approval"]),
+        verification_commit=attestation.verification.commit,
+        verification_tree=attestation.verification.tree,
+        roots=roots,
+    )
+    result = CliRunner().invoke(
+        main,
+        _historical_finalize_args(fixture, retain_all=True),
+    )
+    assert result.exit_code == 0, result.output
+    assert (fixture["control"] / "historical-retention-record.json").is_file()
+
+
+def test_historical_failed_validation_does_not_claim_outcome(
+    tmp_path,
+    monkeypatch,
+):
+    from predictive_cache.collection import cli as collection_cli
+
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    original = collection_cli._validate_historical_attestation
+
+    def fail_validation(*_args, **_kwargs):
+        raise click.ClickException("simulated validation failure")
+
+    monkeypatch.setattr(
+        collection_cli,
+        "_validate_historical_attestation",
+        fail_validation,
+    )
+    failed = CliRunner().invoke(main, _historical_finalize_args(fixture))
+    assert failed.exit_code != 0
+    assert not (fixture["control"] / "historical-disposition.json").exists()
+
+    monkeypatch.setattr(
+        collection_cli,
+        "_validate_historical_attestation",
+        original,
+    )
+    retained = CliRunner().invoke(
+        main,
+        _historical_finalize_args(fixture, retain_all=True),
+    )
+    assert retained.exit_code == 0, retained.output
 
 
 def test_historical_root_accepts_confined_legacy_modes_but_rejects_open_root(

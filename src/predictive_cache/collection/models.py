@@ -470,6 +470,77 @@ class HistoricalDeletionApproval(StrictModel):
         return self
 
 
+class HistoricalRetentionApproval(StrictModel):
+    historical_retention_approval_version: Literal[1] = 1
+    status: Literal["approved"]
+    approved_at: datetime
+    run_id: SafeId
+    attestation_sha256: Sha256
+    verification_commit: GitObjectId
+    verification_tree: GitObjectId
+    merge_confirmed: Literal[True]
+    targets: dict[HistoricalRootRole, HistoricalDeletionTarget]
+    statement: Literal[
+        "Approve indefinite retention of every exact historical evidence root; "
+        "do not create a deletion schedule or delete_by deadline."
+    ]
+
+    _approved_utc = field_validator("approved_at")(_utc)
+
+    @model_validator(mode="after")
+    def retain_every_target(self):
+        expected = set(HistoricalRootRole.__args__)
+        if set(self.targets) != expected:
+            raise ValueError("historical retention approval must bind every root role")
+        if any(target.action != "retain" for target in self.targets.values()):
+            raise ValueError("historical retention approval must retain every root")
+        return self
+
+
+class HistoricalRetentionRecord(StrictModel):
+    historical_retention_record_version: Literal[1] = 1
+    run_id: SafeId
+    finalized_at: datetime
+    retention_policy: Literal["retain_indefinitely"]
+    attestation_sha256: Sha256
+    retention_approval_sha256: Sha256
+    root_actions: dict[HistoricalRootRole, Literal["retain"]]
+    delete_by: Literal[None] = None
+
+    _finalized_utc = field_validator("finalized_at")(_utc)
+
+    @field_validator("root_actions")
+    @classmethod
+    def retain_all_roots(cls, value):
+        expected = set(HistoricalRootRole.__args__)
+        if set(value) != expected or any(
+            action != "retain" for action in value.values()
+        ):
+            raise ValueError("historical retention record must retain every root")
+        return value
+
+
+class HistoricalDispositionClaim(StrictModel):
+    historical_disposition_version: Literal[1] = 1
+    run_id: SafeId
+    outcome: Literal["retain_all", "delete"]
+    claimed_at: datetime
+    attestation_sha256: Sha256
+    approval_sha256: Sha256
+    verification_commit: GitObjectId
+    verification_tree: GitObjectId
+    root_manifest_sha256: dict[HistoricalRootRole, Sha256]
+
+    _claimed_utc = field_validator("claimed_at")(_utc)
+
+    @field_validator("root_manifest_sha256")
+    @classmethod
+    def exact_roots(cls, value):
+        if set(value) != set(HistoricalRootRole.__args__):
+            raise ValueError("historical disposition must bind every root")
+        return value
+
+
 class BoundedValidationAttestation(StrictModel):
     bounded_validation_manifest_version: Literal[1] = 1
     validation_run_id: SafeId

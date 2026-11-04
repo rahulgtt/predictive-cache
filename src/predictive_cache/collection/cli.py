@@ -77,6 +77,7 @@ from .models import (
     HistoricalCompatibilityApproval,
     HistoricalDeletionApproval,
     HistoricalDirectoryEvidence,
+    HistoricalDispositionClaim,
     HistoricalEvidenceReference,
     HistoricalExecutionProvenance,
     HistoricalExternalFileEvidence,
@@ -85,6 +86,8 @@ from .models import (
     HistoricalFrozenRootDeclaration,
     HistoricalIntegrationProvenance,
     HistoricalProviderEvidence,
+    HistoricalRetentionApproval,
+    HistoricalRetentionRecord,
     HistoricalRootEvidence,
     HistoricalRunEvidence,
     HistoricalValidationAttempt,
@@ -1489,6 +1492,77 @@ def _verify_authorization_snapshot(
     _data, digest, identity = _authorization_snapshot(path, label)
     if digest != expected_sha256 or identity != expected_identity:
         raise click.ClickException(f"{label} changed during finalization")
+
+
+def _historical_disposition_claim(
+    finalization_root: Path,
+    *,
+    outcome: str,
+    run_id: str,
+    attestation_sha256: str,
+    approval_sha256: str,
+    verification_commit: str,
+    verification_tree: str,
+    roots: dict[str, HistoricalRootEvidence],
+) -> tuple[HistoricalDispositionClaim, bool]:
+    path = finalization_root / "historical-disposition.json"
+    expected = HistoricalDispositionClaim(
+        run_id=run_id,
+        outcome=outcome,
+        claimed_at=datetime.now(UTC),
+        attestation_sha256=attestation_sha256,
+        approval_sha256=approval_sha256,
+        verification_commit=verification_commit,
+        verification_tree=verification_tree,
+        root_manifest_sha256={
+            role: root.root_manifest_sha256 for role, root in roots.items()
+        },
+    )
+    try:
+        atomic_write_model(path, expected)
+        return expected, True
+    except FileExistsError:
+        try:
+            existing = load_model(path, HistoricalDispositionClaim)
+        except (OSError, ValueError) as error:
+            raise click.ClickException(
+                "historical disposition claim is invalid"
+            ) from error
+        if (
+            existing.run_id != expected.run_id
+            or existing.outcome != expected.outcome
+            or existing.attestation_sha256 != expected.attestation_sha256
+            or existing.approval_sha256 != expected.approval_sha256
+            or existing.verification_commit != expected.verification_commit
+            or existing.verification_tree != expected.verification_tree
+            or existing.root_manifest_sha256
+            != expected.root_manifest_sha256
+        ):
+            raise click.ClickException(
+                "historical disposition conflicts with existing terminal outcome"
+            )
+        return existing, False
+
+
+def _reject_opposite_historical_artifacts(
+    finalization_root: Path,
+    outcome: str,
+) -> None:
+    retain = finalization_root / "historical-retention-record.json"
+    deletion = (
+        finalization_root / "historical-deletion-inventory.json",
+        finalization_root / "historical-cleanup-schedule.json",
+        finalization_root / "historical-cleanup-completion.json",
+    )
+    if outcome == "retain_all":
+        if any(path.exists() or path.is_symlink() for path in deletion):
+            raise click.ClickException(
+                "historical deletion artifacts conflict with retain-all outcome"
+            )
+    elif retain.exists() or retain.is_symlink():
+        raise click.ClickException(
+            "historical retention record conflicts with deletion outcome"
+        )
 
 
 def _verification_git_provenance(
@@ -3655,7 +3729,10 @@ def attest_historical(
 @click.option(
     "--deletion-approval",
     type=click.Path(path_type=Path),
-    required=True,
+)
+@click.option(
+    "--retention-approval",
+    type=click.Path(path_type=Path),
 )
 @click.option(
     "--verification-repository",
@@ -3672,7 +3749,8 @@ def finalize_historical(
     executed_source_archive: Path,
     verification_source_archive: Path,
     frozen_root_declaration: Path,
-    deletion_approval: Path,
+    deletion_approval: Path | None,
+    retention_approval: Path | None,
     verification_repository: Path,
     merged_ref: str,
     adapter_wrapper: Path,
@@ -3680,6 +3758,10 @@ def finalize_historical(
     evidence_roots: tuple[str, ...],
 ) -> None:
     """Finalize the one approved pre-finalizer historical collection."""
+    if (deletion_approval is None) == (retention_approval is None):
+        raise click.ClickException(
+            "choose exactly one of --deletion-approval or --retention-approval"
+        )
     finalization_root = _existing_private_root(
         finalization_root,
         "historical finalization control root",
@@ -3790,54 +3872,70 @@ def finalize_historical(
         raise click.ClickException(
             "historical verifier provenance is not the merged verifier"
         )
+    approval_path = deletion_approval or retention_approval
+    approval_label = (
+        "historical deletion approval"
+        if deletion_approval is not None
+        else "historical retention approval"
+    )
     if (
-        deletion_approval.parent.resolve(strict=True) != finalization_root
-        or deletion_approval.is_symlink()
-        or not deletion_approval.is_file()
-        or stat.S_IMODE(deletion_approval.stat().st_mode) & 0o077
+        approval_path.parent.resolve(strict=True) != finalization_root
+        or approval_path.is_symlink()
+        or not approval_path.is_file()
+        or stat.S_IMODE(approval_path.stat().st_mode) & 0o077
     ):
         raise click.ClickException(
-            "historical deletion approval must be owner-only in finalization root"
+            f"{approval_label} must be owner-only in finalization root"
         )
     try:
         (
-            deletion_approval_bytes,
-            deletion_approval_sha256,
-            deletion_approval_identity,
+            approval_bytes,
+            approval_sha256,
+            approval_identity,
         ) = _authorization_snapshot(
-            deletion_approval,
-            "historical deletion approval",
+            approval_path,
+            approval_label,
         )
-        deletion_approval_model = HistoricalDeletionApproval.model_validate(
-            strict_json_loads(deletion_approval_bytes.decode())
+        approval_model = (
+            HistoricalDeletionApproval
+            if deletion_approval is not None
+            else HistoricalRetentionApproval
+        ).model_validate(
+            strict_json_loads(approval_bytes.decode())
         )
     except (UnicodeDecodeError, json.JSONDecodeError, OSError, ValueError) as error:
-        raise click.ClickException("historical deletion approval is invalid") from error
+        raise click.ClickException(f"{approval_label} is invalid") from error
     expected_targets = {
         role: {
             "canonical_path": root.canonical_path,
             "device": root.device,
             "inode": root.inode,
-            "action": root.retention_action,
+            "action": (
+                root.retention_action
+                if deletion_approval is not None
+                else "retain"
+            ),
         }
         for role, root in roots.items()
     }
     if (
-        deletion_approval_model.run_id != attestation_model.run_id
-        or deletion_approval_model.attestation_sha256 != attestation_sha256
-        or deletion_approval_model.verification_commit != verified_commit
-        or deletion_approval_model.verification_tree != verified_tree
-        or deletion_approval_model.approved_at
+        approval_model.run_id != attestation_model.run_id
+        or approval_model.attestation_sha256 != attestation_sha256
+        or approval_model.verification_commit != verified_commit
+        or approval_model.verification_tree != verified_tree
+        or approval_model.approved_at
         < attestation_model.approval.approved_at
         or {
             role: target.model_dump(mode="json")
-            for role, target in deletion_approval_model.targets.items()
+            for role, target in approval_model.targets.items()
         }
         != expected_targets
     ):
         raise click.ClickException(
-            "historical deletion approval does not match exact targets"
+            f"{approval_label} does not match exact targets"
         )
+    outcome = "delete" if deletion_approval is not None else "retain_all"
+    _reject_opposite_historical_artifacts(finalization_root, outcome)
     for root in roots.values():
         root_path = Path(root.canonical_path)
         if (
@@ -3871,10 +3969,10 @@ def finalize_historical(
         "historical attestation",
     )
     _verify_authorization_snapshot(
-        deletion_approval,
-        deletion_approval_sha256,
-        deletion_approval_identity,
-        "historical deletion approval",
+        approval_path,
+        approval_sha256,
+        approval_identity,
+        approval_label,
     )
     _verify_authorization_snapshot(
         frozen_root_declaration,
@@ -3906,11 +4004,73 @@ def finalize_historical(
         cleaner_wrapper_identity,
         "historical cleaner wrapper",
     )
+    refreshed_commit, refreshed_tree = _verification_git_provenance(
+        verification_repository,
+        attestation_model.verification.commit,
+        verification_archive_bytes,
+    )
+    try:
+        refreshed_merged_commit = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(verification_repository),
+                "rev-parse",
+                f"{merged_ref}^{{commit}}",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise click.ClickException(
+            "historical merged verifier ref changed during finalization"
+        ) from error
+    if (
+        refreshed_commit != verified_commit
+        or refreshed_tree != verified_tree
+        or refreshed_merged_commit != verified_commit
+    ):
+        raise click.ClickException(
+            "historical verifier provenance changed during finalization"
+        )
+    _claim, claim_created = _historical_disposition_claim(
+        finalization_root,
+        outcome=outcome,
+        run_id=attestation_model.run_id,
+        attestation_sha256=attestation_sha256,
+        approval_sha256=approval_sha256,
+        verification_commit=verified_commit,
+        verification_tree=verified_tree,
+        roots=roots,
+    )
+    terminal_path = finalization_root / (
+        "historical-cleanup-schedule.json"
+        if outcome == "delete"
+        else "historical-retention-record.json"
+    )
+    if not claim_created and (terminal_path.exists() or terminal_path.is_symlink()):
+        raise click.ClickException("historical outcome is already finalized")
+    if retention_approval is not None:
+        record = HistoricalRetentionRecord(
+            run_id=attestation_model.run_id,
+            finalized_at=datetime.now(UTC),
+            retention_policy="retain_indefinitely",
+            attestation_sha256=attestation_sha256,
+            retention_approval_sha256=approval_sha256,
+            root_actions={role: "retain" for role in roots},
+            delete_by=None,
+        )
+        atomic_write_model(
+            finalization_root / "historical-retention-record.json",
+            record,
+        )
+        click.echo(record.model_dump_json())
+        return
     inventory = {
         "historical_deletion_inventory_version": 1,
         "run_id": attestation_model.run_id,
         "attestation_sha256": attestation_sha256,
-        "deletion_approval_sha256": deletion_approval_sha256,
+        "deletion_approval_sha256": approval_sha256,
         "roots": [
             root.model_dump(mode="json")
             for root in sorted(roots.values(), key=lambda item: item.role)
@@ -3926,10 +4086,17 @@ def finalize_historical(
             "cleaner_wrapper": attestation_model.cleaner_wrapper.model_dump(mode="json"),
         },
     }
-    inventory_sha = atomic_write_bytes(
-        finalization_root / "historical-deletion-inventory.json",
-        (canonical_json(inventory) + "\n").encode(),
-    )
+    inventory_path = finalization_root / "historical-deletion-inventory.json"
+    inventory_bytes = (canonical_json(inventory) + "\n").encode()
+    try:
+        inventory_sha = atomic_write_bytes(inventory_path, inventory_bytes)
+    except FileExistsError:
+        existing = inventory_path.read_bytes()
+        if existing != inventory_bytes:
+            raise click.ClickException(
+                "historical deletion inventory conflicts with disposition claim"
+            )
+        inventory_sha = hashlib.sha256(existing).hexdigest()
     finalized_at = datetime.now(UTC)
     schedule = HistoricalCleanupScheduleRecord(
         run_id=attestation_model.run_id,
@@ -3940,7 +4107,7 @@ def finalize_historical(
             CollectionManifest,
         ).retention.cleanup_owner,
         attestation_sha256=attestation_sha256,
-        deletion_approval_sha256=deletion_approval_sha256,
+        deletion_approval_sha256=approval_sha256,
         deletion_inventory_sha256=inventory_sha,
         root_actions={
             role: root.retention_action for role, root in roots.items()
@@ -4166,6 +4333,20 @@ def complete_cleanup_historical(
     out: Path,
 ) -> None:
     """Validate cleanup completion for historical compatibility evidence."""
+    disposition_path = schedule.parent / "historical-disposition.json"
+    retention_path = schedule.parent / "historical-retention-record.json"
+    if retention_path.exists() or retention_path.is_symlink():
+        raise click.ClickException(
+            "historical cleanup is forbidden by retain-all disposition"
+        )
+    disposition = load_model(
+        disposition_path,
+        HistoricalDispositionClaim,
+    )
+    if disposition.outcome != "delete":
+        raise click.ClickException(
+            "historical cleanup requires delete disposition"
+        )
     schedule_model = load_model(schedule, HistoricalCleanupScheduleRecord)
     completion_model = load_model(
         completion,
@@ -4183,6 +4364,11 @@ def complete_cleanup_historical(
         or completion_model.deletion_inventory_sha256
         != schedule_model.deletion_inventory_sha256
         or completion_model.completed_at < schedule_model.finalized_at
+        or disposition.run_id != schedule_model.run_id
+        or disposition.attestation_sha256
+        != schedule_model.attestation_sha256
+        or disposition.approval_sha256
+        != schedule_model.deletion_approval_sha256
         or any(
             (
                 schedule_model.root_actions[role] == "delete"

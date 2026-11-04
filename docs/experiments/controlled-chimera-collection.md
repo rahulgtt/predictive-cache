@@ -431,7 +431,12 @@ directories and compares reports and tabular outputs to immutable historical
 artifacts. `finalize-historical` independently proves that the attested
 verifier commit is the supplied merged Git ref and that the source archive
 materializes exactly that tree. Only then, and only with the separate exact
-deletion approval, may it generate the inventory and seven-day schedule.
-Cleanup uses the separate `complete-cleanup-historical` contract, which
-requires deletion of all twelve collection roots and verification that shared
-provider evidence remains retained.
+outcome approval, may it finalize. A deletion approval generates the inventory
+and seven-day schedule. A retain-all approval instead writes an immutable
+`historical-retention-record.json` with every root set to `retain`, a null
+`delete_by`, and no deletion inventory or cleanup schedule. Cleanup uses the
+separate `complete-cleanup-historical` contract only for the deletion outcome.
+Both outcomes first claim the same immutable
+`historical-disposition.json`; once one outcome is claimed, the opposite
+outcome and cleanup completion fail closed. An interrupted same-outcome run may
+resume only while its terminal record or schedule is absent.
