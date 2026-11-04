@@ -61,36 +61,101 @@ class CheckpointProvider(Protocol):
     ) -> list[CollectorDurableEvent]: ...
 
 
+ISOLATED_PROVIDER_BOOTSTRAP = (
+    "import runpy,sys;"
+    "package,script,*args=sys.argv[1:];"
+    "sys.path.insert(0,package);"
+    "sys.argv=[script,*args];"
+    "runpy.run_path(script,run_name='__main__')"
+)
+
+
 class CommandCheckpointProvider:
     """Invoke one trusted collector command for one scheduled checkpoint."""
 
     def __init__(
         self,
         script: Path,
+        package: Path,
         run_dir: Path,
         *,
+        script_sha256: str,
+        package_sha256: str,
         timeout_s: int = 30,
         python_executable: str = "python3",
     ) -> None:
         self.script = script.absolute()
+        self.package = package.absolute()
         self.run_dir = run_dir.absolute()
         self.timeout_s = timeout_s
         self.python_executable = python_executable
+        self._script_fd = self._open_verified(self.script, script_sha256)
+        try:
+            self._package_fd = self._open_verified(
+                self.package,
+                package_sha256,
+            )
+        except BaseException:
+            os.close(self._script_fd)
+            raise
+
+    @staticmethod
+    def _open_verified(path: Path, expected_sha256: str) -> int:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("provider runtime artifact must be a regular file")
+            digest = hashlib.sha256()
+            with os.fdopen(os.dup(fd), "rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            if digest.hexdigest() != expected_sha256:
+                raise ValueError("provider runtime artifact changed before use")
+            os.lseek(fd, 0, os.SEEK_SET)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def close(self) -> None:
+        for name in ("_script_fd", "_package_fd"):
+            fd = getattr(self, name, None)
+            if fd is not None:
+                os.close(fd)
+                setattr(self, name, None)
+
+    def _command(self, action: str, *arguments: str) -> list[str | Path]:
+        if self._script_fd is None or self._package_fd is None:
+            raise RuntimeError("provider runtime artifacts are closed")
+        os.lseek(self._script_fd, 0, os.SEEK_SET)
+        os.lseek(self._package_fd, 0, os.SEEK_SET)
+        return [
+            self.python_executable,
+            "-I",
+            "-S",
+            "-c",
+            ISOLATED_PROVIDER_BOOTSTRAP,
+            f"/proc/self/fd/{self._package_fd}",
+            f"/proc/self/fd/{self._script_fd}",
+            action,
+            self.run_dir,
+            *arguments,
+        ]
 
     def collect(self, scheduled_at: datetime) -> list[Checkpoint]:
         completed = subprocess.run(
-            [
-                self.python_executable,
-                self.script,
+            self._command(
                 "checkpoint",
-                self.run_dir,
                 "--scheduled-at",
                 scheduled_at.isoformat().replace("+00:00", "Z"),
-            ],
+            ),
             check=True,
             capture_output=True,
             text=True,
             timeout=self.timeout_s,
+            pass_fds=(self._script_fd, self._package_fd),
         )
         return [
             Checkpoint.model_validate_json(line)
@@ -100,18 +165,16 @@ class CommandCheckpointProvider:
 
     def health(self, operation: OfferedOperation) -> list[PreReadHealth]:
         completed = subprocess.run(
-            [
-                self.python_executable,
-                self.script,
+            self._command(
                 "probe",
-                self.run_dir,
                 "--operation-id",
                 operation.operation_id,
-            ],
+            ),
             check=True,
             capture_output=True,
             text=True,
             timeout=self.timeout_s,
+            pass_fds=(self._script_fd, self._package_fd),
         )
         return [
             PreReadHealth.model_validate_json(line)
@@ -125,18 +188,16 @@ class CommandCheckpointProvider:
         result: ExecutionResult,
     ) -> list[CollectorDurableEvent]:
         completed = subprocess.run(
-            [
-                self.python_executable,
-                self.script,
+            self._command(
                 "post-read",
-                self.run_dir,
                 "--operation-id",
                 operation.operation_id,
-            ],
+            ),
             check=True,
             capture_output=True,
             text=True,
             timeout=self.timeout_s,
+            pass_fds=(self._script_fd, self._package_fd),
         )
         return [
             CollectorDurableEvent.model_validate_json(line)
@@ -457,7 +518,7 @@ def _validate_provider_event(
     result: ExecutionResult,
     event: CollectorDurableEvent,
     checkpoint_identities: set[tuple[str, str, str, str]],
-) -> None:
+) -> dict:
     if event.run_id != manifest.run_id:
         raise RuntimeError("provider event run identity mismatch")
     if event.durable_at < operation.offered_at_utc or event.durable_at >= manifest.end_time:
@@ -611,6 +672,19 @@ def _validate_provider_event(
         actual = {name: getattr(event, name) for name in expected}
         if actual != expected:
             raise RuntimeError("provider sidecar fields differ from hashed raw record")
+        event_time = datetime.fromtimestamp(
+            canonical_uint_string(raw["event_time_ns"]) / 1_000_000_000,
+            UTC,
+        )
+        sink_time = datetime.fromtimestamp(
+            canonical_uint_string(raw["sink_time_ns"]) / 1_000_000_000,
+            UTC,
+        )
+        if (
+            not manifest.start_time <= event_time < manifest.end_time
+            or event_time > sink_time
+        ):
+            raise ValueError("raw event time is outside the approved run ordering")
     except (
         FileNotFoundError,
         IndexError,
@@ -620,6 +694,7 @@ def _validate_provider_event(
         ValueError,
     ) as error:
         raise RuntimeError("provider raw source is unavailable") from error
+    return raw
 
 
 def build_operation(

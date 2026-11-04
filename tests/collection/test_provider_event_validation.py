@@ -77,13 +77,15 @@ def evidence(tmp_path):
     schema.chmod(0o600)
     raw_dir = root / "collector" / POD / EPOCH
     raw_dir.mkdir(parents=True)
+    event_time_ns = int((START + timedelta(milliseconds=10)).timestamp() * 1_000_000_000)
+    sink_time_ns = int((START + timedelta(milliseconds=20)).timestamp() * 1_000_000_000)
     raw = (
         '{"client_ref":"'
         + ("c" * 64)
         + '","compound_op_index":0,"compound_tag_b64":"","compound_tag_id":"'
         + hashlib.sha256(b"").hexdigest()
         + '","compound_tag_original_length":0,"compound_tag_truncated":false,'
-        '"eof":false,"event_time_ns":"1","export_id":7,'
+        f'"eof":false,"event_time_ns":"{event_time_ns}","export_id":7,'
         '"export_name_b64":"Y29udHJvbGxlZA","file_id":"'
         + FILE
         + '","file_size":"4096","file_size_valid":true,'
@@ -95,7 +97,7 @@ def evidence(tmp_path):
         + EPOCH
         + '","producer_sequence":"1","requested_count":4096,'
         '"requested_offset":"0","returned_bytes":4096,"sequence_id":0,'
-        '"session_ref":"","sink_time_ns":"1","slot_id":0,'
+        f'"session_ref":"","sink_time_ns":"{sink_time_ns}","slot_id":0,'
         '"schema":"nfs4_read_v2","target_created_ns":"1","target_fh":"AA",'
         '"volume_id":"'
         + VOLUME
@@ -141,7 +143,7 @@ def evidence(tmp_path):
         producer_epoch=EPOCH,
         producer_sequence=1,
         server_operation_id="9" * 64,
-        sink_time_ns=1,
+        sink_time_ns=sink_time_ns,
         volume_id=VOLUME,
         file_id=FILE,
         export_id=7,
@@ -245,7 +247,14 @@ def test_provider_event_rejects_tamper_epoch_tag_and_status(tmp_path):
 
 @pytest.mark.parametrize(
     "mutation",
-    ["missing", "extra", "wrong_origin", "padded_base64url", "noncanonical_base64url"],
+    [
+        "missing",
+        "extra",
+        "wrong_origin",
+        "padded_base64url",
+        "noncanonical_base64url",
+        "wrong_event_time",
+    ],
 )
 def test_provider_event_rejects_schema_and_trust_mismatch(tmp_path, mutation):
     operation, result, event, identities = evidence(tmp_path)
@@ -258,8 +267,10 @@ def test_provider_event_rejects_schema_and_trust_mismatch(tmp_path, mutation):
         raw["origin_claim"] = "controlled_demand"
     elif mutation == "padded_base64url":
         raw["target_fh"] = "AA=="
-    else:
+    elif mutation == "noncanonical_base64url":
         raw["target_fh"] = "AB"
+    else:
+        raw["event_time_ns"] = "2"
     mutated = rewrite_raw(tmp_path, event, raw)
     with pytest.raises(RuntimeError, match="unavailable"):
         _validate_provider_event(

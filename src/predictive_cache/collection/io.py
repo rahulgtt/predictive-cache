@@ -15,6 +15,18 @@ from pydantic import BaseModel
 T = TypeVar("T", bound=BaseModel)
 
 
+def strict_json_loads(value: str):
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = item
+        return result
+
+    return json.loads(value, object_pairs_hook=unique_object)
+
+
 def canonical_json(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -141,7 +153,7 @@ def read_models(path: Path, model: type[T]) -> list[T]:
     with path.open("r", encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, start=1):
             try:
-                raw = json.loads(line)
+                raw = strict_json_loads(line)
                 records.append(model.model_validate(raw))
             except (json.JSONDecodeError, ValueError) as error:
                 raise ValueError(f"{path}:{line_number}: invalid evidence record") from error

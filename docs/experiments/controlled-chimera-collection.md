@@ -166,7 +166,7 @@ Use only the owner-approved frozen provider package:
 
 | Artifact | SHA-256 |
 | --- | --- |
-| Package manifest | `3c6d3a4cb164cc4df87c36480dab49621e140f9307a170e393233eb8221feece` |
+| Provider package archive | `3c6d3a4cb164cc4df87c36480dab49621e140f9307a170e393233eb8221feece` |
 | Provider | `51d92af0b0beab61ac77dd4dd7b5d19cd9a4fd83e4a709e74582b3be244682d4` |
 | Shared collector | `09158174889f25a6abd7a70a33d24ad1d2efaba3f8ec935e0d5344eba5959225` |
 | Validator | `8d3dc5aad205c6fca55aa8b7c34e933906ca3f7758befb9c1bdf1d835c53e7da` |
@@ -183,6 +183,7 @@ python -m predictive_cache.collection.cli run \
   --run-dir "$VALIDATION_RUN_DIR" \
   --mount-root /already/mounted/export \
   --checkpoint-command "$PRIVATE_PROVIDER_SCRIPT" \
+  --provider-package "$PRIVATE_PROVIDER_PACKAGE" \
   --validation-operations 1 \
   --adapter-command "$INTEGRATED_ADAPTER" \
   --cleaner-command "$INTEGRATED_CLEANER"
@@ -236,9 +237,12 @@ The hashed deletion inventory includes exact raw chunks plus private
 `manifest.json`, `fixture-catalog.json`, offered/execution ledgers, durable and
 canonical event sidecars, source envelope, health/checkpoint evidence and
 reconciliation output when present. Bounded provider-backed validation has no
-independent finalizer or deletion deadline: retain its separate owner-only
-evidence root until full dataset finalization, then include that independently
-path- and hash-verified root in the same inventory and seven-day cleanup.
+independent finalizer or deletion deadline. Its attestation retains a distinct
+validation run ID and candidate-manifest identity and binds the validated
+commit/tree/source archive, permit prefix, approved provider stack, wrappers,
+contracts and PASS outputs. Retain its four original owner-only roots until
+full dataset finalization. At that point, inventory those four roots and the
+live run's four roots independently under one seven-day cleanup schedule.
 Repository-tracked provenance/schema contracts and sanitized validation
 summaries are outside that private deletion inventory.
 
@@ -332,21 +336,59 @@ python -m predictive_cache.collection.cli finalize \
   --run-dir /tmp/pcache-controlled-run \
   --dataset-report /private/path/validated-dataset-report.json \
   --dataset-root /private/path/validated-dataset \
-  --validation-evidence-root /private/path/bounded-validation-evidence
+  --finalization-root /private/path/finalization-control \
+  --bounded-validation-attestation \
+    /private/path/finalization-control/validation-attestation.json \
+  --cleanup-root bounded_harness_evidence=/private/path/bounded-harness \
+  --cleanup-root bounded_provider_evidence=/private/path/bounded-provider \
+  --cleanup-root bounded_adapter_dataset=/private/path/bounded-adapter \
+  --cleanup-root bounded_clean_dataset=/private/path/bounded-clean \
+  --cleanup-root live_harness_evidence=/private/path/live-harness \
+  --cleanup-root live_provider_evidence=/private/path/live-provider \
+  --cleanup-root live_adapter_dataset=/private/path/live-adapter \
+  --cleanup-root live_clean_dataset=/private/path/validated-dataset
 ```
 
 Finalization starts the retention deadline only after it re-hashes every
 declared dataset output and validation-provenance file and confirms that those
-declarations exactly cover the owner-only dataset root. It independently
-inventories the separate bounded-validation evidence root. That root must
-contain `validation-manifest.json`, which binds the full run-manifest hash,
-approved package/provider/collector/validator/runbook hashes, successful real
-provider-backed status, an operation count from one through three, and exact
-hashes for every other file in the root. Relative or non-normalized roots,
-symlink traversal, nonregular files, unsafe modes, missing outputs and forged
-or stale hashes fail closed. Finalization also requires successful canonical
-reconciliation whose manifest, offered-ledger and observed hashes match fresh
-run files and whose counts cover all 300 offers.
+declarations exactly cover the owner-only live clean dataset. The bounded
+attestation remains separate from the live manifest/reconciliation and cannot
+satisfy a live field. The live dataset report declares its own four roots,
+manifest, reconciliation, adapter manifest and cleaned manifest. All eight
+roots are re-inventoried by canonical path, path hash, device/inode, kind,
+per-file hash/mode and root-manifest hash. Missing/extra roots, nesting,
+aliases, symlinks, nonregular files, unsafe modes, root-kind swaps, copied
+substitutes and stale hashes fail closed. Finalization also requires successful
+canonical reconciliation whose manifest, offered-ledger and observed hashes
+match fresh live files and whose counts cover all 300 offers.
+Both bounded and live provider declarations must bind the approved package,
+provider, collector, validator, absolute interpreter and fixed argument
+contract. The harness writes `provider-invocation.json` before collection and
+binds its run, manifest, interpreter, snapshot, actions and argument contract.
+Finalization re-hashes the actual interpreter, the inventoried
+package/collector/validator artifacts and the
+`.approved-tools/checkpoint-provider` snapshot from the inventoried harness
+root; a replaced artifact, altered invocation or declaration-only hash fails
+closed. The package archive and entry script are copied into the run-local
+`.approved-tools` root and executed with Python isolated mode (`-I -S`) and a
+fixed bootstrap path, so caller `PYTHONPATH`, user site packages and
+`sitecustomize` cannot substitute provider modules.
+Adapter and clean event files must use canonical
+`volume_id=<id>/date=<UTC-date>/part-00000` partitions whose identity, date and
+row order match their contents. Per-day clean summaries are derived exactly
+from those adapter rows, and duplicate JSON object keys are rejected in every
+JSONL evidence record. The complete raw identity set must equal the durable and
+observed identity set; an otherwise valid contiguous extra raw event fails
+finalization. The actual `collector/` regular-file inventory must also exactly
+equal the source manifest and provider chunk references; extra, missing,
+symlinked or unexpectedly nested chunks fail. Clean output accepts only exact
+declared artifact classes such
+as `events_clean/`, `excluded/`, `coverage/` and `validation.json`; lookalike
+prefixes are rejected.
+The bounded attestation and finalizer-generated deletion inventory/schedule
+reside in a separate owner-only control directory, outside all eight evidence
+roots. This avoids self-referential manifests and prevents finalization from
+changing a root after its complete snapshot.
 Duplicate, missing, unexpected or unknown events and unapproved exclusions
 fail closed. A declared exclusion reason may explain a gap, but remains visible
 in the report.

@@ -1,26 +1,45 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
+import shutil
 import stat
+import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
+import click
 import pytest
+import yaml
 from click.testing import CliRunner
 from pydantic import ValidationError
 
 from predictive_cache.collection.cli import (
-    APPROVED_COLLECTOR_SHA256,
-    APPROVED_PROVIDER_PACKAGE_SHA256,
-    APPROVED_PROVIDER_SHA256,
-    APPROVED_VALIDATION_RUNBOOK_SHA256,
-    APPROVED_VALIDATOR_SHA256,
+    APPROVED_VALIDATED_CODE_HEAD_SHA256,
+    APPROVED_VALIDATED_MERGE_COMMIT_SHA256,
+    APPROVED_VALIDATED_TREE_SHA256,
+    _approved_executable,
+    _artifact_rows,
+    _cleanup_root,
+    _manifest_profile,
+    _open_verified_fd,
+    _validate_clean_artifact_contract,
+    _validate_clean_daily_summary,
+    _validate_dataset_artifacts,
+    _validate_exact_raw_identities,
+    _validate_full_profile,
+    _validate_live_row_chain,
+    _validate_partitioned_rows,
+    _validate_provider_provenance,
     main,
 )
 from predictive_cache.collection.harness import (
+    ISOLATED_PROVIDER_BOOTSTRAP,
     CollectionRunner,
     CommandCheckpointProvider,
     DirectMountExecutor,
@@ -41,26 +60,39 @@ from predictive_cache.collection.io import (
 )
 from predictive_cache.collection.models import (
     AdapterValidationPermit,
+    BoundedCleanReport,
+    BoundedValidationAttestation,
     Checkpoint,
     CleanupCompletionRecord,
+    CleanupEvidenceReference,
     CleanupScheduleRecord,
     CollectionManifest,
     CollectorDurableEvent,
     CollectorFileManifest,
     CollectorSourceFile,
+    DatasetArtifact,
     DropCounters,
     ExecutionResult,
     FixtureCatalog,
     FixtureEntry,
     JsonlEvidence,
+    LiveCleanManifest,
+    LiveCleanReport,
+    LiveCoverageRow,
+    LiveFinalizationDeclaration,
+    LiveProviderDeclaration,
     ObservedEvent,
     OfferedOperation,
     PreReadHealth,
+    ProviderInvocationRecord,
     ReconciliationReport,
     RetentionPolicy,
     SoftwareVersions,
     StopRules,
 )
+from predictive_cache.datagen.io import config_hash
+from predictive_cache.prep.clean.report import render_summary
+from predictive_cache.prep.config import CleanConfig
 
 START = datetime(2026, 11, 4, tzinfo=UTC)
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
@@ -328,13 +360,21 @@ class FakeProvider:
         raw_path = self.root / relative
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         event_id = f"{operation.operation_index + 1:08x}-0000-4000-8000-000000000000"
+        event_time_ns = int(
+            (operation.offered_at_utc + timedelta(milliseconds=10)).timestamp()
+            * 1_000_000_000
+        )
+        sink_time_ns = int(
+            (operation.offered_at_utc + timedelta(milliseconds=20)).timestamp()
+            * 1_000_000_000
+        )
         raw_record = (
             '{"client_ref":"'
             + ("c" * 64)
             + '","compound_op_index":0,"compound_tag_b64":"","compound_tag_id":"'
             + hashlib.sha256(b"").hexdigest()
             + '","compound_tag_original_length":0,"compound_tag_truncated":false,'
-            '"eof":false,"event_time_ns":"1",'
+            f'"eof":false,"event_time_ns":"{event_time_ns}",'
             f'"export_id":{operation.export_id},"export_name_b64":"Y29udHJvbGxlZA",'
             f'"file_id":"{operation.file_id}","file_size":"{operation.file_size}",'
             f'"file_size_valid":true,"local_id":"{event_id}",'
@@ -344,7 +384,7 @@ class FakeProvider:
             f'"outcome":"success","producer_epoch":"{EPOCH}",'
             f'"producer_sequence":"{operation.operation_index + 1}",'
             f'"requested_count":{operation.count},"requested_offset":"{operation.offset}",'
-            f'"returned_bytes":{result.bytes_read},"sink_time_ns":"{operation.operation_index}",'
+            f'"returned_bytes":{result.bytes_read},"sink_time_ns":"{sink_time_ns}",'
             f'"schema":"nfs4_read_v2","sequence_id":0,"session_ref":"","slot_id":0,'
             f'"target_created_ns":"1","target_fh":"AA",'
             f'"volume_id":"{operation.volume_id}"}}'
@@ -360,7 +400,7 @@ class FakeProvider:
                 producer_epoch=EPOCH,
                 producer_sequence=operation.operation_index + 1,
                 server_operation_id=f"{operation.operation_index + 900:064x}",
-                sink_time_ns=operation.operation_index,
+                sink_time_ns=sink_time_ns,
                 volume_id=operation.volume_id,
                 file_id=operation.file_id,
                 export_id=operation.export_id,
@@ -398,6 +438,63 @@ def test_manifest_requires_exact_five_hours_and_explicit_rate():
         )
 
 
+def test_bounded_and_live_manifest_profiles_allow_only_run_identity_and_time_changes():
+    live = manifest(seed=32)
+    candidate = live.model_copy(
+        update={
+            "run_id": "bounded-validation",
+            "run_ref": hashlib.sha256(b"bounded-validation").hexdigest()[:32],
+            "start_time": live.start_time + timedelta(days=1),
+            "end_time": live.end_time + timedelta(days=1),
+        }
+    )
+    assert _manifest_profile(candidate) == _manifest_profile(live)
+    for update in (
+        {"cluster_id": "other-cluster"},
+        {"seed": 33},
+        {"offered_count": live.offered_count - 1},
+        {"fixture_catalog_sha256": "0" * 64},
+        {
+            "software": live.software.model_copy(
+                update={"chimera_image_sha256": "0" * 64}
+            )
+        },
+        {
+            "stop_rules": live.stop_rules.model_copy(
+                update={"latency_guardrail_ms": live.stop_rules.latency_guardrail_ms + 1}
+            )
+        },
+        {
+            "retention": live.retention.model_copy(
+                update={"cleanup_owner": "different-owner"}
+            )
+        },
+    ):
+        assert _manifest_profile(candidate.model_copy(update=update)) != _manifest_profile(
+            live
+        )
+
+
+def test_full_profile_allows_arbitrary_start_with_exact_five_hour_duration():
+    live_catalog, live = live_catalog_manifest()
+    shifted = live.model_copy(
+    update={
+        "start_time": live.start_time + timedelta(minutes=30),
+        "end_time": live.end_time + timedelta(minutes=30),
+    }
+    )
+    _validate_full_profile(shifted)
+    operations = planned_operations(shifted, live_catalog)
+    buckets = Counter(
+    (shifted.start_time + timedelta(minutes=index)).replace(
+        minute=0, second=0, microsecond=0
+    )
+    for index in range(len(operations))
+    )
+    assert len(buckets) == 6
+    assert sum(buckets.values()) == 300
+
+
 def test_cleanup_deadline_is_created_only_after_finalization():
     schedule = CleanupScheduleRecord(
         run_id="controlled-001",
@@ -423,8 +520,133 @@ def test_cleanup_deadline_is_created_only_after_finalization():
         completed_at=START + timedelta(days=1),
         cleanup_owner="experiment-owner",
         evidence="private evidence removed",
+        schedule_sha256="c" * 64,
+        validation_report_sha256=schedule.validation_report_sha256,
+        deletion_inventory_sha256=schedule.deletion_inventory_sha256,
+        root_dispositions={
+            kind: "deleted"
+            for kind in (
+                "bounded_harness_evidence",
+                "bounded_provider_evidence",
+                "bounded_adapter_dataset",
+                "bounded_clean_dataset",
+                "live_harness_evidence",
+                "live_provider_evidence",
+                "live_adapter_dataset",
+                "live_clean_dataset",
+            )
+        },
     )
     assert completion.completed_at < completion.delete_by
+    with pytest.raises(ValidationError, match="must not exceed"):
+        completion.model_copy(
+            update={"completed_at": schedule.delete_by + timedelta(seconds=1)}
+        ).__class__.model_validate(
+            completion.model_dump()
+            | {"completed_at": schedule.delete_by + timedelta(seconds=1)}
+        )
+    with pytest.raises(ValidationError, match="all eight roots"):
+        CleanupCompletionRecord(
+            run_id="controlled-001",
+            delete_by=schedule.delete_by,
+            completed_at=START + timedelta(days=1),
+            cleanup_owner="experiment-owner",
+            evidence="incomplete cleanup",
+            schedule_sha256="c" * 64,
+            validation_report_sha256=schedule.validation_report_sha256,
+            deletion_inventory_sha256=schedule.deletion_inventory_sha256,
+            root_dispositions={"live_harness_evidence": "deleted"},
+        )
+
+
+def test_cleanup_completion_command_binds_immutable_schedule(tmp_path):
+    root = private_dir(tmp_path)
+    schedule_path = root / "cleanup-schedule.json"
+    schedule = CleanupScheduleRecord(
+        run_id="controlled-001",
+        finalized_at=START,
+        delete_by=START + timedelta(days=7),
+        cleanup_owner="experiment-owner",
+        validation_report_sha256="a" * 64,
+        deletion_inventory_sha256="b" * 64,
+    )
+    atomic_write_model(schedule_path, schedule)
+    completion = CleanupCompletionRecord(
+        run_id=schedule.run_id,
+        delete_by=schedule.delete_by,
+        completed_at=START + timedelta(days=1),
+        cleanup_owner=schedule.cleanup_owner,
+        evidence="all roots deleted",
+        schedule_sha256=sha256(schedule_path),
+        validation_report_sha256=schedule.validation_report_sha256,
+        deletion_inventory_sha256=schedule.deletion_inventory_sha256,
+        root_dispositions={
+            kind: "deleted"
+            for kind in (
+                "bounded_harness_evidence",
+                "bounded_provider_evidence",
+                "bounded_adapter_dataset",
+                "bounded_clean_dataset",
+                "live_harness_evidence",
+                "live_provider_evidence",
+                "live_adapter_dataset",
+                "live_clean_dataset",
+            )
+        },
+    )
+    completion_path = root / "completion.json"
+    atomic_write_model(completion_path, completion)
+    result = CliRunner().invoke(
+        main,
+        [
+            "complete-cleanup",
+            "--schedule",
+            str(schedule_path),
+            "--completion",
+            str(completion_path),
+            "--out",
+            str(root / "cleanup-completion.json"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    bad = completion.model_copy(update={"delete_by": schedule.delete_by + timedelta(days=1)})
+    bad_path = root / "bad-completion.json"
+    atomic_write_model(bad_path, bad)
+    result = CliRunner().invoke(
+        main,
+        [
+            "complete-cleanup",
+            "--schedule",
+            str(schedule_path),
+            "--completion",
+            str(bad_path),
+            "--out",
+            str(root / "bad-output.json"),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "does not match schedule" in result.output
+
+
+def test_reconciliation_success_cannot_hide_failure_details():
+    values = {
+        "run_id": "controlled-001",
+        "manifest_sha256": "a" * 64,
+        "ledger_sha256": "b" * 64,
+        "observed_sha256": "c" * 64,
+        "offered_count": 1,
+        "unique_durable_count": 1,
+        "duplicate_operation_ids": (),
+        "missing_operation_ids": ("d" * 64,),
+        "unexpected_operation_ids": (),
+        "unknown_event_ids": (),
+        "exclusions": {},
+        "pod_epochs": {},
+        "success": True,
+        "failures": (),
+    }
+    with pytest.raises(ValidationError, match="success conflicts"):
+        ReconciliationReport(**values)
 
 
 def test_generation_is_deterministic_and_ids_cover_range_inputs():
@@ -1109,16 +1331,23 @@ def test_frozen_manifest_and_cli_complete_without_live_io(tmp_path):
     } == {"simulated"}
 
 
-def _finalization_fixture(tmp_path: Path):
+def _finalization_fixture(tmp_path: Path, monkeypatch):
     tmp_path.mkdir(parents=True, exist_ok=True)
     source = FIXTURE_DIR
     live_manifest = json.loads((source / "frozen-manifest.json").read_text())
     live_manifest["offered_count"] = 300
     live_manifest["offered_rate_per_s"] = 1 / 60
     live_manifest["stop_rules"]["latency_guardrail_ms"] = 5000
+    live_catalog, _ = live_catalog_manifest()
+    live_manifest["fixture_catalog_sha256"] = catalog_sha256(live_catalog)
     manifest_path = tmp_path / "live-manifest.json"
     manifest_path.write_text(json.dumps(live_manifest) + "\n")
     manifest_path.chmod(0o600)
+    catalog_path = tmp_path / "live-catalog.json"
+    catalog_path.write_text(
+        json.dumps(live_catalog.model_dump(mode="json")) + "\n"
+    )
+    catalog_path.chmod(0o600)
     run_dir = tmp_path / "run"
     result = CliRunner().invoke(
         main,
@@ -1127,7 +1356,7 @@ def _finalization_fixture(tmp_path: Path):
             "--manifest",
             str(manifest_path),
             "--catalog",
-            str(source / "frozen-catalog.json"),
+            str(catalog_path),
             "--cluster-provenance",
             str(CONTRACT_DIR / "cluster-provenance-v1.json"),
             "--event-schema",
@@ -1139,21 +1368,246 @@ def _finalization_fixture(tmp_path: Path):
         ],
     )
     assert result.exit_code == 0, result.output
+    live_manifest_model = CollectionManifest.model_validate(live_manifest)
+    planned = planned_operations(live_manifest_model, live_catalog)
+    offered_rows = []
+    execution_rows = []
+    durable_rows = []
+    observed_rows = []
+    raw_lines = []
+    raw_relative = Path("collector") / POD_UID / EPOCH / "events.jsonl"
+    raw_path = run_dir / raw_relative
+    raw_path.parent.mkdir(parents=True, mode=0o700)
+    for index, item in enumerate(planned):
+        offered = build_operation(
+            live_manifest_model,
+            item,
+            offered_at=START + timedelta(minutes=index),
+            monotonic_ns=index + 1,
+            timing_mode="wallclock",
+        )
+        offered_rows.append(offered)
+        completed = offered.offered_at_utc + timedelta(seconds=1)
+        execution_rows.append(
+            ExecutionResult(
+                operation_id=offered.operation_id,
+                completed_at_utc=completed,
+                status="ok",
+                bytes_read=offered.count,
+                latency_ms=10,
+                supervised_latency_ms=100,
+                content_sha256=hashlib.sha256(
+                    f"content-{index}".encode()
+                ).hexdigest(),
+                executor_kind="direct-mount",
+                filesystem_type="nfs4",
+            )
+        )
+        event_id = str(uuid.UUID(int=index + 1))
+        server_operation_id = hashlib.sha256(
+            f"server-{index}".encode()
+        ).hexdigest()
+        event_ns = int((offered.offered_at_utc + timedelta(milliseconds=10)).timestamp() * 1e9)
+        sink_ns = int((offered.offered_at_utc + timedelta(milliseconds=20)).timestamp() * 1e9)
+        raw = {
+            "schema": "nfs4_read_v2",
+            "local_id": event_id,
+            "producer_epoch": EPOCH,
+            "producer_sequence": str(index + 1),
+            "event_time_ns": str(event_ns),
+            "sink_time_ns": str(sink_ns),
+            "target_created_ns": "1",
+            "volume_id": offered.volume_id,
+            "file_id": offered.file_id,
+            "identity_valid": True,
+            "export_name_b64": base64.urlsafe_b64encode(b"/controlled")
+            .rstrip(b"=")
+            .decode(),
+            "export_id": offered.export_id,
+            "target_fh": "AA",
+            "operation_id": server_operation_id,
+            "client_ref": "c" * 64,
+            "session_ref": "",
+            "compound_op_index": 0,
+            "slot_id": 0,
+            "sequence_id": index + 1,
+            "compound_tag_b64": "",
+            "compound_tag_original_length": 0,
+            "compound_tag_truncated": False,
+            "compound_tag_id": hashlib.sha256(b"").hexdigest(),
+            "origin_claim": "unknown",
+            "origin_trust": "client_asserted",
+            "requested_offset": str(offered.offset),
+            "requested_count": offered.count,
+            "returned_bytes": offered.count,
+            "nfs_status": 0,
+            "outcome": "success",
+            "eof": False,
+            "file_size_valid": True,
+            "file_size": str(offered.file_size),
+        }
+        raw_line = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
+        raw_lines.append(raw_line)
+        durable_at = offered.offered_at_utc + timedelta(seconds=2)
+        durable_rows.append(
+            CollectorDurableEvent(
+                run_id=offered.run_id,
+                event_id=event_id,
+                pod_name="collector-0",
+                pod_uid=POD_UID,
+                node_name="node-1",
+                producer_epoch=EPOCH,
+                producer_sequence=index + 1,
+                server_operation_id=server_operation_id,
+                sink_time_ns=sink_ns,
+                volume_id=offered.volume_id,
+                file_id=offered.file_id,
+                export_id=offered.export_id,
+                export_name="/controlled",
+                offset=offered.offset,
+                count=offered.count,
+                returned_bytes=offered.count,
+                nfs_status=0,
+                outcome="success",
+                eof=False,
+                durable_at=durable_at,
+                tag="",
+                raw_jsonl_path=raw_relative.as_posix(),
+                raw_jsonl_sha256="0" * 64,
+                raw_line_number=index + 1,
+                raw_record_sha256=hashlib.sha256(raw_line).hexdigest(),
+            )
+        )
+        observed_rows.append(
+            ObservedEvent(
+                operation_id=offered.operation_id,
+                event_id=event_id,
+                pod_uid=POD_UID,
+                producer_epoch=EPOCH,
+                producer_sequence=index + 1,
+                server_operation_id=server_operation_id,
+                sink_time_ns=sink_ns,
+                volume_id=offered.volume_id,
+                file_id=offered.file_id,
+                offset=offered.offset,
+                count=offered.count,
+                durable_at=durable_at,
+                status="durable",
+                tag=None,
+            )
+        )
+    raw_path.write_bytes(b"\n".join(raw_lines) + b"\n")
+    raw_path.chmod(0o600)
+    raw_hash = sha256(raw_path)
+    durable_rows = [
+        row.model_copy(update={"raw_jsonl_sha256": raw_hash})
+        for row in durable_rows
+    ]
+    source_files = (
+        CollectorSourceFile(
+            raw_jsonl_path=raw_relative.as_posix(),
+            sha256=raw_hash,
+            pod_name="collector-0",
+            pod_uid=POD_UID,
+            node_name="node-1",
+            producer_epoch=EPOCH,
+        ),
+    )
     atomic_write_model(
         run_dir / "collector-file-manifest.json",
-        source_manifest(run_dir, run_id="controlled-demo"),
+        CollectorFileManifest(run_id="controlled-demo", files=source_files),
     )
-    for name in (
-        "offered.jsonl",
-        "execution.jsonl",
-        "durable-events.jsonl",
-        "observed.jsonl",
-        "pre-read-health.jsonl",
-        "checkpoints.jsonl",
-    ):
-        path = run_dir / name
-        path.write_text("{}\n")
-        path.chmod(0o600)
+    write_jsonl(run_dir / "offered.jsonl", offered_rows)
+    write_jsonl(run_dir / "execution.jsonl", execution_rows)
+    write_jsonl(run_dir / "durable-events.jsonl", durable_rows)
+    write_jsonl(run_dir / "observed.jsonl", observed_rows)
+    checkpoints = []
+    active = JsonlEvidence(
+        path=raw_relative.as_posix(),
+        size_bytes=raw_path.stat().st_size,
+        sha256=raw_hash,
+    )
+    for checkpoint_index in range(21):
+        scheduled = START + timedelta(minutes=15 * checkpoint_index)
+        synced = sum(row.durable_at <= scheduled for row in durable_rows)
+        checkpoints.append(
+            Checkpoint(
+                run_id="controlled-demo",
+                scheduled_at=scheduled,
+                captured_at=scheduled,
+                pod_name="collector-0",
+                pod_uid=POD_UID,
+                node_name="node-1",
+                producer_epoch=EPOCH,
+                restart_count=0,
+                last_enqueued_sequence=synced,
+                last_synced_sequence=synced,
+                synced_count=synced,
+                queue_depth=0,
+                worker_in_flight=0,
+                delivery_clean=1,
+                barrier_ready=1,
+                drops=DropCounters(
+                    queue=0,
+                    encode=0,
+                    sink=0,
+                    rollback=0,
+                    rotation=0,
+                ),
+                active_jsonl=active,
+                collector_sink_healthy=True,
+                storage_healthy=True,
+                cluster_healthy=True,
+                volume_healthy=True,
+                export_healthy=True,
+                parse_errors=0,
+                identity_mismatches=0,
+                checksum_mismatches=0,
+                foreground_read_errors=0,
+                max_observed_latency_ms=10,
+            )
+        )
+    write_jsonl(run_dir / "checkpoints.jsonl", checkpoints)
+    write_jsonl(
+        run_dir / "pre-read-health.jsonl",
+        [
+            PreReadHealth(
+                run_id=offered.run_id,
+                operation_id=offered.operation_id,
+                captured_at=offered.offered_at_utc + timedelta(milliseconds=500),
+                pod_name="collector-0",
+                pod_uid=POD_UID,
+                node_name="node-1",
+                producer_epoch=EPOCH,
+                last_enqueued_sequence=index,
+                last_synced_sequence=index,
+                synced_count=index,
+                queue_depth=0,
+                worker_in_flight=0,
+                delivery_clean=1,
+                barrier_ready=1,
+                drops=DropCounters(
+                    queue=0,
+                    encode=0,
+                    sink=0,
+                    rollback=0,
+                    rotation=0,
+                ),
+                collector_sink_healthy=True,
+                storage_healthy=True,
+                cluster_healthy=True,
+                volume_healthy=True,
+                export_healthy=True,
+                parse_errors=0,
+                identity_mismatches=0,
+                checksum_mismatches=0,
+                foreground_read_errors=0,
+            )
+            for index, offered in enumerate(offered_rows)
+        ],
+    )
+    for directory in (path for path in run_dir.rglob("*") if path.is_dir()):
+        directory.chmod(0o700)
     atomic_write_model(
         run_dir / "reconciliation.json",
         ReconciliationReport(
@@ -1175,57 +1629,1633 @@ def _finalization_fixture(tmp_path: Path):
     )
     dataset_root = tmp_path / "dataset"
     dataset_root.mkdir(mode=0o700)
-    output = dataset_root / "events.jsonl"
-    output.write_text('{"event":"ok"}\n')
+    output = (
+        dataset_root
+        / "events_clean"
+        / f"volume_id={live_manifest['volume_id']}"
+        / "date=2026-11-04"
+        / "part-00000.jsonl"
+    )
+    output.parent.mkdir(parents=True, mode=0o700)
+    output.write_text("")
     output.chmod(0o600)
     provenance = dataset_root / "validation.json"
     provenance.write_text('{"status":"passed"}\n')
     provenance.chmod(0o600)
-    validation_root = tmp_path / "validation-evidence"
-    validation_root.mkdir(mode=0o700)
-    provider = validation_root / "provider.jsonl"
-    provider.write_text('{"provider":"ok"}\n')
-    provider.chmod(0o600)
-    validation_manifest = validation_root / "validation-manifest.json"
-    validation_manifest.write_text(
+    clean_manifest = dataset_root / "manifest.json"
+
+    def evidence_root(name, files):
+        root = tmp_path / name
+        root.mkdir(mode=0o700)
+        for path, content in files.items():
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            for directory in (
+                parent
+                for parent in (target.parent, *target.parent.parents)
+                if parent == root or root in parent.parents
+            ):
+                directory.chmod(0o700)
+            target.write_text(content)
+            target.chmod(0o600)
+        return root
+
+    def add_clean_auxiliary(root, volume_id, date, report):
+        created = []
+        for relative in (
+            f"opens/volume_id={volume_id}/date={date}/part-00000.jsonl",
+            f"open_ranges/volume_id={volume_id}/date={date}/part-00000.jsonl",
+            f"meta/volume_id={volume_id}/part-00000.jsonl",
+        ):
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("")
+            target.chmod(0o600)
+            created.append(target)
+        config = CleanConfig()
+        config_path = root / "config.resolved.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {"clean": config.model_dump(mode="json")},
+                sort_keys=True,
+            )
+        )
+        config_path.chmod(0o600)
+        summary_path = root / "report/summary.md"
+        summary_path.write_text(render_summary(report))
+        summary_path.chmod(0o600)
+        created.extend((config_path, summary_path))
+        return config_hash(config), created
+
+    candidate_manifest = json.loads(json.dumps(live_manifest))
+    candidate_manifest["run_id"] = "bounded-validation"
+    candidate_manifest["run_ref"] = hashlib.sha256(
+        b"bounded-validation"
+    ).hexdigest()[:32]
+    bounded_harness = evidence_root(
+        "bounded-harness",
+        {
+            "candidate-manifest.json": json.dumps(candidate_manifest) + "\n",
+            "cluster-provenance-v1.json": (
+                CONTRACT_DIR / "cluster-provenance-v1.json"
+            ).read_text(),
+            "event-schema-v2.json": (
+                CONTRACT_DIR / "nfs4-read-v2.schema.json"
+            ).read_text(),
+            "budget-evidence-v1.json": (
+                FIXTURE_DIR / "budget-evidence-v1.json"
+            ).read_text(),
+            "fixture-catalog.json": (run_dir / "fixture-catalog.json").read_text(),
+            "source-archive.tar.gz": "source archive\n",
+            "adapter-wrapper": "adapter wrapper\n",
+            "cleaner-wrapper": "cleaner wrapper\n",
+            ".approved-tools/checkpoint-provider": "provider\n",
+            ".approved-tools/provider-package.zip": "provider package\n",
+        },
+    )
+    bounded_provider = evidence_root(
+        "bounded-provider",
+        {
+            "provider-package.json": "provider package\n",
+            "provider.py": "provider\n",
+            "collector.py": "collector\n",
+            "validator.py": "validator\n",
+            "runbook.md": "runbook\n",
+            "provider-evidence.jsonl": '{"status":"passed"}\n',
+        },
+    )
+    artifact_constants = {
+        "APPROVED_EXECUTED_SOURCE_ARCHIVE_SHA256": sha256(
+            bounded_harness / "source-archive.tar.gz"
+        ),
+        "APPROVED_ADAPTER_WRAPPER_SHA256": sha256(
+            bounded_harness / "adapter-wrapper"
+        ),
+        "APPROVED_CLEANER_WRAPPER_SHA256": sha256(
+            bounded_harness / "cleaner-wrapper"
+        ),
+        "APPROVED_PROVIDER_PACKAGE_SHA256": sha256(
+            bounded_provider / "provider-package.json"
+        ),
+        "APPROVED_PROVIDER_SHA256": sha256(bounded_provider / "provider.py"),
+        "APPROVED_COLLECTOR_SHA256": sha256(bounded_provider / "collector.py"),
+        "APPROVED_VALIDATOR_SHA256": sha256(bounded_provider / "validator.py"),
+        "APPROVED_VALIDATION_RUNBOOK_SHA256": sha256(
+            bounded_provider / "runbook.md"
+        ),
+    }
+    for name, value in artifact_constants.items():
+        monkeypatch.setattr(f"predictive_cache.collection.cli.{name}", value)
+    live_snapshot = run_dir / ".approved-tools/checkpoint-provider"
+    live_snapshot.parent.mkdir(mode=0o700)
+    live_snapshot.write_text("provider\n")
+    live_snapshot.chmod(0o500)
+    live_package = run_dir / ".approved-tools/provider-package.zip"
+    live_package.write_text("provider package\n")
+    live_package.chmod(0o400)
+    for root, run_id, manifest_path in (
+        (
+            bounded_harness,
+            "bounded-validation",
+            bounded_harness / "candidate-manifest.json",
+        ),
+        (run_dir, "controlled-demo", run_dir / "manifest.json"),
+    ):
+        atomic_write_model(
+            root / "provider-invocation.json",
+            ProviderInvocationRecord(
+                run_id=run_id,
+                manifest_sha256=sha256(manifest_path),
+                provider_package_sha256=artifact_constants[
+                    "APPROVED_PROVIDER_PACKAGE_SHA256"
+                ],
+                provider_package_path=".approved-tools/provider-package.zip",
+                provider_snapshot_path=".approved-tools/checkpoint-provider",
+                provider_snapshot_sha256=artifact_constants[
+                    "APPROVED_PROVIDER_SHA256"
+                ],
+                collector_sha256=artifact_constants[
+                    "APPROVED_COLLECTOR_SHA256"
+                ],
+                validator_sha256=artifact_constants[
+                    "APPROVED_VALIDATOR_SHA256"
+                ],
+                interpreter_path="/usr/bin/python3.12",
+                interpreter_sha256=(
+                    "f5e62d752212336f7eaa112499e41bdd58f655d3cf152c7d3c7cc1e5a01545a0"
+                ),
+                argv_contract=(
+                    "/usr/bin/python3.12",
+                    "-I",
+                    "-S",
+                    "-c",
+                    ISOLATED_PROVIDER_BOOTSTRAP,
+                    ".approved-tools/provider-package.zip",
+                    ".approved-tools/checkpoint-provider",
+                    "<action>",
+                    "<run_dir>",
+                ),
+                actions=("checkpoint", "probe", "post-read"),
+                created_at=START,
+            ),
+        )
+    candidate_model = CollectionManifest.model_validate(candidate_manifest)
+    candidate_operation_id = planned_operations(
+        candidate_model,
+        live_catalog,
+    )[0][4]
+    permit = AdapterValidationPermit(
+        permit_id="11111111-1111-4111-8111-111111111111",
+        run_id="bounded-validation",
+        full_manifest_sha256=sha256(bounded_harness / "candidate-manifest.json"),
+        validation_operations=1,
+        operation_indexes=(0,),
+        operation_ids=(candidate_operation_id,),
+        provider_package_sha256=artifact_constants[
+            "APPROVED_PROVIDER_PACKAGE_SHA256"
+        ],
+        provider_sha256=artifact_constants["APPROVED_PROVIDER_SHA256"],
+        collector_sha256=artifact_constants["APPROVED_COLLECTOR_SHA256"],
+        validator_sha256=artifact_constants["APPROVED_VALIDATOR_SHA256"],
+        runbook_sha256=artifact_constants["APPROVED_VALIDATION_RUNBOOK_SHA256"],
+        status="approved",
+        expires_at=START + timedelta(hours=1),
+    )
+    atomic_write_model(bounded_harness / "adapter-validation-permit.json", permit)
+    bounded_operation = build_operation(
+        candidate_model,
+        planned_operations(candidate_model, live_catalog)[0],
+        offered_at=START,
+        monotonic_ns=1,
+        timing_mode="wallclock",
+    )
+    write_jsonl(bounded_harness / "offered.jsonl", [bounded_operation])
+    bounded_execution = ExecutionResult(
+        operation_id=bounded_operation.operation_id,
+        completed_at_utc=START + timedelta(minutes=15),
+        status="ok",
+        bytes_read=4096,
+        latency_ms=10,
+        supervised_latency_ms=100,
+        content_sha256="f" * 64,
+        executor_kind="direct-mount",
+        filesystem_type="nfs4",
+    )
+    write_jsonl(bounded_harness / "execution.jsonl", [bounded_execution])
+    bounded_event_id = str(uuid.UUID(int=1000))
+    bounded_server_operation = hashlib.sha256(b"bounded-server").hexdigest()
+    bounded_event_ns = int((START + timedelta(seconds=1)).timestamp() * 1e9)
+    bounded_sink_ns = int((START + timedelta(seconds=2)).timestamp() * 1e9)
+    bounded_raw = {
+        "schema": "nfs4_read_v2",
+        "local_id": bounded_event_id,
+        "producer_epoch": EPOCH,
+        "producer_sequence": "1",
+        "event_time_ns": str(bounded_event_ns),
+        "sink_time_ns": str(bounded_sink_ns),
+        "target_created_ns": "1",
+        "volume_id": bounded_operation.volume_id,
+        "file_id": bounded_operation.file_id,
+        "identity_valid": True,
+        "export_name_b64": base64.urlsafe_b64encode(b"/controlled")
+        .rstrip(b"=")
+        .decode(),
+        "export_id": bounded_operation.export_id,
+        "target_fh": "AA",
+        "operation_id": bounded_server_operation,
+        "client_ref": "c" * 64,
+        "session_ref": "",
+        "compound_op_index": 0,
+        "slot_id": 0,
+        "sequence_id": 1,
+        "compound_tag_b64": "",
+        "compound_tag_original_length": 0,
+        "compound_tag_truncated": False,
+        "compound_tag_id": hashlib.sha256(b"").hexdigest(),
+        "origin_claim": "unknown",
+        "origin_trust": "client_asserted",
+        "requested_offset": str(bounded_operation.offset),
+        "requested_count": bounded_operation.count,
+        "returned_bytes": bounded_operation.count,
+        "nfs_status": 0,
+        "outcome": "success",
+        "eof": False,
+        "file_size_valid": True,
+        "file_size": str(bounded_operation.file_size),
+    }
+    bounded_raw_line = json.dumps(
+        bounded_raw, sort_keys=True, separators=(",", ":")
+    ).encode()
+    bounded_raw_relative = Path("collector") / POD_UID / EPOCH / "events.jsonl"
+    bounded_raw_path = bounded_harness / bounded_raw_relative
+    bounded_raw_path.parent.mkdir(parents=True, mode=0o700)
+    bounded_raw_path.write_bytes(bounded_raw_line + b"\n")
+    bounded_raw_path.chmod(0o600)
+    bounded_raw_hash = sha256(bounded_raw_path)
+    bounded_durable_at = START + timedelta(minutes=16)
+    bounded_durable = CollectorDurableEvent(
+        run_id="bounded-validation",
+        event_id=bounded_event_id,
+        pod_name="collector-0",
+        pod_uid=POD_UID,
+        node_name="node-1",
+        producer_epoch=EPOCH,
+        producer_sequence=1,
+        server_operation_id=bounded_server_operation,
+        sink_time_ns=bounded_sink_ns,
+        volume_id=bounded_operation.volume_id,
+        file_id=bounded_operation.file_id,
+        export_id=bounded_operation.export_id,
+        export_name="/controlled",
+        offset=bounded_operation.offset,
+        count=bounded_operation.count,
+        returned_bytes=bounded_operation.count,
+        nfs_status=0,
+        outcome="success",
+        eof=False,
+        durable_at=bounded_durable_at,
+        tag="",
+        raw_jsonl_path=bounded_raw_relative.as_posix(),
+        raw_jsonl_sha256=bounded_raw_hash,
+        raw_line_number=1,
+        raw_record_sha256=hashlib.sha256(bounded_raw_line).hexdigest(),
+    )
+    write_jsonl(bounded_harness / "durable-events.jsonl", [bounded_durable])
+    bounded_observed = ObservedEvent(
+        operation_id=bounded_operation.operation_id,
+        event_id=bounded_event_id,
+        pod_uid=POD_UID,
+        producer_epoch=EPOCH,
+        producer_sequence=1,
+        server_operation_id=bounded_server_operation,
+        sink_time_ns=bounded_sink_ns,
+        volume_id=bounded_operation.volume_id,
+        file_id=bounded_operation.file_id,
+        offset=bounded_operation.offset,
+        count=bounded_operation.count,
+        durable_at=bounded_durable_at,
+        status="durable",
+        tag=None,
+    )
+    write_jsonl(bounded_harness / "observed.jsonl", [bounded_observed])
+    atomic_write_model(
+        bounded_harness / "collector-file-manifest.json",
+        CollectorFileManifest(
+            run_id="bounded-validation",
+            files=(
+                CollectorSourceFile(
+                    raw_jsonl_path=bounded_raw_relative.as_posix(),
+                    sha256=bounded_raw_hash,
+                    pod_name="collector-0",
+                    pod_uid=POD_UID,
+                    node_name="node-1",
+                    producer_epoch=EPOCH,
+                ),
+            ),
+        ),
+    )
+    bounded_active = JsonlEvidence(
+        path=bounded_raw_relative.as_posix(),
+        size_bytes=bounded_raw_path.stat().st_size,
+        sha256=bounded_raw_hash,
+    )
+    write_jsonl(
+        bounded_harness / "checkpoints.jsonl",
+        [
+            Checkpoint(
+                run_id="bounded-validation",
+                scheduled_at=START,
+                captured_at=START,
+                pod_name="collector-0",
+                pod_uid=POD_UID,
+                node_name="node-1",
+                producer_epoch=EPOCH,
+                restart_count=0,
+                last_enqueued_sequence=0,
+                last_synced_sequence=0,
+                synced_count=0,
+                queue_depth=0,
+                worker_in_flight=0,
+                delivery_clean=1,
+                barrier_ready=1,
+                drops=DropCounters(
+                    queue=0, encode=0, sink=0, rollback=0, rotation=0
+                ),
+                active_jsonl=bounded_active,
+                collector_sink_healthy=True,
+                storage_healthy=True,
+                cluster_healthy=True,
+                volume_healthy=True,
+                export_healthy=True,
+                parse_errors=0,
+                identity_mismatches=0,
+                checksum_mismatches=0,
+                foreground_read_errors=0,
+                max_observed_latency_ms=10,
+            )
+        ],
+    )
+    write_jsonl(
+        bounded_harness / "pre-read-health.jsonl",
+        [
+            PreReadHealth(
+                run_id="bounded-validation",
+                operation_id=bounded_operation.operation_id,
+                captured_at=START + timedelta(milliseconds=500),
+                pod_name="collector-0",
+                pod_uid=POD_UID,
+                node_name="node-1",
+                producer_epoch=EPOCH,
+                last_enqueued_sequence=0,
+                last_synced_sequence=0,
+                synced_count=0,
+                queue_depth=0,
+                worker_in_flight=0,
+                delivery_clean=1,
+                barrier_ready=1,
+                drops=DropCounters(
+                    queue=0, encode=0, sink=0, rollback=0, rotation=0
+                ),
+                collector_sink_healthy=True,
+                storage_healthy=True,
+                cluster_healthy=True,
+                volume_healthy=True,
+                export_healthy=True,
+                parse_errors=0,
+                identity_mismatches=0,
+                checksum_mismatches=0,
+                foreground_read_errors=0,
+            )
+        ],
+    )
+    atomic_write_model(
+        bounded_harness / "reconciliation.json",
+        ReconciliationReport(
+            run_id="bounded-validation",
+            manifest_sha256=sha256(
+                bounded_harness / "candidate-manifest.json"
+            ),
+            ledger_sha256=sha256(bounded_harness / "offered.jsonl"),
+            observed_sha256=sha256(bounded_harness / "observed.jsonl"),
+            offered_count=1,
+            unique_durable_count=1,
+            duplicate_operation_ids=(),
+            missing_operation_ids=(),
+            unexpected_operation_ids=(),
+            unknown_event_ids=(),
+            exclusions={},
+            pod_epochs={},
+            success=True,
+            failures=(),
+        ),
+    )
+    atomic_write_model(
+        bounded_provider / "provider-manifest.json",
+        LiveProviderDeclaration(
+            run_id="bounded-validation",
+            manifest_sha256=sha256(
+                bounded_harness / "candidate-manifest.json"
+            ),
+            provider_package_sha256=artifact_constants[
+                "APPROVED_PROVIDER_PACKAGE_SHA256"
+            ],
+            provider_sha256=artifact_constants["APPROVED_PROVIDER_SHA256"],
+            collector_sha256=artifact_constants["APPROVED_COLLECTOR_SHA256"],
+            validator_sha256=artifact_constants["APPROVED_VALIDATOR_SHA256"],
+            provider_snapshot_sha256=artifact_constants[
+                "APPROVED_PROVIDER_SHA256"
+            ],
+            provider_package_artifact=CleanupEvidenceReference(
+                root_id="bounded_harness_evidence",
+                path=".approved-tools/provider-package.zip",
+                sha256=sha256(
+                    bounded_harness / ".approved-tools/provider-package.zip"
+                ),
+            ),
+            collector_artifact=CleanupEvidenceReference(
+                root_id="bounded_provider_evidence",
+                path="collector.py",
+                sha256=sha256(bounded_provider / "collector.py"),
+            ),
+            validator_artifact=CleanupEvidenceReference(
+                root_id="bounded_provider_evidence",
+                path="validator.py",
+                sha256=sha256(bounded_provider / "validator.py"),
+            ),
+            invocation_record=CleanupEvidenceReference(
+                root_id="bounded_harness_evidence",
+                path="provider-invocation.json",
+                sha256=sha256(
+                    bounded_harness / "provider-invocation.json"
+                ),
+            ),
+            interpreter_path="/usr/bin/python3.12",
+            interpreter_sha256=(
+                "f5e62d752212336f7eaa112499e41bdd58f655d3cf152c7d3c7cc1e5a01545a0"
+            ),
+            argv_contract=(
+                "/usr/bin/python3.12",
+                "-I",
+                "-S",
+                "-c",
+                ISOLATED_PROVIDER_BOOTSTRAP,
+                ".approved-tools/provider-package.zip",
+                ".approved-tools/checkpoint-provider",
+                "<action>",
+                "<run_dir>",
+            ),
+            operation_count=1,
+            event_count=1,
+            content_sha256_by_operation={
+                bounded_operation.operation_id: bounded_execution.content_sha256
+            },
+            source_manifest=CleanupEvidenceReference(
+                root_id="bounded_harness_evidence",
+                path="collector-file-manifest.json",
+                sha256=sha256(
+                    bounded_harness / "collector-file-manifest.json"
+                ),
+            ),
+            fixture_catalog=CleanupEvidenceReference(
+                root_id="bounded_harness_evidence",
+                path="fixture-catalog.json",
+                sha256=sha256(bounded_harness / "fixture-catalog.json"),
+            ),
+            source_chunks=(
+                CleanupEvidenceReference(
+                    root_id="bounded_harness_evidence",
+                    path=bounded_raw_relative.as_posix(),
+                    sha256=bounded_raw_hash,
+                ),
+            ),
+            durable_sidecar=CleanupEvidenceReference(
+                root_id="bounded_harness_evidence",
+                path="durable-events.jsonl",
+                sha256=sha256(bounded_harness / "durable-events.jsonl"),
+            ),
+            checkpoints=CleanupEvidenceReference(
+                root_id="bounded_harness_evidence",
+                path="checkpoints.jsonl",
+                sha256=sha256(bounded_harness / "checkpoints.jsonl"),
+            ),
+            pre_read_health=CleanupEvidenceReference(
+                root_id="bounded_harness_evidence",
+                path="pre-read-health.jsonl",
+                sha256=sha256(bounded_harness / "pre-read-health.jsonl"),
+            ),
+            execution_ledger=CleanupEvidenceReference(
+                root_id="bounded_harness_evidence",
+                path="execution.jsonl",
+                sha256=sha256(bounded_harness / "execution.jsonl"),
+            ),
+            offered_ledger=CleanupEvidenceReference(
+                root_id="bounded_harness_evidence",
+                path="offered.jsonl",
+                sha256=sha256(bounded_harness / "offered.jsonl"),
+            ),
+            observed=CleanupEvidenceReference(
+                root_id="bounded_harness_evidence",
+                path="observed.jsonl",
+                sha256=sha256(bounded_harness / "observed.jsonl"),
+            ),
+            reconciliation=CleanupEvidenceReference(
+                root_id="bounded_harness_evidence",
+                path="reconciliation.json",
+                sha256=sha256(bounded_harness / "reconciliation.json"),
+            ),
+            scope="live_collection",
+        ),
+    )
+    bounded_adapter = evidence_root(
+        "bounded-adapter",
+        {
+            (
+                "events/"
+                f"volume_id={candidate_manifest['volume_id']}/"
+                "date=2026-11-04/part-00000.jsonl"
+            ): json.dumps(
+                {
+                    "schema_version": 1,
+                    "event_id": bounded_event_id,
+                    "event_time": (
+                        START + timedelta(seconds=1)
+                    ).isoformat(),
+                    "ingest_time": bounded_durable_at.isoformat(),
+                    "volume_id": bounded_operation.volume_id,
+                    "file_id": bounded_operation.file_id,
+                    "dir_id": bounded_operation.dir_id,
+                    "operation": "read",
+                    "handle_id": None,
+                    "offset": bounded_operation.offset,
+                    "bytes_requested": bounded_operation.count,
+                    "bytes_read": bounded_operation.count,
+                    "handle_bytes_read": None,
+                    "handle_duration_ms": None,
+                    "file_size": bounded_operation.file_size,
+                    "result": "ok",
+                    "origin": "synthetic",
+                    "session_id": None,
+                    "cohort_id": None,
+                    "client_id": bounded_operation.client_id,
+                    "app": "nfs4",
+                    "cache_outcome": None,
+                    "latency_ms": None,
+                }
+            )
+            + "\n",
+            "loss/loss.jsonl": json.dumps(
+                {
+                    "volume_id": candidate_manifest["volume_id"],
+                    "hour_start": START.isoformat(),
+                    "offered": 1,
+                    "emitted": 1,
+                    "dropped": 0,
+                    "sampled_out": 0,
+                    "duplicates": 0,
+                    "late": 0,
+                }
+            )
+            + "\n",
+            "report/summary.md": "bounded import\n",
+        },
+    )
+    bounded_input_hashes = {
+        "event_sources": sha256(
+            bounded_harness / "collector-file-manifest.json"
+        ),
+        "observed": sha256(bounded_harness / "observed.jsonl"),
+        "run_manifest": sha256(bounded_harness / "candidate-manifest.json"),
+        "offered_ledger": sha256(bounded_harness / "offered.jsonl"),
+        "fixture_catalog": sha256(bounded_harness / "fixture-catalog.json"),
+        "checkpoints": sha256(bounded_harness / "checkpoints.jsonl"),
+        "validation_permit": sha256(
+            bounded_harness / "adapter-validation-permit.json"
+        ),
+    }
+    bounded_report = {
+        "schema": "chimera_import_report_v2",
+        "run_id": "bounded-validation",
+        "counts": {
+            "event_sources": 1,
+            "raw_events": 1,
+            "durable_events": 1,
+            "approved_exclusions": 0,
+            "offered_operations": 1,
+        },
+        "event_quality": {},
+        "approved_exclusions": [],
+        "known_gaps": [],
+        "input_sha256": bounded_input_hashes,
+        "event_source_sha256": {"collector/chunk.jsonl": "5" * 64},
+    }
+    bounded_report_path = bounded_adapter / "report/import.json"
+    bounded_report_path.write_text(json.dumps(bounded_report) + "\n")
+    bounded_report_path.chmod(0o600)
+    bounded_files = [
+        {
+            "path": path.relative_to(bounded_adapter).as_posix(),
+            "sha256": sha256(path),
+            "rows": (
+                len(path.read_text().splitlines())
+                if path.suffix == ".jsonl"
+                else None
+            ),
+        }
+        for path in sorted(bounded_adapter.rglob("*"))
+        if path.is_file()
+    ]
+    bounded_manifest = {
+        "manifest_version": 1,
+        "dataset_id": "bounded-adapter-dataset",
+        "data_kind": "synthetic",
+        "generator": {
+            "name": "pcache-datagen",
+            "version": "0.1.0",
+            "git_sha": "test",
+            "runtime": {
+                "adapter": "pcache-chimera-import",
+                "adapter_version": "0.1.0",
+                "python": "3.12",
+                "run_id": "bounded-validation",
+                "chimera_image_sha256": candidate_manifest["software"][
+                    "chimera_image_sha256"
+                ],
+                "event_schema_sha256": candidate_manifest["event_schema_sha256"],
+                **{
+                    f"{name}_sha256": digest
+                    for name, digest in bounded_input_hashes.items()
+                },
+            },
+        },
+        "event_schema_version": 1,
+        "seed": 0,
+        "preset": "custom",
+        "config_sha256": "c" * 64,
+        "period": {
+            "start": candidate_manifest["start_time"],
+            "end": candidate_manifest["end_time"],
+        },
+        "volumes": [candidate_manifest["volume_id"]],
+        "counts": {
+            "events": 1,
+            "dropped_events": 0,
+            "files": 60,
+            "actors": 0,
+            "patterns": 0,
+            "by_operation": {"read": 1},
+            "by_origin": {"synthetic": 1},
+            "by_fault": {},
+        },
+        "known_gaps": [],
+        "files": bounded_files,
+        "created_at": candidate_manifest["end_time"],
+        "limitations": ["synthetic"],
+    }
+    bounded_manifest_path = bounded_adapter / "manifest.json"
+    bounded_manifest_path.write_text(json.dumps(bounded_manifest) + "\n")
+    bounded_manifest_path.chmod(0o600)
+    bounded_clean = evidence_root(
+        "bounded-clean",
+        {
+            (
+                "events_clean/"
+                f"volume_id={candidate_manifest['volume_id']}/"
+                "date=2026-11-04/part-00000.jsonl"
+            ): "",
+            (
+                "excluded/"
+                f"volume_id={candidate_manifest['volume_id']}/"
+                "date=2026-11-04/part-00000.jsonl"
+            ): json.dumps(
+                {
+                    **json.loads(
+                        (
+                            bounded_adapter
+                            / "events"
+                            / f"volume_id={candidate_manifest['volume_id']}"
+                            / "date=2026-11-04"
+                            / "part-00000.jsonl"
+                        ).read_text()
+                    ),
+                    "reason": "origin_synthetic",
+                    "detail": None,
+                }
+            )
+            + "\n",
+            "validation.json": '{"status":"passed"}\n',
+        },
+    )
+    bounded_coverage_dir = bounded_clean / "coverage"
+    bounded_coverage_dir.mkdir(mode=0o700)
+    bounded_coverage_path = bounded_coverage_dir / "coverage.jsonl"
+    bounded_coverage_rows = [
+        {
+            "volume_id": candidate_manifest["volume_id"],
+            "hour_start": START.isoformat(),
+            "offered": 1,
+            "emitted": 1,
+            "dropped": 0,
+            "sampled_out": 0,
+            "loss_fraction": 0.0,
+            "status": "complete",
+        }
+    ]
+    bounded_coverage_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in bounded_coverage_rows)
+    )
+    bounded_coverage_path.chmod(0o600)
+    bounded_counts = {
+        "input_events": 1,
+        "kept_events": 0,
+        "excluded_by_reason": {"origin_synthetic": 1},
+        "open_ranges": 0,
+        "opens": 0,
+        "meta_events": 0,
+        "catalog_miss_events": 0,
+        "catalog_miss_files": 0,
+        "late_reads_after_completion": 0,
+        "opens_open_missing": 0,
+        "opens_close_missing": 0,
+        "opens_bytes_inconsistent": 0,
+        "unexpected_reads_in_summary_mode": 0,
+    }
+    bounded_report_dir = bounded_clean / "report"
+    bounded_report_dir.mkdir(mode=0o700)
+    bounded_quality_path = bounded_report_dir / "quality.json"
+    bounded_quality = {
+                "counts": bounded_counts,
+                "by_volume_day": [
+                    {
+                        "volume_id": candidate_manifest["volume_id"],
+                        "date": "2026-11-04",
+                        "input": 1,
+                        "kept": 0,
+                        "excluded": 1,
+                    }
+                ],
+                "excluded_by_reason": {"origin_synthetic": 1},
+                "exclusions_by_volume_day_reason": [
+                    {
+                        "volume_id": candidate_manifest["volume_id"],
+                        "date": "2026-11-04",
+                        "reason": "origin_synthetic",
+                        "count": 1,
+                    }
+                ],
+                "duplicate_rate": 0.0,
+                "late_arrival_s": {
+                    "p50": None,
+                    "p90": None,
+                    "p99": None,
+                    "max": None,
+                    "negative_count": 0,
+                },
+                "coverage_hours": {"complete": 1},
+                "incomplete_windows": [],
+                "opens": {
+                    "count": 0,
+                    "open_missing": 0,
+                    "close_missing": 0,
+                    "bytes_inconsistent": 0,
+                    "consumed_share": 0.0,
+                },
+                "successful_returned_bytes": 0,
+                "distinct_bytes": 0,
+                "catalog_misses": {"files": 0, "events": 0},
+                "origin_mix": {"synthetic": 1},
+                "app_mix": {"nfs4": 1},
+                "opens_by_volume_hour": [],
+                "opens_by_volume_weekday": [],
+            }
+    bounded_quality_path.write_text(
+        json.dumps(bounded_quality) + "\n"
+    )
+    bounded_quality_path.chmod(0o600)
+    bounded_config_sha, _ = add_clean_auxiliary(
+        bounded_clean,
+        candidate_manifest["volume_id"],
+        "2026-11-04",
+        bounded_quality,
+    )
+    bounded_clean_files = [
+        {
+            "path": path.relative_to(bounded_clean).as_posix(),
+            "sha256": sha256(path),
+            "rows": (
+                len(path.read_text().splitlines())
+                if path.suffix == ".jsonl"
+                else None
+            ),
+        }
+        for path in sorted(bounded_clean.rglob("*"))
+        if path.is_file()
+    ]
+    bounded_clean_manifest = {
+        "manifest_version": 1,
+        "dataset_id": "bounded-clean-dataset",
+        "data_kind": "synthetic",
+        "stage": "clean",
+        "parent": {
+            "dataset_id": "bounded-adapter-dataset",
+            "manifest_sha256": sha256(bounded_manifest_path),
+        },
+        "tool": {"name": "pcache-prep", "version": "0.1.0", "git_sha": "test"},
+        "config_sha256": bounded_config_sha,
+        "period": {
+            "start": candidate_manifest["start_time"],
+            "end": candidate_manifest["end_time"],
+        },
+        "counts": bounded_counts,
+        "coverage": {
+            "hours": 1,
+            "complete": 1,
+            "incomplete": 0,
+            "no_counters": 0,
+            "skew_margin_s": 600,
+            "assume_complete_without_counters": False,
+        },
+        "files": bounded_clean_files,
+        "created_at": (START + timedelta(minutes=30)).isoformat(),
+    }
+    bounded_clean_manifest_path = bounded_clean / "manifest.json"
+    bounded_clean_manifest_path.write_text(
+        json.dumps(bounded_clean_manifest) + "\n"
+    )
+    bounded_clean_manifest_path.chmod(0o600)
+    live_provider = evidence_root(
+        "live-provider",
+        {
+            "provider-package.json": "provider package\n",
+            "collector.py": "collector\n",
+            "validator.py": "validator\n",
+            "provider-evidence.jsonl": '{"status":"passed"}\n',
+        },
+    )
+    live_source_manifest = CollectorFileManifest.model_validate_json(
+        (run_dir / "collector-file-manifest.json").read_text()
+    )
+    provider_declaration = LiveProviderDeclaration(
+        run_id="controlled-demo",
+        manifest_sha256=sha256(run_dir / "manifest.json"),
+        provider_package_sha256=artifact_constants[
+            "APPROVED_PROVIDER_PACKAGE_SHA256"
+        ],
+        provider_sha256=artifact_constants["APPROVED_PROVIDER_SHA256"],
+        collector_sha256=artifact_constants["APPROVED_COLLECTOR_SHA256"],
+        validator_sha256=artifact_constants["APPROVED_VALIDATOR_SHA256"],
+        provider_snapshot_sha256=artifact_constants[
+            "APPROVED_PROVIDER_SHA256"
+        ],
+        provider_package_artifact=CleanupEvidenceReference(
+            root_id="live_harness_evidence",
+            path=".approved-tools/provider-package.zip",
+            sha256=sha256(
+                run_dir / ".approved-tools/provider-package.zip"
+            ),
+        ),
+        collector_artifact=CleanupEvidenceReference(
+            root_id="live_provider_evidence",
+            path="collector.py",
+            sha256=sha256(live_provider / "collector.py"),
+        ),
+        validator_artifact=CleanupEvidenceReference(
+            root_id="live_provider_evidence",
+            path="validator.py",
+            sha256=sha256(live_provider / "validator.py"),
+        ),
+        invocation_record=CleanupEvidenceReference(
+            root_id="live_harness_evidence",
+            path="provider-invocation.json",
+            sha256=sha256(run_dir / "provider-invocation.json"),
+        ),
+        interpreter_path="/usr/bin/python3.12",
+        interpreter_sha256=(
+            "f5e62d752212336f7eaa112499e41bdd58f655d3cf152c7d3c7cc1e5a01545a0"
+        ),
+        argv_contract=(
+            "/usr/bin/python3.12",
+            "-I",
+            "-S",
+            "-c",
+            ISOLATED_PROVIDER_BOOTSTRAP,
+            ".approved-tools/provider-package.zip",
+            ".approved-tools/checkpoint-provider",
+            "<action>",
+            "<run_dir>",
+        ),
+        operation_count=300,
+        event_count=300,
+        content_sha256_by_operation={
+            row.operation_id: row.content_sha256 for row in execution_rows
+        },
+        source_manifest=CleanupEvidenceReference(
+            root_id="live_harness_evidence",
+            path="collector-file-manifest.json",
+            sha256=sha256(run_dir / "collector-file-manifest.json"),
+        ),
+        fixture_catalog=CleanupEvidenceReference(
+            root_id="live_harness_evidence",
+            path="fixture-catalog.json",
+            sha256=sha256(run_dir / "fixture-catalog.json"),
+        ),
+        source_chunks=tuple(
+            CleanupEvidenceReference(
+                root_id="live_harness_evidence",
+                path=source.raw_jsonl_path,
+                sha256=source.sha256,
+            )
+            for source in live_source_manifest.files
+        ),
+        durable_sidecar=CleanupEvidenceReference(
+            root_id="live_harness_evidence",
+            path="durable-events.jsonl",
+            sha256=sha256(run_dir / "durable-events.jsonl"),
+        ),
+        checkpoints=CleanupEvidenceReference(
+            root_id="live_harness_evidence",
+            path="checkpoints.jsonl",
+            sha256=sha256(run_dir / "checkpoints.jsonl"),
+        ),
+        pre_read_health=CleanupEvidenceReference(
+            root_id="live_harness_evidence",
+            path="pre-read-health.jsonl",
+            sha256=sha256(run_dir / "pre-read-health.jsonl"),
+        ),
+        execution_ledger=CleanupEvidenceReference(
+            root_id="live_harness_evidence",
+            path="execution.jsonl",
+            sha256=sha256(run_dir / "execution.jsonl"),
+        ),
+        offered_ledger=CleanupEvidenceReference(
+            root_id="live_harness_evidence",
+            path="offered.jsonl",
+            sha256=sha256(run_dir / "offered.jsonl"),
+        ),
+        observed=CleanupEvidenceReference(
+            root_id="live_harness_evidence",
+            path="observed.jsonl",
+            sha256=sha256(run_dir / "observed.jsonl"),
+        ),
+        reconciliation=CleanupEvidenceReference(
+            root_id="live_harness_evidence",
+            path="reconciliation.json",
+            sha256=sha256(run_dir / "reconciliation.json"),
+        ),
+        scope="live_collection",
+    )
+    atomic_write_model(
+        live_provider / "provider-manifest.json",
+        provider_declaration,
+    )
+    live_adapter_event_rows = [
+        {
+            "schema_version": 1,
+            "event_id": observation.event_id,
+            "event_time": (
+                operation.offered_at_utc + timedelta(milliseconds=10)
+            ).isoformat(),
+            "ingest_time": observation.durable_at.isoformat(),
+            "volume_id": operation.volume_id,
+            "file_id": operation.file_id,
+            "dir_id": operation.dir_id,
+            "operation": "read",
+            "handle_id": None,
+            "offset": operation.offset,
+            "bytes_requested": operation.count,
+            "bytes_read": sidecar.returned_bytes,
+            "handle_bytes_read": None,
+            "handle_duration_ms": None,
+            "file_size": operation.file_size,
+            "result": "ok",
+            "origin": "synthetic",
+            "session_id": None,
+            "cohort_id": None,
+            "client_id": operation.client_id,
+            "app": "nfs4",
+            "cache_outcome": None,
+            "latency_ms": None,
+        }
+        for operation, observation, sidecar in zip(
+            offered_rows,
+            observed_rows,
+            durable_rows,
+            strict=True,
+        )
+    ]
+    live_adapter = evidence_root(
+        "live-adapter",
+        {
+            (
+                "events/"
+                f"volume_id={live_manifest['volume_id']}/"
+                "date=2026-11-04/part-00000.jsonl"
+            ): "".join(
+                json.dumps(row) + "\n" for row in live_adapter_event_rows
+            ),
+            "loss/loss.jsonl": "".join(
+                json.dumps(
+                    {
+                        "volume_id": live_manifest["volume_id"],
+                        "hour_start": (
+                            START + timedelta(hours=index)
+                        ).isoformat(),
+                        "offered": 60,
+                        "emitted": 60,
+                        "dropped": 0,
+                        "sampled_out": 0,
+                        "duplicates": 0,
+                        "late": 0,
+                    }
+                )
+                + "\n"
+                for index in range(5)
+            ),
+            "report/summary.md": "live import\n",
+        },
+    )
+    adapter_report = {
+        "schema": "chimera_import_report_v2",
+        "run_id": "controlled-demo",
+        "counts": {
+            "event_sources": 1,
+            "raw_events": 300,
+            "durable_events": 300,
+            "approved_exclusions": 0,
+            "offered_operations": 300,
+        },
+        "input_sha256": {
+            "run_manifest": sha256(run_dir / "manifest.json"),
+            "offered_ledger": sha256(run_dir / "offered.jsonl"),
+            "observed": sha256(run_dir / "observed.jsonl"),
+            "event_sources": sha256(run_dir / "collector-file-manifest.json"),
+            "checkpoints": sha256(run_dir / "checkpoints.jsonl"),
+            "fixture_catalog": sha256(run_dir / "fixture-catalog.json"),
+        },
+        "event_source_sha256": {
+            source.raw_jsonl_path: source.sha256
+            for source in live_source_manifest.files
+        },
+        "event_quality": {},
+        "approved_exclusions": [],
+        "known_gaps": [],
+    }
+    adapter_report_path = live_adapter / "report/import.json"
+    adapter_report_path.write_text(json.dumps(adapter_report) + "\n")
+    adapter_report_path.chmod(0o600)
+    adapter_files = [
+        {
+            "path": path.relative_to(live_adapter).as_posix(),
+            "sha256": sha256(path),
+            "rows": (
+                len(path.read_text().splitlines())
+                if path.suffix == ".jsonl"
+                else None
+            ),
+        }
+        for path in sorted(live_adapter.rglob("*"))
+        if path.is_file()
+    ]
+    adapter_manifest = {
+        "manifest_version": 1,
+        "dataset_id": "live-adapter-dataset",
+        "data_kind": "synthetic",
+        "generator": {
+            "name": "pcache-datagen",
+            "version": "0.1.0",
+            "git_sha": "test",
+            "runtime": {
+                "adapter": "pcache-chimera-import",
+                "adapter_version": "0.1.0",
+                "python": "3.12",
+                "run_id": "controlled-demo",
+                "chimera_image_sha256": live_manifest["software"][
+                    "chimera_image_sha256"
+                ],
+                "event_schema_sha256": live_manifest["event_schema_sha256"],
+                **{
+                    f"{name}_sha256": digest
+                    for name, digest in adapter_report["input_sha256"].items()
+                },
+            }
+        },
+        "event_schema_version": 1,
+        "seed": 0,
+        "preset": "custom",
+        "config_sha256": "a" * 64,
+        "period": {
+            "start": live_manifest["start_time"],
+            "end": live_manifest["end_time"],
+        },
+        "volumes": [live_manifest["volume_id"]],
+        "counts": {
+            "events": 300,
+            "dropped_events": 0,
+            "files": 60,
+            "actors": 0,
+            "patterns": 0,
+            "by_operation": {"read": 300},
+            "by_origin": {"synthetic": 300},
+            "by_fault": {},
+        },
+        "known_gaps": [],
+        "files": adapter_files,
+        "created_at": live_manifest["end_time"],
+        "limitations": ["synthetic"],
+    }
+    adapter_manifest_path = live_adapter / "manifest.json"
+    adapter_manifest_path.write_text(json.dumps(adapter_manifest) + "\n")
+    adapter_manifest_path.chmod(0o600)
+    coverage_dir = dataset_root / "coverage"
+    coverage_dir.mkdir(mode=0o700)
+    coverage_path = coverage_dir / "coverage.jsonl"
+    coverage_rows = [
+        {
+            "volume_id": live_manifest["volume_id"],
+            "hour_start": (START + timedelta(hours=index)).isoformat(),
+            "offered": 60,
+            "emitted": 60,
+            "dropped": 0,
+            "sampled_out": 0,
+            "loss_fraction": 0.0,
+            "status": "complete",
+        }
+        for index in range(5)
+    ]
+    coverage_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in coverage_rows)
+    )
+    coverage_path.chmod(0o600)
+    excluded_path = (
+        dataset_root
+        / "excluded"
+        / f"volume_id={live_manifest['volume_id']}"
+        / "date=2026-11-04"
+        / "part-00000.jsonl"
+    )
+    excluded_path.parent.mkdir(parents=True, mode=0o700)
+    excluded_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    **event,
+                    "reason": "origin_synthetic",
+                    "detail": None,
+                }
+            )
+            + "\n"
+            for event in live_adapter_event_rows
+        )
+    )
+    excluded_path.chmod(0o600)
+    counts = {
+        "input_events": 300,
+        "kept_events": 0,
+        "excluded_by_reason": {"origin_synthetic": 300},
+        "open_ranges": 0,
+        "opens": 0,
+        "meta_events": 0,
+        "catalog_miss_events": 0,
+        "catalog_miss_files": 0,
+        "late_reads_after_completion": 0,
+        "opens_open_missing": 0,
+        "opens_close_missing": 0,
+        "opens_bytes_inconsistent": 0,
+        "unexpected_reads_in_summary_mode": 0,
+    }
+    clean_report = {
+        "counts": counts,
+        "by_volume_day": [
+            {
+                "volume_id": live_manifest["volume_id"],
+                "date": "2026-11-04",
+                "input": 300,
+                "kept": 0,
+                "excluded": 300,
+            }
+        ],
+        "excluded_by_reason": {"origin_synthetic": 300},
+        "exclusions_by_volume_day_reason": [
+            {
+                "volume_id": live_manifest["volume_id"],
+                "date": "2026-11-04",
+                "reason": "origin_synthetic",
+                "count": 300,
+            }
+        ],
+        "duplicate_rate": 0.0,
+        "late_arrival_s": {
+            "p50": None,
+            "p90": None,
+            "p99": None,
+            "max": None,
+            "negative_count": 0,
+        },
+        "coverage_hours": {"complete": 5},
+        "incomplete_windows": [],
+        "opens": {
+            "count": 0,
+            "open_missing": 0,
+            "close_missing": 0,
+            "bytes_inconsistent": 0,
+            "consumed_share": 0.0,
+        },
+        "successful_returned_bytes": 0,
+        "distinct_bytes": 0,
+        "catalog_misses": {"files": 0, "events": 0},
+        "origin_mix": {"synthetic": 300},
+        "app_mix": {"nfs4": 300},
+        "opens_by_volume_hour": [],
+        "opens_by_volume_weekday": [],
+    }
+    report_dir = dataset_root / "report"
+    report_dir.mkdir(mode=0o700)
+    clean_report_path = report_dir / "quality.json"
+    clean_report_path.write_text(json.dumps(clean_report) + "\n")
+    clean_report_path.chmod(0o600)
+    live_config_sha, live_auxiliary = add_clean_auxiliary(
+        dataset_root,
+        live_manifest["volume_id"],
+        "2026-11-04",
+        clean_report,
+    )
+    clean_files = [
+        {
+            "path": output.relative_to(dataset_root).as_posix(),
+            "sha256": sha256(output),
+            "rows": 0,
+        },
+        {
+            "path": excluded_path.relative_to(dataset_root).as_posix(),
+            "sha256": sha256(excluded_path),
+            "rows": 300,
+        },
+        {"path": "validation.json", "sha256": sha256(provenance), "rows": None},
+        {
+            "path": "coverage/coverage.jsonl",
+            "sha256": sha256(coverage_path),
+            "rows": 5,
+        },
+        {
+            "path": "report/quality.json",
+            "sha256": sha256(clean_report_path),
+            "rows": None,
+        },
+        *[
+            {
+                "path": path.relative_to(dataset_root).as_posix(),
+                "sha256": sha256(path),
+                "rows": (
+                    len(path.read_text().splitlines())
+                    if path.suffix == ".jsonl"
+                    else None
+                ),
+            }
+            for path in live_auxiliary
+        ],
+    ]
+    clean_manifest.write_text(
         json.dumps(
             {
-                "validation_evidence_version": 1,
-                "run_id": "controlled-demo",
-                "full_manifest_sha256": sha256(run_dir / "manifest.json"),
-                "provider_package_sha256": APPROVED_PROVIDER_PACKAGE_SHA256,
-                "provider_sha256": APPROVED_PROVIDER_SHA256,
-                "collector_sha256": APPROVED_COLLECTOR_SHA256,
-                "validator_sha256": APPROVED_VALIDATOR_SHA256,
-                "runbook_sha256": APPROVED_VALIDATION_RUNBOOK_SHA256,
-                "validation_operations": 1,
-                "status": "success",
-                "files": {"provider.jsonl": sha256(provider)},
+                "manifest_version": 1,
+                "dataset_id": "live-clean-dataset",
+                "data_kind": "synthetic",
+                "stage": "clean",
+                "parent": {
+                    "dataset_id": "live-adapter-dataset",
+                    "manifest_sha256": sha256(adapter_manifest_path),
+                },
+                "tool": {
+                    "name": "pcache-prep",
+                    "version": "0.1.0",
+                    "git_sha": "test",
+                },
+                "config_sha256": live_config_sha,
+                "period": {
+                    "start": live_manifest["start_time"],
+                    "end": live_manifest["end_time"],
+                },
+                "counts": counts,
+                "coverage": {
+                    "hours": 5,
+                    "complete": 5,
+                    "incomplete": 0,
+                    "no_counters": 0,
+                    "skew_margin_s": 600,
+                    "assume_complete_without_counters": False,
+                },
+                "files": clean_files,
+                "created_at": live_manifest["end_time"],
             }
         )
         + "\n"
     )
-    validation_manifest.chmod(0o600)
+    clean_manifest.chmod(0o600)
+    imported_hash = sha256(bounded_adapter / "manifest.json")
+    cleaned_hash = sha256(bounded_clean / "manifest.json")
+    monkeypatch.setattr(
+        "predictive_cache.collection.cli.APPROVED_IMPORTED_MANIFEST_SHA256",
+        imported_hash,
+    )
+    monkeypatch.setattr(
+        "predictive_cache.collection.cli.APPROVED_CLEANED_MANIFEST_SHA256",
+        cleaned_hash,
+    )
+    for root in (bounded_harness, bounded_provider, bounded_adapter, bounded_clean):
+        for directory in (path for path in root.rglob("*") if path.is_dir()):
+            directory.chmod(0o700)
+    bounded_roots = (
+        _cleanup_root(
+            "bounded_harness_evidence",
+            "bounded_harness_evidence",
+            bounded_harness,
+        ),
+        _cleanup_root(
+            "bounded_provider_evidence",
+            "bounded_provider_evidence",
+            bounded_provider,
+        ),
+        _cleanup_root(
+            "bounded_adapter_dataset",
+            "bounded_adapter_dataset",
+            bounded_adapter,
+        ),
+        _cleanup_root(
+            "bounded_clean_dataset",
+            "bounded_clean_dataset",
+            bounded_clean,
+        ),
+    )
+    attestation = BoundedValidationAttestation(
+        validation_run_id="bounded-validation",
+        full_live_candidate_manifest=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="candidate-manifest.json",
+            sha256=sha256(bounded_harness / "candidate-manifest.json"),
+        ),
+        permit_id=permit.permit_id,
+        permit=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="adapter-validation-permit.json",
+            sha256=sha256(bounded_harness / "adapter-validation-permit.json"),
+        ),
+        offered_ledger=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="offered.jsonl",
+            sha256=sha256(bounded_harness / "offered.jsonl"),
+        ),
+        execution_ledger=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="execution.jsonl",
+            sha256=sha256(bounded_harness / "execution.jsonl"),
+        ),
+        observed=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="observed.jsonl",
+            sha256=sha256(bounded_harness / "observed.jsonl"),
+        ),
+        source_manifest=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="collector-file-manifest.json",
+            sha256=sha256(bounded_harness / "collector-file-manifest.json"),
+        ),
+        checkpoints=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="checkpoints.jsonl",
+            sha256=sha256(bounded_harness / "checkpoints.jsonl"),
+        ),
+        durable_sidecar=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="durable-events.jsonl",
+            sha256=sha256(bounded_harness / "durable-events.jsonl"),
+        ),
+        pre_read_health=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="pre-read-health.jsonl",
+            sha256=sha256(bounded_harness / "pre-read-health.jsonl"),
+        ),
+        provider_manifest=CleanupEvidenceReference(
+            root_id="bounded_provider_evidence",
+            path="provider-manifest.json",
+            sha256=sha256(bounded_provider / "provider-manifest.json"),
+        ),
+        validation_operations=1,
+        operation_ids=permit.operation_ids,
+        validated_code_head_sha256=APPROVED_VALIDATED_CODE_HEAD_SHA256,
+        validated_merge_commit_sha256=APPROVED_VALIDATED_MERGE_COMMIT_SHA256,
+        validated_tree_sha256=APPROVED_VALIDATED_TREE_SHA256,
+        executed_source_archive=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="source-archive.tar.gz",
+            sha256=sha256(bounded_harness / "source-archive.tar.gz"),
+        ),
+        provider_package=CleanupEvidenceReference(
+            root_id="bounded_provider_evidence",
+            path="provider-package.json",
+            sha256=sha256(bounded_provider / "provider-package.json"),
+        ),
+        provider=CleanupEvidenceReference(
+            root_id="bounded_provider_evidence",
+            path="provider.py",
+            sha256=sha256(bounded_provider / "provider.py"),
+        ),
+        collector=CleanupEvidenceReference(
+            root_id="bounded_provider_evidence",
+            path="collector.py",
+            sha256=sha256(bounded_provider / "collector.py"),
+        ),
+        validator=CleanupEvidenceReference(
+            root_id="bounded_provider_evidence",
+            path="validator.py",
+            sha256=sha256(bounded_provider / "validator.py"),
+        ),
+        runbook=CleanupEvidenceReference(
+            root_id="bounded_provider_evidence",
+            path="runbook.md",
+            sha256=sha256(bounded_provider / "runbook.md"),
+        ),
+        adapter_wrapper=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="adapter-wrapper",
+            sha256=sha256(bounded_harness / "adapter-wrapper"),
+        ),
+        cleaner_wrapper=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="cleaner-wrapper",
+            sha256=sha256(bounded_harness / "cleaner-wrapper"),
+        ),
+        cluster_provenance=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="cluster-provenance-v1.json",
+            sha256=sha256(bounded_harness / "cluster-provenance-v1.json"),
+        ),
+        event_schema=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="event-schema-v2.json",
+            sha256=sha256(bounded_harness / "event-schema-v2.json"),
+        ),
+        budget_evidence=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="budget-evidence-v1.json",
+            sha256=sha256(bounded_harness / "budget-evidence-v1.json"),
+        ),
+        fixture_catalog=CleanupEvidenceReference(
+            root_id="bounded_harness_evidence",
+            path="fixture-catalog.json",
+            sha256=sha256(bounded_harness / "fixture-catalog.json"),
+        ),
+        imported_manifest=CleanupEvidenceReference(
+            root_id="bounded_adapter_dataset",
+            path="manifest.json",
+            sha256=imported_hash,
+        ),
+        imported_report=CleanupEvidenceReference(
+            root_id="bounded_adapter_dataset",
+            path="report/import.json",
+            sha256=sha256(bounded_adapter / "report/import.json"),
+        ),
+        cleaned_manifest=CleanupEvidenceReference(
+            root_id="bounded_clean_dataset",
+            path="manifest.json",
+            sha256=cleaned_hash,
+        ),
+        cleaned_report=CleanupEvidenceReference(
+            root_id="bounded_clean_dataset",
+            path="report/quality.json",
+            sha256=sha256(bounded_clean / "report/quality.json"),
+        ),
+        started_at=START,
+        completed_at=START + timedelta(minutes=30),
+        scope="bounded_validation",
+        data_kind="synthetic",
+        representative_production_demand=False,
+        status="passed",
+        cleanup_roots=bounded_roots,
+    )
+    finalization_root = tmp_path / "finalization-control"
+    finalization_root.mkdir(mode=0o700)
+    attestation_path = finalization_root / "validation-attestation.json"
+    atomic_write_model(attestation_path, attestation)
+
+    for root in (run_dir, live_provider, live_adapter, dataset_root):
+        for directory in (path for path in root.rglob("*") if path.is_dir()):
+            directory.chmod(0o700)
+    live_roots = (
+        _cleanup_root(
+            "live_harness_evidence",
+            "live_harness_evidence",
+            run_dir,
+        ),
+        _cleanup_root(
+            "live_provider_evidence",
+            "live_provider_evidence",
+            live_provider,
+        ),
+        _cleanup_root(
+            "live_adapter_dataset",
+            "live_adapter_dataset",
+            live_adapter,
+        ),
+        _cleanup_root(
+            "live_clean_dataset",
+            "live_clean_dataset",
+            dataset_root,
+        ),
+    )
+    live_declaration = LiveFinalizationDeclaration(
+        run_id="controlled-demo",
+        manifest_sha256=sha256(run_dir / "manifest.json"),
+        reconciliation_sha256=sha256(run_dir / "reconciliation.json"),
+        validated_code_head_sha256=APPROVED_VALIDATED_CODE_HEAD_SHA256,
+        validated_merge_commit_sha256=APPROVED_VALIDATED_MERGE_COMMIT_SHA256,
+        validated_tree_sha256=APPROVED_VALIDATED_TREE_SHA256,
+        executed_source_archive_sha256=artifact_constants[
+            "APPROVED_EXECUTED_SOURCE_ARCHIVE_SHA256"
+        ],
+        provider_manifest=CleanupEvidenceReference(
+            root_id="live_provider_evidence",
+            path="provider-manifest.json",
+            sha256=sha256(live_provider / "provider-manifest.json"),
+        ),
+        adapter_manifest=CleanupEvidenceReference(
+            root_id="live_adapter_dataset",
+            path="manifest.json",
+            sha256=sha256(live_adapter / "manifest.json"),
+        ),
+        adapter_report=CleanupEvidenceReference(
+            root_id="live_adapter_dataset",
+            path="report/import.json",
+            sha256=sha256(live_adapter / "report/import.json"),
+        ),
+        cleaned_manifest=CleanupEvidenceReference(
+            root_id="live_clean_dataset",
+            path="manifest.json",
+            sha256=sha256(clean_manifest),
+        ),
+        cleaned_report=CleanupEvidenceReference(
+            root_id="live_clean_dataset",
+            path="report/quality.json",
+            sha256=sha256(clean_report_path),
+        ),
+        cleanup_roots=live_roots,
+    )
     report = tmp_path / "report.json"
     report.write_text(
         json.dumps(
             {
                 "run_id": "controlled-demo",
                 "status": "success",
-                "output_hashes": {"events.jsonl": sha256(output)},
+                "output_hashes": {
+                    output.relative_to(dataset_root).as_posix(): sha256(output),
+                    excluded_path.relative_to(dataset_root).as_posix(): sha256(
+                        excluded_path
+                    ),
+                    "manifest.json": sha256(clean_manifest),
+                    "coverage/coverage.jsonl": sha256(coverage_path),
+                    **{
+                        path.relative_to(dataset_root).as_posix(): sha256(path)
+                        for path in live_auxiliary
+                    },
+                },
                 "validation_provenance": {
                     "validation.json": sha256(provenance),
+                    "report/quality.json": sha256(clean_report_path),
                 },
+                "live_finalization": live_declaration.model_dump(mode="json"),
             }
         )
         + "\n"
     )
     report.chmod(0o600)
-    return run_dir, report, dataset_root, validation_root, output
+    roots = {
+        "bounded_harness_evidence": bounded_harness,
+        "bounded_provider_evidence": bounded_provider,
+        "bounded_adapter_dataset": bounded_adapter,
+        "bounded_clean_dataset": bounded_clean,
+        "live_harness_evidence": run_dir,
+        "live_provider_evidence": live_provider,
+        "live_adapter_dataset": live_adapter,
+        "live_clean_dataset": dataset_root,
+    }
+    return (
+        run_dir,
+        report,
+        dataset_root,
+        finalization_root,
+        attestation_path,
+        roots,
+        output,
+    )
 
 
-def _finalize_args(run_dir, report, dataset_root, validation_root):
-    return [
+def _finalize_args(
+    run_dir,
+    report,
+    dataset_root,
+    finalization_root,
+    attestation_path,
+    roots,
+):
+    arguments = [
         "finalize",
         "--run-dir",
         str(run_dir),
@@ -1233,26 +3263,37 @@ def _finalize_args(run_dir, report, dataset_root, validation_root):
         str(report),
         "--dataset-root",
         str(dataset_root),
-        "--validation-evidence-root",
-        str(validation_root),
+        "--finalization-root",
+        str(finalization_root),
+        "--bounded-validation-attestation",
+        str(attestation_path),
     ]
+    for kind, path in roots.items():
+        arguments.extend(["--cleanup-root", f"{kind}={path}"])
+    return arguments
 
 
-def test_finalize_requires_verified_outputs_and_reconciliation(tmp_path):
-    run_dir, report, dataset_root, validation_root, _ = _finalization_fixture(tmp_path)
+def test_finalize_requires_verified_outputs_and_reconciliation(tmp_path, monkeypatch):
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = _finalization_fixture(
+        tmp_path, monkeypatch
+    )
     result = CliRunner().invoke(
         main,
-        _finalize_args(run_dir, report, dataset_root, validation_root),
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, roots),
     )
     assert result.exit_code == 0, result.output
     schedule = CleanupScheduleRecord.model_validate_json(
-        (run_dir / "cleanup-schedule.json").read_text()
+        (finalization_root / "cleanup-schedule.json").read_text()
     )
     assert schedule.delete_by == schedule.finalized_at + timedelta(days=7)
-    inventory = (run_dir / "deletion-inventory.json").read_text()
-    assert '"reconciliation.json"' in inventory
-    assert '"validated_dataset"' in inventory
-    assert '"bounded_validation_evidence"' in inventory
+    inventory = json.loads((finalization_root / "deletion-inventory.json").read_text())
+    serialized = json.dumps(inventory)
+    assert '"reconciliation.json"' in serialized
+    assert len(inventory["roots"]) == 8
+    assert {root["kind"] for root in inventory["roots"]} == set(roots)
+    for kind in roots:
+        item = next(root for root in inventory["roots"] if root["kind"] == kind)
+        assert item["canonical_path"] == str(roots[kind].resolve())
 
 
 def test_bounded_run_seals_adapter_validation_permit_before_execution(
@@ -1265,6 +3306,7 @@ def test_bounded_run_seals_adapter_validation_permit_before_execution(
     atomic_write_model(run_dir / "fixture-catalog.json", live_catalog)
     observed = {}
     subprocess_calls = []
+    runtime_fds = []
 
     class FakeRunner:
         def run(self, manifest, catalog, evidence_dir, executor, **kwargs):
@@ -1280,13 +3322,46 @@ def test_bounded_run_seals_adapter_validation_permit_before_execution(
         "predictive_cache.collection.cli.DirectMountExecutor",
         lambda *args, **kwargs: object(),
     )
+    class FakeCommandProvider:
+        def close(self):
+            return None
+
     monkeypatch.setattr(
         "predictive_cache.collection.cli.CommandCheckpointProvider",
-        lambda *args, **kwargs: object(),
+        lambda *args, **kwargs: FakeCommandProvider(),
     )
     monkeypatch.setattr(
         "predictive_cache.collection.cli.subprocess.run",
         lambda args, **kwargs: subprocess_calls.append(args),
+    )
+    monkeypatch.setattr(
+        "predictive_cache.collection.cli._approved_executable",
+        lambda path, _digest, _label: path,
+    )
+    monkeypatch.setattr(
+        "predictive_cache.collection.cli._snapshot_executable",
+        lambda path, _run_dir, _name, _digest: path,
+    )
+    monkeypatch.setattr(
+        "predictive_cache.collection.cli._approved_artifact",
+        lambda path, _digest, _label: path,
+    )
+    monkeypatch.setattr(
+        "predictive_cache.collection.cli._snapshot_artifact",
+        lambda path, _run_dir, _name, _digest: path,
+    )
+    def fake_open_verified_fd(_path, _digest):
+        fd = os.open("/dev/null", os.O_RDONLY)
+        runtime_fds.append(fd)
+        return fd
+
+    monkeypatch.setattr(
+        "predictive_cache.collection.cli._open_verified_fd",
+        fake_open_verified_fd,
+    )
+    monkeypatch.setattr(
+        "predictive_cache.collection.cli._approved_interpreter",
+        lambda: Path("/usr/bin/python3.12"),
     )
     result = CliRunner().invoke(
         main,
@@ -1298,6 +3373,8 @@ def test_bounded_run_seals_adapter_validation_permit_before_execution(
             str(tmp_path),
             "--checkpoint-command",
             str(tmp_path / "provider"),
+            "--provider-package",
+            str(tmp_path / "provider-package.zip"),
             "--validation-operations",
             "2",
             "--adapter-command",
@@ -1317,43 +3394,487 @@ def test_bounded_run_seals_adapter_validation_permit_before_execution(
     assert permit.operation_ids == tuple(item[4] for item in expected)
     assert subprocess_calls == [
         [
-            tmp_path / "adapter",
+            f"/proc/self/fd/{runtime_fds[0]}",
             run_dir,
             run_dir / "adapter-validation-permit.json",
         ],
-        [tmp_path / "cleaner", run_dir],
+        [f"/proc/self/fd/{runtime_fds[1]}", run_dir],
     ]
 
 
-def test_finalize_rejects_forged_and_tampered_dataset_hashes(tmp_path):
-    run_dir, report, dataset_root, validation_root, output = _finalization_fixture(tmp_path)
+def test_unapproved_validation_command_is_rejected(tmp_path):
+    command = tmp_path / "command"
+    command.write_text("#!/bin/sh\nexit 0\n")
+    command.chmod(0o700)
+    with pytest.raises(click.ClickException, match="approved executable"):
+        _approved_executable(command, "0" * 64, "adapter command")
+
+
+def test_verified_runtime_fd_survives_path_replacement(tmp_path):
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text("approved\n")
+    expected = sha256(wrapper)
+    fd = _open_verified_fd(wrapper, expected)
+    try:
+        wrapper.unlink()
+        wrapper.write_text("replacement\n")
+        with os.fdopen(os.dup(fd), "r") as stream:
+            assert stream.read() == "approved\n"
+    finally:
+        os.close(fd)
+
+
+def test_provider_provenance_rejects_replaced_snapshot(tmp_path, monkeypatch):
+    run_dir, _, _, _, _, roots, _ = _finalization_fixture(
+        tmp_path, monkeypatch
+    )
+    snapshot = run_dir / ".approved-tools/checkpoint-provider"
+    snapshot.chmod(0o600)
+    snapshot.write_text("replacement\n")
+    snapshot.chmod(0o500)
+    evidence = {
+        kind: _cleanup_root(kind, kind, path)
+        for kind, path in roots.items()
+    }
+    provider = LiveProviderDeclaration.model_validate_json(
+        (roots["live_provider_evidence"] / "provider-manifest.json").read_text()
+    )
+    source_manifest = CollectorFileManifest.model_validate_json(
+        (run_dir / "collector-file-manifest.json").read_text()
+    )
+    with pytest.raises(click.ClickException, match="approved executable"):
+        _validate_provider_provenance(
+            provider,
+            evidence,
+            "live_harness_evidence",
+            "controlled-demo",
+            sha256(run_dir / "manifest.json"),
+            300,
+            source_manifest,
+            "live",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("provider_package_sha256", "0" * 64),
+        ("interpreter_path", "/tmp/python3"),
+        ("interpreter_sha256", "0" * 64),
+        ("argv_contract", ("/usr/bin/python3.12", "wrong-provider")),
+    ],
+)
+def test_bounded_provider_requires_complete_provenance(
+    tmp_path,
+    monkeypatch,
+    field,
+    value,
+):
+    _, _, _, _, _, roots, _ = _finalization_fixture(tmp_path, monkeypatch)
+    evidence = {
+        kind: _cleanup_root(kind, kind, path)
+        for kind, path in roots.items()
+    }
+    provider_path = roots["bounded_provider_evidence"] / "provider-manifest.json"
+    provider = LiveProviderDeclaration.model_validate_json(
+        provider_path.read_text()
+    ).model_copy(update={field: value})
+    source_manifest = CollectorFileManifest.model_validate_json(
+        (
+            roots["bounded_harness_evidence"]
+            / "collector-file-manifest.json"
+        ).read_text()
+    )
+    with pytest.raises(click.ClickException, match="provenance is inconsistent"):
+        _validate_provider_provenance(
+            provider,
+            evidence,
+            "bounded_harness_evidence",
+            "bounded-validation",
+            sha256(
+                roots["bounded_harness_evidence"]
+                / "candidate-manifest.json"
+            ),
+            1,
+            source_manifest,
+            "bounded",
+        )
+
+
+@pytest.mark.parametrize("mutation", ["package", "invocation"])
+def test_bounded_provider_rejects_resealed_runtime_artifacts(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    _, _, _, _, _, roots, _ = _finalization_fixture(tmp_path, monkeypatch)
+    provider_path = roots["bounded_provider_evidence"] / "provider-manifest.json"
+    provider = LiveProviderDeclaration.model_validate_json(
+        provider_path.read_text()
+    )
+    if mutation == "package":
+        artifact = (
+            roots["bounded_harness_evidence"]
+            / ".approved-tools/provider-package.zip"
+        )
+        artifact.write_text("alternate package\n")
+        artifact.chmod(0o400)
+        provider = provider.model_copy(
+            update={
+                "provider_package_artifact": CleanupEvidenceReference(
+                    root_id="bounded_harness_evidence",
+                    path=".approved-tools/provider-package.zip",
+                    sha256=sha256(artifact),
+                )
+            }
+        )
+        message = "package snapshot is not approved"
+    else:
+        artifact = (
+            roots["bounded_harness_evidence"] / "provider-invocation.json"
+        )
+        raw = json.loads(artifact.read_text())
+        raw["actions"] = ["checkpoint"]
+        artifact.unlink()
+        artifact.write_text(json.dumps(raw) + "\n")
+        artifact.chmod(0o600)
+        provider = provider.model_copy(
+            update={
+                "invocation_record": CleanupEvidenceReference(
+                    root_id="bounded_harness_evidence",
+                    path="provider-invocation.json",
+                    sha256=sha256(artifact),
+                )
+            }
+        )
+        message = "invocation record is inconsistent"
+    evidence = {
+        kind: _cleanup_root(kind, kind, path)
+        for kind, path in roots.items()
+    }
+    source_manifest = CollectorFileManifest.model_validate_json(
+        (
+            roots["bounded_harness_evidence"]
+            / "collector-file-manifest.json"
+        ).read_text()
+    )
+    with pytest.raises(click.ClickException, match=message):
+        _validate_provider_provenance(
+            provider,
+            evidence,
+            "bounded_harness_evidence",
+            "bounded-validation",
+            sha256(
+                roots["bounded_harness_evidence"]
+                / "candidate-manifest.json"
+            ),
+            1,
+            source_manifest,
+            "bounded",
+        )
+
+
+def test_provider_package_must_reference_executed_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    _, _, _, _, _, roots, _ = _finalization_fixture(tmp_path, monkeypatch)
+    provider = LiveProviderDeclaration.model_validate_json(
+        (
+            roots["bounded_provider_evidence"] / "provider-manifest.json"
+        ).read_text()
+    ).model_copy(
+        update={
+            "provider_package_artifact": CleanupEvidenceReference(
+                root_id="bounded_provider_evidence",
+                path="provider-package.json",
+                sha256=sha256(
+                    roots["bounded_provider_evidence"]
+                    / "provider-package.json"
+                ),
+            )
+        }
+    )
+    evidence = {
+        kind: _cleanup_root(kind, kind, path)
+        for kind, path in roots.items()
+    }
+    source_manifest = CollectorFileManifest.model_validate_json(
+        (
+            roots["bounded_harness_evidence"]
+            / "collector-file-manifest.json"
+        ).read_text()
+    )
+    with pytest.raises(click.ClickException, match="canonical reference"):
+        _validate_provider_provenance(
+            provider,
+            evidence,
+            "bounded_harness_evidence",
+            "bounded-validation",
+            sha256(
+                roots["bounded_harness_evidence"]
+                / "candidate-manifest.json"
+            ),
+            1,
+            source_manifest,
+            "bounded",
+        )
+
+
+def test_provider_declaration_rejects_duplicate_chunk_reference(
+    tmp_path,
+    monkeypatch,
+):
+    _, _, _, _, _, roots, _ = _finalization_fixture(tmp_path, monkeypatch)
+    raw = json.loads(
+        (
+            roots["bounded_provider_evidence"] / "provider-manifest.json"
+        ).read_text()
+    )
+    raw["source_chunks"].append(dict(raw["source_chunks"][0]))
+    with pytest.raises(ValidationError, match="duplicate source chunks"):
+        LiveProviderDeclaration.model_validate(raw)
+
+
+@pytest.mark.parametrize("mutation", ["extra", "missing", "symlink"])
+def test_provider_rejects_nonexact_collector_chunk_inventory(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    _, _, _, _, _, roots, _ = _finalization_fixture(tmp_path, monkeypatch)
+    harness = roots["bounded_harness_evidence"]
+    source_manifest = CollectorFileManifest.model_validate_json(
+        (harness / "collector-file-manifest.json").read_text()
+    )
+    raw_path = harness / source_manifest.files[0].raw_jsonl_path
+    if mutation == "extra":
+        unexpected = raw_path.parent / "unexpected.jsonl"
+        unexpected.write_text(raw_path.read_text())
+        unexpected.chmod(0o600)
+    elif mutation == "missing":
+        raw_path.unlink()
+    else:
+        unexpected = raw_path.parent / "unexpected.jsonl"
+        unexpected.symlink_to(raw_path)
+        with pytest.raises(click.ClickException, match="symlink"):
+            _cleanup_root(
+                "bounded_harness_evidence",
+                "bounded_harness_evidence",
+                harness,
+            )
+        return
+    evidence = {
+        kind: _cleanup_root(kind, kind, path)
+        for kind, path in roots.items()
+    }
+    provider = LiveProviderDeclaration.model_validate_json(
+        (
+            roots["bounded_provider_evidence"] / "provider-manifest.json"
+        ).read_text()
+    )
+    with pytest.raises(click.ClickException):
+        _validate_provider_provenance(
+            provider,
+            evidence,
+            "bounded_harness_evidence",
+            "bounded-validation",
+            sha256(harness / "candidate-manifest.json"),
+            1,
+            source_manifest,
+            "bounded",
+        )
+
+
+def test_partition_and_bounded_daily_summary_are_exact(
+    tmp_path,
+    monkeypatch,
+):
+    _, _, _, _, _, roots, _ = _finalization_fixture(tmp_path, monkeypatch)
+    adapter_root = roots["bounded_adapter_dataset"]
+    event_path = next((adapter_root / "events").rglob("part-00000.jsonl"))
+    event = json.loads(event_path.read_text())
+    with pytest.raises(click.ClickException, match="canonical partition path"):
+        _validate_partitioned_rows(
+            {"events/volume_id=wrong/date=2026-11-04/part-00000.jsonl": [event]},
+            "events",
+            event["volume_id"],
+            {"2026-11-04"},
+        )
+    report = BoundedCleanReport.model_validate_json(
+        (
+            roots["bounded_clean_dataset"] / "report/quality.json"
+        ).read_text()
+    )
+    wrong_day = report.model_copy(
+        update={
+            "by_volume_day": (
+                report.by_volume_day[0].model_copy(
+                    update={"date": "2026-11-05"}
+                ),
+            )
+        }
+    )
+    with pytest.raises(click.ClickException, match="per-day distributions"):
+        _validate_clean_daily_summary(
+            wrong_day,
+            [event],
+            event["volume_id"],
+            "bounded",
+        )
+
+
+def test_jsonl_artifact_rejects_duplicate_keys(tmp_path):
+    artifact = tmp_path / "events.jsonl"
+    artifact.write_text('{"event_id":"first","event_id":"second"}\n')
+    with pytest.raises(click.ClickException, match="invalid JSONL artifact"):
+        _artifact_rows(artifact, 1)
+
+
+def test_raw_identity_reconciliation_rejects_unreferenced_event():
+    streams = {
+        ("pod-uid", "producer-epoch"): [
+            SimpleNamespace(local_id="event-1", sequence=1),
+            SimpleNamespace(local_id="event-2", sequence=2),
+        ]
+    }
+    durable = {
+        ("event-1", "pod-uid", "producer-epoch", 1): object(),
+    }
+    with pytest.raises(click.ClickException, match="exactly match durable"):
+        _validate_exact_raw_identities(streams, durable, 1)
+
+
+def test_clean_artifact_allowlist_rejects_events_prefix_smuggling(tmp_path):
+    root = private_dir(tmp_path) / "clean"
+    root.mkdir(mode=0o700)
+    manifest = root / "manifest.json"
+    manifest.write_text("{}\n")
+    manifest.chmod(0o600)
+    smuggled = root / "events-private" / "credentials.txt"
+    smuggled.parent.mkdir(mode=0o700)
+    smuggled.write_text("not dataset evidence\n")
+    smuggled.chmod(0o600)
+    evidence = _cleanup_root("live_clean_dataset", "live_clean_dataset", root)
+    with pytest.raises(click.ClickException, match="unsupported artifact path"):
+        _validate_dataset_artifacts(
+            evidence,
+            (
+                DatasetArtifact(
+                    path="events-private/credentials.txt",
+                    sha256=sha256(smuggled),
+                    rows=None,
+                ),
+            ),
+            "manifest.json",
+            (
+                "events_clean/",
+                "excluded/",
+                "coverage/",
+                "validation.json",
+            ),
+        )
+
+
+def test_clean_artifact_contract_rejects_unvalidated_class_member(
+    tmp_path,
+    monkeypatch,
+):
+    _, _, _, _, _, roots, _ = _finalization_fixture(tmp_path, monkeypatch)
+    clean_root_path = roots["live_clean_dataset"]
+    clean_root = _cleanup_root(
+        "live_clean_dataset",
+        "live_clean_dataset",
+        clean_root_path,
+    )
+    manifest = LiveCleanManifest.model_validate_json(
+        (clean_root_path / "manifest.json").read_text()
+    )
+    report = LiveCleanReport.model_validate_json(
+        (clean_root_path / "report/quality.json").read_text()
+    )
+    artifacts = _validate_dataset_artifacts(
+        clean_root,
+        manifest.files,
+        "manifest.json",
+        (
+            "events_clean/",
+            "excluded/",
+            "coverage/",
+            "opens/",
+            "open_ranges/",
+            "meta/",
+            "report/",
+            "config.resolved.yaml",
+            "validation.json",
+        ),
+    )
+    artifacts["meta/private-data.bin"] = None
+    adapter_event_path = next(
+        (roots["live_adapter_dataset"] / "events").rglob(
+            "part-00000.jsonl"
+        )
+    )
+    adapter_rows = [
+        json.loads(line)
+        for line in adapter_event_path.read_text().splitlines()
+    ]
+    with pytest.raises(click.ClickException, match="set is not canonical"):
+        _validate_clean_artifact_contract(
+            clean_root,
+            artifacts,
+            manifest,
+            report,
+            adapter_rows,
+        )
+    artifacts.pop("meta/private-data.bin")
+    (clean_root_path / "validation.json").write_text(
+        '{"status":"failed"}\n'
+    )
+    with pytest.raises(click.ClickException, match="auxiliary artifacts"):
+        _validate_clean_artifact_contract(
+            clean_root,
+            artifacts,
+            manifest,
+            report,
+            adapter_rows,
+        )
+
+
+def test_finalize_rejects_forged_and_tampered_dataset_hashes(tmp_path, monkeypatch):
+    run_dir, report, dataset_root, finalization_root, attestation, roots, output = _finalization_fixture(
+        tmp_path, monkeypatch
+    )
     raw = json.loads(report.read_text())
-    raw["output_hashes"]["events.jsonl"] = "0" * 64
+    output_key = output.relative_to(dataset_root).as_posix()
+    raw["output_hashes"][output_key] = "0" * 64
     report.write_text(json.dumps(raw) + "\n")
     result = CliRunner().invoke(
         main,
-        _finalize_args(run_dir, report, dataset_root, validation_root),
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, roots),
     )
     assert result.exit_code != 0
     assert "do not match actual outputs" in result.output
 
-    raw["output_hashes"]["events.jsonl"] = sha256(output)
+    raw["output_hashes"][output_key] = sha256(output)
     report.write_text(json.dumps(raw) + "\n")
     output.write_text('{"event":"tampered"}\n')
     result = CliRunner().invoke(
         main,
-        _finalize_args(run_dir, report, dataset_root, validation_root),
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, roots),
     )
     assert result.exit_code != 0
     assert "do not match actual outputs" in result.output
 
 
-def test_finalize_rejects_missing_or_symlinked_outputs(tmp_path):
-    run_dir, report, dataset_root, validation_root, output = _finalization_fixture(tmp_path)
+def test_finalize_rejects_missing_or_symlinked_outputs(tmp_path, monkeypatch):
+    run_dir, report, dataset_root, finalization_root, attestation, roots, output = _finalization_fixture(
+        tmp_path, monkeypatch
+    )
     output.unlink()
     result = CliRunner().invoke(
         main,
-        _finalize_args(run_dir, report, dataset_root, validation_root),
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, roots),
     )
     assert result.exit_code != 0
 
@@ -1363,18 +3884,21 @@ def test_finalize_rejects_missing_or_symlinked_outputs(tmp_path):
     output.symlink_to(target)
     result = CliRunner().invoke(
         main,
-        _finalize_args(run_dir, report, dataset_root, validation_root),
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, roots),
     )
     assert result.exit_code != 0
     assert "must not contain symlinks" in result.output
 
 
-def test_finalize_rejects_unsafe_external_validation_root(tmp_path):
-    run_dir, report, dataset_root, validation_root, _ = _finalization_fixture(tmp_path)
+def test_finalize_rejects_unsafe_external_validation_root(tmp_path, monkeypatch):
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = _finalization_fixture(
+        tmp_path, monkeypatch
+    )
+    validation_root = roots["bounded_provider_evidence"]
     validation_root.chmod(0o755)
     result = CliRunner().invoke(
         main,
-        _finalize_args(run_dir, report, dataset_root, validation_root),
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, roots),
     )
     assert result.exit_code != 0
     assert "must be owner-only" in result.output
@@ -1382,26 +3906,29 @@ def test_finalize_rejects_unsafe_external_validation_root(tmp_path):
     validation_root.chmod(0o700)
     link = tmp_path / "validation-link"
     link.symlink_to(validation_root, target_is_directory=True)
+    linked_roots = roots | {"bounded_provider_evidence": link}
     result = CliRunner().invoke(
         main,
-        _finalize_args(run_dir, report, dataset_root, link),
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, linked_roots),
     )
     assert result.exit_code != 0
     assert "must not traverse symlinks" in result.output
 
 
-def test_finalize_rejects_missing_or_failed_reconciliation(tmp_path):
-    run_dir, report, dataset_root, validation_root, _ = _finalization_fixture(tmp_path)
+def test_finalize_rejects_missing_or_failed_reconciliation(tmp_path, monkeypatch):
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = _finalization_fixture(
+        tmp_path, monkeypatch
+    )
     (run_dir / "reconciliation.json").unlink()
     result = CliRunner().invoke(
         main,
-        _finalize_args(run_dir, report, dataset_root, validation_root),
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, roots),
     )
     assert result.exit_code != 0
     assert "full-run evidence is incomplete" in result.output
 
-    fixture = _finalization_fixture(tmp_path / "failed")
-    run_dir, report, dataset_root, validation_root, _ = fixture
+    fixture = _finalization_fixture(tmp_path / "failed", monkeypatch)
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = fixture
     reconciliation = ReconciliationReport.model_validate_json(
         (run_dir / "reconciliation.json").read_text()
     )
@@ -1412,34 +3939,558 @@ def test_finalize_rejects_missing_or_failed_reconciliation(tmp_path):
     )
     result = CliRunner().invoke(
         main,
-        _finalize_args(run_dir, report, dataset_root, validation_root),
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, roots),
     )
     assert result.exit_code != 0
     assert "successful reconciliation evidence is required" in result.output
 
 
-def test_finalize_authenticates_external_validation_manifest(tmp_path):
-    run_dir, report, dataset_root, validation_root, _ = _finalization_fixture(tmp_path)
-    validation_manifest = validation_root / "validation-manifest.json"
-    raw = json.loads(validation_manifest.read_text())
-    raw["provider_sha256"] = "0" * 64
-    validation_manifest.write_text(json.dumps(raw) + "\n")
+def test_finalize_authenticates_external_validation_manifest(tmp_path, monkeypatch):
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = _finalization_fixture(
+        tmp_path, monkeypatch
+    )
+    raw = json.loads(attestation.read_text())
+    raw["provider"]["sha256"] = "0" * 64
+    attestation.unlink()
+    attestation.write_text(json.dumps(raw) + "\n")
+    attestation.chmod(0o600)
     result = CliRunner().invoke(
         main,
-        _finalize_args(run_dir, report, dataset_root, validation_root),
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, roots),
     )
     assert result.exit_code != 0
-    assert "not approved" in result.output
+    assert "hash mismatch" in result.output
 
-    fixture = _finalization_fixture(tmp_path / "tampered")
-    run_dir, report, dataset_root, validation_root, _ = fixture
-    (validation_root / "provider.jsonl").write_text('{"provider":"tampered"}\n')
+    fixture = _finalization_fixture(tmp_path / "tampered", monkeypatch)
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = fixture
+    (roots["bounded_provider_evidence"] / "provider-evidence.jsonl").write_text(
+        '{"provider":"tampered"}\n'
+    )
     result = CliRunner().invoke(
         main,
-        _finalize_args(run_dir, report, dataset_root, validation_root),
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, roots),
     )
     assert result.exit_code != 0
-    assert "do not match actual files" in result.output
+    assert "does not match attestation" in result.output
+
+
+def test_finalize_rejects_resealed_contract_substitution(tmp_path, monkeypatch):
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = (
+        _finalization_fixture(tmp_path, monkeypatch)
+    )
+    contract = roots["bounded_harness_evidence"] / "cluster-provenance-v1.json"
+    contract.write_text('{"substituted":true}\n')
+    contract.chmod(0o600)
+    resealed = _cleanup_root(
+        "bounded_harness_evidence",
+        "bounded_harness_evidence",
+        roots["bounded_harness_evidence"],
+    )
+    raw = json.loads(attestation.read_text())
+    raw["cluster_provenance"]["sha256"] = sha256(contract)
+    raw["cleanup_roots"] = [
+        resealed.model_dump(mode="json")
+        if item["kind"] == "bounded_harness_evidence"
+        else item
+        for item in raw["cleanup_roots"]
+    ]
+    attestation.unlink()
+    attestation.write_text(json.dumps(raw) + "\n")
+    attestation.chmod(0o600)
+    result = CliRunner().invoke(
+        main,
+        _finalize_args(
+            run_dir,
+            report,
+            dataset_root,
+            finalization_root,
+            attestation,
+            roots,
+        ),
+    )
+    assert result.exit_code != 0
+    assert "does not match the live experiment profile" in result.output
+
+
+def test_finalize_rejects_decoy_artifact_path_with_matching_bytes(
+    tmp_path,
+    monkeypatch,
+):
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = (
+        _finalization_fixture(tmp_path, monkeypatch)
+    )
+    source = roots["bounded_adapter_dataset"] / "manifest.json"
+    decoy = roots["bounded_adapter_dataset"] / "decoy-manifest.json"
+    decoy.write_bytes(source.read_bytes())
+    decoy.chmod(0o600)
+    resealed = _cleanup_root(
+        "bounded_adapter_dataset",
+        "bounded_adapter_dataset",
+        roots["bounded_adapter_dataset"],
+    )
+    raw = json.loads(attestation.read_text())
+    raw["imported_manifest"]["path"] = "decoy-manifest.json"
+    raw["cleanup_roots"] = [
+        resealed.model_dump(mode="json")
+        if item["kind"] == "bounded_adapter_dataset"
+        else item
+        for item in raw["cleanup_roots"]
+    ]
+    attestation.unlink()
+    attestation.write_text(json.dumps(raw) + "\n")
+    attestation.chmod(0o600)
+    result = CliRunner().invoke(
+        main,
+        _finalize_args(
+            run_dir,
+            report,
+            dataset_root,
+            finalization_root,
+            attestation,
+            roots,
+        ),
+    )
+    assert result.exit_code != 0
+    assert "wrong canonical artifact" in result.output
+
+
+def test_finalize_requires_exact_eight_distinct_roots(tmp_path, monkeypatch):
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = _finalization_fixture(
+        tmp_path, monkeypatch
+    )
+    seven = dict(roots)
+    seven.pop("bounded_clean_dataset")
+    result = CliRunner().invoke(
+        main,
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, seven),
+    )
+    assert result.exit_code != 0
+    assert "exactly eight" in result.output
+
+    nine = dict(roots)
+    extra = tmp_path / "extra"
+    extra.mkdir(mode=0o700)
+    evidence = extra / "evidence.json"
+    evidence.write_text("{}\n")
+    evidence.chmod(0o600)
+    nine["extra_root"] = extra
+    result = CliRunner().invoke(
+        main,
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, nine),
+    )
+    assert result.exit_code != 0
+    assert "exactly eight" in result.output
+
+    duplicate = roots | {
+        "bounded_provider_evidence": roots["bounded_adapter_dataset"]
+    }
+    result = CliRunner().invoke(
+        main,
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, duplicate),
+    )
+    assert result.exit_code != 0
+    assert "distinct and non-nested" in result.output
+
+    nested_root = roots["bounded_adapter_dataset"] / "nested-provider"
+    shutil.copytree(roots["bounded_provider_evidence"], nested_root)
+    nested_root.chmod(0o700)
+    for path in nested_root.rglob("*"):
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    nested = roots | {"bounded_provider_evidence": nested_root}
+    result = CliRunner().invoke(
+        main,
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, nested),
+    )
+    assert result.exit_code != 0
+    assert "distinct and non-nested" in result.output
+
+
+def test_finalize_rejects_root_kind_swap_and_copied_substitute(tmp_path, monkeypatch):
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = _finalization_fixture(
+        tmp_path, monkeypatch
+    )
+    swapped = roots | {
+        "bounded_adapter_dataset": roots["bounded_clean_dataset"],
+        "bounded_clean_dataset": roots["bounded_adapter_dataset"],
+    }
+    result = CliRunner().invoke(
+        main,
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, swapped),
+    )
+    assert result.exit_code != 0
+    assert "does not match attestation" in result.output
+
+    copied_root = tmp_path / "copied-provider"
+    shutil.copytree(roots["bounded_provider_evidence"], copied_root)
+    copied_root.chmod(0o700)
+    for path in copied_root.rglob("*"):
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    copied = roots | {"bounded_provider_evidence": copied_root}
+    result = CliRunner().invoke(
+        main,
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, copied),
+    )
+    assert result.exit_code != 0
+    assert "does not match attestation" in result.output
+
+
+def test_finalize_rejects_relabelled_live_run_and_code_hash(tmp_path, monkeypatch):
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = _finalization_fixture(
+        tmp_path, monkeypatch
+    )
+    raw = json.loads(report.read_text())
+    raw["live_finalization"]["run_id"] = "bounded-validation"
+    report.write_text(json.dumps(raw) + "\n")
+    result = CliRunner().invoke(
+        main,
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, roots),
+    )
+    assert result.exit_code != 0
+    assert "live finalization declaration is inconsistent" in result.output
+
+    fixture = _finalization_fixture(tmp_path / "code-mismatch", monkeypatch)
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = fixture
+    raw = json.loads(attestation.read_text())
+    raw["validated_tree_sha256"] = "0" * 40
+    attestation.unlink()
+    attestation.write_text(json.dumps(raw) + "\n")
+    attestation.chmod(0o600)
+    result = CliRunner().invoke(
+        main,
+        _finalize_args(run_dir, report, dataset_root, finalization_root, attestation, roots),
+    )
+    assert result.exit_code != 0
+    assert "provenance is not approved" in result.output
+
+    fixture = _finalization_fixture(tmp_path / "expired", monkeypatch)
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = fixture
+    raw = json.loads(attestation.read_text())
+    raw["started_at"] = (START + timedelta(hours=2)).isoformat()
+    raw["completed_at"] = (START + timedelta(hours=2, minutes=1)).isoformat()
+    attestation.unlink()
+    attestation.write_text(json.dumps(raw) + "\n")
+    attestation.chmod(0o600)
+    result = CliRunner().invoke(
+        main,
+        _finalize_args(
+            run_dir,
+            report,
+            dataset_root,
+            finalization_root,
+            attestation,
+            roots,
+        ),
+    )
+    assert result.exit_code != 0
+    assert "execution interval does not match permit evidence" in result.output
+
+
+@pytest.mark.parametrize(
+    ("kind", "reference_name", "manifest_name", "mutation"),
+    [
+        (
+            "live_provider_evidence",
+            "provider_manifest",
+            "provider-manifest.json",
+            lambda value: value | {"operation_count": 299},
+        ),
+        (
+            "live_adapter_dataset",
+            "adapter_manifest",
+            "manifest.json",
+            lambda value: value
+            | {
+                "counts": value["counts"]
+                | {"events": 299, "by_origin": {"synthetic": 299}}
+            },
+        ),
+        (
+            "live_adapter_dataset",
+            "adapter_manifest",
+            "manifest.json",
+            lambda value: value
+            | {
+                "generator": value["generator"]
+                | {
+                    "runtime": value["generator"]["runtime"]
+                    | {"run_manifest_sha256": "0" * 64}
+                }
+            },
+        ),
+        (
+            "live_adapter_dataset",
+            "adapter_manifest",
+            "manifest.json",
+            lambda value: value
+            | {
+                "counts": value["counts"]
+                | {"dropped_events": 1}
+            },
+        ),
+        (
+            "live_adapter_dataset",
+            "adapter_manifest",
+            "manifest.json",
+            lambda value: value
+            | {"known_gaps": [{"reason": "unexpected"}]},
+        ),
+        (
+            "live_adapter_dataset",
+            "adapter_report",
+            "report/import.json",
+            lambda value: value | {"validation_permit_sha256": "0" * 64},
+        ),
+        (
+            "live_adapter_dataset",
+            "adapter_report",
+            "report/import.json",
+            lambda value: value
+            | {"approved_exclusions": [{"reason": "unexpected"}]},
+        ),
+        (
+            "live_clean_dataset",
+            "cleaned_manifest",
+            "manifest.json",
+            lambda value: value
+            | {"parent": {"manifest_sha256": "0" * 64}},
+        ),
+        (
+            "live_clean_dataset",
+            "cleaned_manifest",
+            "manifest.json",
+            lambda value: value
+            | {
+                "parent": value["parent"]
+                | {"dataset_id": "wrong-parent"}
+            },
+        ),
+        (
+            "live_clean_dataset",
+            "cleaned_manifest",
+            "manifest.json",
+            lambda value: value
+            | {"counts": value["counts"] | {"opens": 1}},
+        ),
+        (
+            "live_clean_dataset",
+            "cleaned_report",
+            "report/quality.json",
+            lambda value: value
+            | {"exclusions_by_volume_day_reason": []},
+        ),
+        (
+            "live_clean_dataset",
+            "cleaned_report",
+            "report/quality.json",
+            lambda value: value
+            | {"app_mix": {"wrong-app": 300}},
+        ),
+    ],
+)
+def test_finalize_rejects_semantically_stale_live_outputs(
+    tmp_path,
+    monkeypatch,
+    kind,
+    reference_name,
+    manifest_name,
+    mutation,
+):
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = (
+        _finalization_fixture(tmp_path, monkeypatch)
+    )
+    manifest_path = roots[kind] / manifest_name
+    raw_manifest = json.loads(manifest_path.read_text())
+    manifest_path.write_text(json.dumps(mutation(raw_manifest)) + "\n")
+    manifest_path.chmod(0o600)
+    resealed = _cleanup_root(kind, kind, roots[kind])
+    raw_report = json.loads(report.read_text())
+    raw_report["live_finalization"][reference_name]["sha256"] = sha256(
+        manifest_path
+    )
+    raw_report["live_finalization"]["cleanup_roots"] = [
+        resealed.model_dump(mode="json") if item["kind"] == kind else item
+        for item in raw_report["live_finalization"]["cleanup_roots"]
+    ]
+    if kind == "live_clean_dataset" and manifest_name == "manifest.json":
+        raw_report["output_hashes"]["manifest.json"] = sha256(manifest_path)
+    if kind == "live_clean_dataset" and manifest_name == "report/quality.json":
+        raw_report["validation_provenance"]["report/quality.json"] = sha256(
+            manifest_path
+        )
+    report.write_text(json.dumps(raw_report) + "\n")
+    result = CliRunner().invoke(
+        main,
+        _finalize_args(
+            run_dir,
+            report,
+            dataset_root,
+            finalization_root,
+            attestation,
+            roots,
+        ),
+    )
+    assert result.exit_code != 0
+    assert "live " in result.output
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["zero", "missing", "duplicate", "wrong_status", "wrong_count"],
+)
+def test_finalize_rejects_invalid_live_coverage(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    run_dir, report, dataset_root, finalization_root, attestation, roots, _ = (
+        _finalization_fixture(tmp_path, monkeypatch)
+    )
+    coverage_path = dataset_root / "coverage/coverage.jsonl"
+    rows = [json.loads(line) for line in coverage_path.read_text().splitlines()]
+    if mutation == "zero":
+        rows = []
+    elif mutation == "missing":
+        rows = rows[:-1]
+    elif mutation == "duplicate":
+        rows[-1] = dict(rows[0])
+    elif mutation == "wrong_status":
+        rows[0]["status"] = "incomplete"
+    else:
+        rows[0]["offered"] = 59
+        rows[0]["emitted"] = 59
+    coverage_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    coverage_path.chmod(0o600)
+
+    clean_manifest_path = dataset_root / "manifest.json"
+    clean_manifest = json.loads(clean_manifest_path.read_text())
+    for item in clean_manifest["files"]:
+        if item["path"] == "coverage/coverage.jsonl":
+            item["sha256"] = sha256(coverage_path)
+    if mutation == "zero":
+        clean_manifest["coverage"]["hours"] = 0
+        clean_manifest["coverage"]["complete"] = 0
+    clean_manifest_path.write_text(json.dumps(clean_manifest) + "\n")
+    clean_manifest_path.chmod(0o600)
+
+    quality_path = dataset_root / "report/quality.json"
+    quality = json.loads(quality_path.read_text())
+    if mutation == "zero":
+        quality["coverage_hours"] = {"complete": 0}
+    quality_path.write_text(json.dumps(quality) + "\n")
+    quality_path.chmod(0o600)
+
+    resealed = _cleanup_root(
+        "live_clean_dataset",
+        "live_clean_dataset",
+        dataset_root,
+    )
+    raw_report = json.loads(report.read_text())
+    raw_report["output_hashes"]["coverage/coverage.jsonl"] = sha256(coverage_path)
+    raw_report["output_hashes"]["manifest.json"] = sha256(clean_manifest_path)
+    raw_report["validation_provenance"]["report/quality.json"] = sha256(quality_path)
+    raw_report["live_finalization"]["cleaned_manifest"]["sha256"] = sha256(
+        clean_manifest_path
+    )
+    raw_report["live_finalization"]["cleaned_report"]["sha256"] = sha256(
+        quality_path
+    )
+    raw_report["live_finalization"]["cleanup_roots"] = [
+        resealed.model_dump(mode="json")
+        if item["kind"] == "live_clean_dataset"
+        else item
+        for item in raw_report["live_finalization"]["cleanup_roots"]
+    ]
+    report.write_text(json.dumps(raw_report) + "\n")
+    result = CliRunner().invoke(
+        main,
+        _finalize_args(
+            run_dir,
+            report,
+            dataset_root,
+            finalization_root,
+            attestation,
+            roots,
+        ),
+    )
+    assert result.exit_code != 0
+    assert "live clean" in result.output or "row count mismatch" in result.output
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("duplicate", "event identities"),
+        ("event_time", "adapter event row"),
+    ],
+)
+def test_finalize_rejects_invalid_adapter_event_identity_or_time(
+    tmp_path,
+    monkeypatch,
+    mutation,
+    message,
+):
+    run_dir, _, _, _, _, roots, _ = (
+        _finalization_fixture(tmp_path, monkeypatch)
+    )
+    events_path = next(
+        (roots["live_adapter_dataset"] / "events").rglob("part-00000.jsonl")
+    )
+    rows = [json.loads(line) for line in events_path.read_text().splitlines()]
+    if mutation == "duplicate":
+        rows[1]["event_id"] = rows[0]["event_id"]
+    else:
+        rows[0]["event_time"] = (
+            datetime.fromisoformat(rows[0]["event_time"])
+            + timedelta(seconds=1)
+        ).isoformat()
+    loss_rows = [
+        json.loads(line)
+        for line in (
+            roots["live_adapter_dataset"] / "loss/loss.jsonl"
+        ).read_text().splitlines()
+    ]
+    excluded_rows = [
+        json.loads(line)
+        for line in (
+            next(
+                (roots["live_clean_dataset"] / "excluded").rglob(
+                    "part-00000.jsonl"
+                )
+            )
+        ).read_text().splitlines()
+    ]
+    coverage_rows = [
+        LiveCoverageRow.model_validate_json(line)
+        for line in (
+            roots["live_clean_dataset"] / "coverage/coverage.jsonl"
+        ).read_text().splitlines()
+    ]
+    provider = LiveProviderDeclaration.model_validate_json(
+        (
+            roots["live_provider_evidence"] / "provider-manifest.json"
+        ).read_text()
+    )
+    live_manifest = CollectionManifest.model_validate_json(
+        (run_dir / "manifest.json").read_text()
+    )
+    live_catalog = FixtureCatalog.model_validate_json(
+        (run_dir / "fixture-catalog.json").read_text()
+    )
+    root_evidence = {
+        kind: _cleanup_root(kind, kind, path)
+        for kind, path in roots.items()
+    }
+    with pytest.raises(click.ClickException, match=message):
+        _validate_live_row_chain(
+            root_evidence,
+            live_manifest,
+            live_catalog,
+            provider,
+            rows,
+            loss_rows,
+            excluded_rows,
+            coverage_rows,
+        )
 
 
 def mount_operation(
@@ -1754,35 +4805,57 @@ def test_command_provider_uses_deployment_checkpoint_and_probe_contract(monkeypa
         return type("Completed", (), {"stdout": output + "\n"})()
 
     monkeypatch.setattr("predictive_cache.collection.harness.subprocess.run", fake_run)
+    script = tmp_path / "cluster2-collection-provider.py"
+    package = tmp_path / "provider-package.zip"
+    script.write_text("provider\n")
+    package.write_text("package\n")
     provider = CommandCheckpointProvider(
-        tmp_path / "cluster2-collection-provider.py",
+        script,
+        package,
         root,
+        script_sha256=sha256(script),
+        package_sha256=sha256(package),
     )
     assert provider.collect(START)
     assert provider.health(operation)
+    script.unlink()
+    script.write_text("replacement\n")
+    package.unlink()
+    package.write_text("replacement\n")
+    with os.fdopen(os.dup(provider._script_fd), "r") as stream:
+        assert stream.read() == "provider\n"
+    with os.fdopen(os.dup(provider._package_fd), "r") as stream:
+        assert stream.read() == "package\n"
     result = DryRunExecutor(lambda: START).read(operation)
     assert provider.post_read(operation, result)
-    assert calls[0] == [
+    prefix = [
         "python3",
-        (tmp_path / "cluster2-collection-provider.py").absolute(),
+        "-I",
+        "-S",
+        "-c",
+        ISOLATED_PROVIDER_BOOTSTRAP,
+        f"/proc/self/fd/{provider._package_fd}",
+        f"/proc/self/fd/{provider._script_fd}",
+    ]
+    assert calls[0] == [
+        *prefix,
         "checkpoint",
         root.absolute(),
         "--scheduled-at",
         "2026-11-04T00:00:00Z",
     ]
     assert calls[1] == [
-        "python3",
-        (tmp_path / "cluster2-collection-provider.py").absolute(),
+        *prefix,
         "probe",
         root.absolute(),
         "--operation-id",
         operation.operation_id,
     ]
     assert calls[2] == [
-        "python3",
-        (tmp_path / "cluster2-collection-provider.py").absolute(),
+        *prefix,
         "post-read",
         root.absolute(),
         "--operation-id",
         operation.operation_id,
     ]
+    provider.close()
