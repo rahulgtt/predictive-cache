@@ -6,12 +6,16 @@ synthetic NFSv4.1 READ collection used to exercise collection reconciliation,
 the Chimera importer, and production cleaning.
 
 The package is not committed to Git, published through ClearML, or available
-through a repository-relative path. Its current retention is indefinite by
-user decision. The owner is the `automation` account. Package roots are
-owner-private mode `0700`, and package files are mode `0600`.
+through a repository-relative path. The owner is the `automation` account.
+Package roots are owner-private mode `0700`, and package files are mode `0600`.
 
-The package is collected and reconciled, but not finalized. The current
-owner-approved integrity summary is:
+The unchanged private `MANIFEST.json` remains a pre-finalization snapshot: its
+`collected_and_reconciled_not_finalized` status describes package creation, not
+the current evidence disposition. Historical finalization subsequently
+recorded the terminal retain-all outcome for all 13 evidence roots. Every root
+is retained indefinitely, with no deletion deadline or cleanup schedule.
+
+The current owner-approved integrity summary is:
 
 | Property | Value |
 | --- | --- |
