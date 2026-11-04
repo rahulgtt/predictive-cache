@@ -16,7 +16,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from predictive_cache.controller.http import HttpSource
 from predictive_cache.controller.ingest import Ingestor
+from predictive_cache.controller.pass2_runtime import (
+    Pass2RuntimeConfig,
+    Pass2RuntimeError,
+    Pass2Scheduler,
+)
 from predictive_cache.controller.sources import RealClock, ReplayClock, ReplaySource
+from predictive_cache.dispatcher.schema import parse_utc_z
+from predictive_cache.dispatcher.securefs import SecureFileError
 from predictive_cache.prep.config import CleanConfig
 
 
@@ -167,6 +174,118 @@ def run(config_path):
     except Exception:
         raise click.ClickException("ingestion failed; check configuration and source") from None
     click.echo(json.dumps(_summary(ingestor, updates), sort_keys=True))
+
+
+@main.command("run-pass2")
+@click.option(
+    "--schedule",
+    "schedule_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--target-map",
+    "target_map_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--dispatcher-root",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.option("--run-id", required=True)
+@click.option("--run-start", required=True, help="Explicit Pass-2 UTC start time.")
+@click.option(
+    "--publish-lead-seconds",
+    type=click.IntRange(min=0, max=299),
+    default=5,
+    show_default=True,
+)
+@click.option(
+    "--plan-ttl-seconds",
+    type=click.IntRange(min=1, max=300),
+    default=120,
+    show_default=True,
+)
+@click.option(
+    "--max-bytes-per-min",
+    type=click.IntRange(min=1),
+    default=64 * 2**20,
+    show_default=True,
+)
+@click.option(
+    "--max-items-per-min",
+    type=click.IntRange(min=1),
+    default=60,
+    show_default=True,
+)
+@click.option(
+    "--poll-seconds",
+    type=click.FloatRange(min=0.01),
+    default=0.1,
+    show_default=True,
+)
+@click.option(
+    "--clock-tolerance-seconds",
+    type=click.FloatRange(min=0),
+    default=1.0,
+    show_default=True,
+)
+@click.option("--stop-file", default="stop", show_default=True)
+@click.option("--once", is_flag=True, help="Publish work due now and exit.")
+def run_pass2(
+    schedule_path: Path,
+    target_map_path: Path,
+    dispatcher_root: Path,
+    run_id: str,
+    run_start: str,
+    publish_lead_seconds: int,
+    plan_ttl_seconds: int,
+    max_bytes_per_min: int,
+    max_items_per_min: int,
+    poll_seconds: float,
+    clock_tolerance_seconds: float,
+    stop_file: str,
+    once: bool,
+) -> None:
+    """Publish due frozen Pass-2 predictions to the plan-file Dispatcher."""
+    try:
+        config = Pass2RuntimeConfig(
+            schedule_path=schedule_path.absolute(),
+            target_map_path=target_map_path.absolute(),
+            dispatcher_root=dispatcher_root.absolute(),
+            run_id=run_id,
+            run_start=parse_utc_z(run_start),
+            publish_lead_seconds=publish_lead_seconds,
+            plan_ttl_seconds=plan_ttl_seconds,
+            max_bytes_per_min=max_bytes_per_min,
+            max_items_per_min=max_items_per_min,
+            poll_seconds=poll_seconds,
+            clock_tolerance_seconds=clock_tolerance_seconds,
+            stop_file=stop_file,
+        )
+        with Pass2Scheduler(config) as scheduler:
+            stats = scheduler.run(once=once)
+    except Pass2RuntimeError as exc:
+        raise click.ClickException(str(exc)) from None
+    except (OSError, SecureFileError, ValueError):
+        raise click.ClickException(
+            "Pass-2 scheduling failed; inspect the owner-only state and audit records"
+        ) from None
+    click.echo(
+        json.dumps(
+            {
+                "status": stats.status,
+                "reason": stats.reason,
+                "pending_items": stats.pending_items,
+                "published_plans": stats.published_plans,
+                "published_items": stats.published_items,
+                "skipped_items": stats.skipped_items,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":
