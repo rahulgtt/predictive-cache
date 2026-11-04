@@ -107,6 +107,20 @@ class _Handler(BaseHTTPRequestHandler):
         self._respond(code, {"error": code})
 
     def _respond(self, status, payload):
+        source = self.server.source
+        if (
+            source.wire_format == "nfs4_read_v2"
+            and getattr(self, "_authenticated", False)
+            and status >= 400
+            and not getattr(self, "_rejection_counted", False)
+        ):
+            self._rejection_counted = True
+            try:
+                source.on_reject()
+            except Exception:
+                # Rejection accounting must never echo request or credential data.
+                source.rejection_failed = True
+                status, payload = 503, {"error": 503}
         self.close_connection = True
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         try:
@@ -122,6 +136,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         source = self.server.source
+        self._authenticated = False
         if self.path != "/v1/events":
             self._respond(404, {"error": 404})
             return
@@ -132,6 +147,7 @@ class _Handler(BaseHTTPRequestHandler):
         ):
             self._respond(401, {"error": 401})
             return
+        self._authenticated = True
         lengths = self.headers.get_all("Content-Length", [])
         if self.headers.get_all("Transfer-Encoding") or len(lengths) > 1:
             self._respond(400, {"error": 400})
@@ -160,12 +176,37 @@ class _Handler(BaseHTTPRequestHandler):
             if len(body) != length:
                 self._respond(400, {"error": 400})
                 return
-            events = json.loads(body, parse_constant=_invalid_constant)
+            options = {"parse_constant": _invalid_constant}
+            if source.wire_format == "nfs4_read_v2":
+                options["object_pairs_hook"] = _unique_object
+            events = json.loads(body, **options)
         except (TimeoutError, socket.timeout):
             self._respond(408, {"error": 408})
             return
         except (ValueError, UnicodeError, RecursionError):
             self._respond(400, {"error": 400})
+            return
+        if source.wire_format == "nfs4_read_v2":
+            from .chimera_reads import EnvelopeError
+
+            if not isinstance(events, dict) or not isinstance(events.get("events"), list):
+                self._respond(400, {"error": 400})
+                return
+            if len(events["events"]) > source.max_events:
+                self._respond(413, {"error": 413})
+                return
+            try:
+                accepted, dropped, duplicate = source.sink(events)
+            except EnvelopeError as exc:
+                # Avoid charging the same rejected request twice.
+                self._rejection_counted = bool(getattr(exc, "loss_accounted", False))
+                self._respond(exc.status, {"error": exc.status})
+            except Exception:
+                self._respond(503, {"error": 503})
+            else:
+                self._respond(
+                    202, {"accepted": accepted, "dropped": dropped, "duplicate": duplicate}
+                )
             return
         if not isinstance(events, list) or any(not isinstance(row, dict) for row in events):
             self._respond(400, {"error": 400})
@@ -186,6 +227,15 @@ def _invalid_constant(value):
     raise ValueError("non-finite JSON number")
 
 
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON field")
+        result[key] = value
+    return result
+
+
 class HttpSource:
     """Receiver with eight workers and no unbounded pending-request queue.
 
@@ -203,7 +253,13 @@ class HttpSource:
         max_events=10000,
         max_concurrent=8,
         read_timeout_s=2,
+        wire_format="normalized-v1",
+        on_reject=None,
     ):
+        if wire_format not in {"normalized-v1", "nfs4_read_v2"}:
+            raise ValueError("unsupported HTTP wire format")
+        if wire_format == "nfs4_read_v2" and not callable(on_reject):
+            raise ValueError("raw ingress requires rejection accounting")
         if not isinstance(token, str) or not token or any(c.isspace() for c in token):
             raise ValueError("a nonempty bearer token without whitespace is required")
         for value, cap in (
@@ -221,6 +277,8 @@ class HttpSource:
         self.max_events = max_events
         self.max_concurrent = max_concurrent
         self.read_timeout_s = read_timeout_s
+        self.wire_format, self.on_reject = wire_format, on_reject
+        self.rejection_failed = False
         self.server = None
         self.thread = None
         self.sink = None

@@ -14,7 +14,7 @@ from datetime import datetime
 import numpy as np
 
 from predictive_cache.controller.feedback import UsefulByteFeedback
-from predictive_cache.controller.health import EXCLUSIONS, REASONS, ControllerHealth
+from predictive_cache.controller.health import EXCLUSIONS, PLAN_GATES, REASONS, ControllerHealth
 from predictive_cache.controller.planner import PlannerConfig, ScoredCandidate
 from predictive_cache.controller.read_memory import CoverageObservation
 from predictive_cache.dispatcher import securefs
@@ -200,11 +200,18 @@ class ReadReplayRuntime:
             os.close(fd)
         return len(plan.items)
 
-    def tick(self, t: datetime, *, events=(), coverage=()) -> TickResult:
+    def tick(self, t: datetime, *, events=(), coverage=(), source_gates=()) -> TickResult:
         if self._failed:
             raise ReadRuntimeError("READ replay stopped; manual reconciliation required")
         started = self.monotonic()
         try:
+            if (
+                not isinstance(source_gates, (tuple, list, set, frozenset))
+                or len(source_gates) > len(PLAN_GATES)
+                or any(not isinstance(reason, str) for reason in source_gates)
+                or not set(source_gates) <= PLAN_GATES
+            ):
+                raise ValueError("invalid source readiness gates")
             t = parse_utc_z(t)
             if self._last_t is not None and t <= self._last_t:
                 raise ValueError("READ ticks must increase")
@@ -247,6 +254,7 @@ class ReadReplayRuntime:
             bundle = self.models.active()
             _, model_reasons = self.models.readiness()
             reasons = set(model_reasons) & (REASONS - {"not_started", "no_scorer"})
+            reasons.update(source_gates)
             reasons.update(
                 set(self.health.snapshot()["reasons"])
                 & {"restore_failed", "ingest_loss", "controller_error"}
