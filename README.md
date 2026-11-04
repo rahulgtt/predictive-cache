@@ -127,7 +127,10 @@ Controlled lab output remains `data_kind=synthetic`, and imported events remain
 The adapter validates exact pod/epoch, catalog identity, durability and loss
 reconciliation before atomic publication. It does not fabricate missing
 directories, catalog metadata or datagen truth artifacts. See the
-[Chimera v2 adapter contract](docs/data-prep/chimera-v2-adapter.md).
+[Chimera v2 adapter contract](docs/data-prep/chimera-v2-adapter.md). Approved
+engineers can use the
+[owner-private controlled dataset guide](docs/data-prep/owner-private-controlled-dataset.md)
+to request the frozen package without publishing its path or contents.
 
 ## Manual NFS range reader
 
@@ -704,6 +707,7 @@ stays blocked. Synthetic fixtures cannot close either gap.
 | --- | --- |
 | Day-to-day schedule and ownership | [Quick glance](docs/plan/team-quick-glance.md) and [detailed team plan](docs/predictive-cache-48-hour-team-plan.md) |
 | Full generation schema, dataset layout and synthetic patterns | [Datagen spec](docs/datagen/spec.md) |
+| Approved access to the owner-private controlled collection | [Owner-private controlled dataset](docs/data-prep/owner-private-controlled-dataset.md) |
 | Collection, state, failure and benchmark procedures | [Validation and operations](docs/architecture/validation-and-operations.md) |
 | Gate owners and required evidence | [Checkpoint map](docs/plan/milestones.md) |
 | Contributor and agent procedures | [AGENTS.md](AGENTS.md), [handbook](docs/ai/contributor-handbook.md) and [workflow](docs/ai/workflow.md) |
