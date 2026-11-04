@@ -6,7 +6,8 @@ users wait for it to arrive from cloud storage.
 > **Status: design proposal, not an implemented service.** Synthetic data
 > generation and cleaning, the controlled collection harness, Chimera v2
 > importer, strict current-run finalizer, explicit pre-finalizer historical
-> compatibility path, offline plan-file dispatcher, and experimental
+> compatibility path, narrow READ-demand inference snapshot and baseline
+> package/plan publisher, offline plan-file dispatcher, and experimental
 > standalone manual NFS range reader are implemented. The Controller,
 > automated live Warmer
 > integration, representative data collection and real-workload performance
@@ -14,6 +15,13 @@ users wait for it to arrive from cloud storage.
 > never read personal files. Diagrams and examples below describe the intended
 > system; they do not establish that the required telemetry or cache controls
 > already work.
+
+The narrow datagen-to-Dispatcher path has passed focused tests, Ruff, and one
+controlled offline `skipped/dry_run` integration on `nas-vm`; it issued zero
+bytes and did not start the Warmer. The separately approved one-READ
+Dispatcher-to-Warmer validation remains unrun. This is plumbing evidence only,
+not model-quality, cache-residency, performance, or production-readiness
+evidence.
 
 ## Run the datagen foundation
 
@@ -162,6 +170,17 @@ It projects successful NFSv4.1 READs without inventing OPEN/CLOSE, handles or
 application sessions, and binds snapshots/model packages to exact semantic,
 feature-schema and serving-contract hashes. Generic datagen v1 remains
 available for lifecycle fixtures.
+
+The controlled
+[datagen-to-Warmer offline MVP](docs/experiments/datagen-to-warmer-mvp.md)
+builds the distinct `read-demand-v1-narrow-mvp` inference snapshot, packages
+the explicit non-trained `baseline-read-frequency`, publishes a bounded
+schema-v2 READ plan from an approved fixture target map, and exercises the
+existing Dispatcher only in `--no-real-reads --once` mode. This is synthetic
+contract-plumbing evidence only. It is not a trained model, full Controller,
+live Warmer integration, representative-data result, cache-residency proof, or
+performance claim. The documented offline `nas-vm` validation is complete;
+the separately approved one-READ Dispatcher-to-Warmer gate remains unrun.
 
 ## Manual NFS range reader
 

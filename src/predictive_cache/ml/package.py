@@ -290,6 +290,8 @@ def write_package(
             "feature_columns": list(columns),
             "serving_contract": {"config": config, "sha256": contract_sha256(config)},
             "serving_policy": policy,
+            **({"data_kind": meta["data_kind"]} if "data_kind" in meta else {}),
+            **({"trained": meta["trained"]} if "trained" in meta else {}),
             "data": dict(meta.get("data", {})),
             "training": dict(meta.get("training", {})),
             "created_at": datetime.now(UTC)
@@ -439,6 +441,14 @@ def _verify(
     # 3. known version, model type and a servable policy
     if manifest.get("package_version") != PACKAGE_VERSION:
         raise PackageError("unknown_package_version", str(manifest.get("package_version")))
+    if "trained" in manifest and not isinstance(manifest["trained"], bool):
+        raise PackageError("bad_payload", "trained must be boolean")
+    if "data_kind" in manifest and manifest["data_kind"] not in {
+        "real",
+        "synthetic",
+        "fixture",
+    }:
+        raise PackageError("bad_payload", "data_kind is invalid")
     model_type = manifest.get("model_type")
     if not isinstance(model_type, str):
         raise PackageError("unknown_model_type", repr(model_type))
