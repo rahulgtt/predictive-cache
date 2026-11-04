@@ -10,6 +10,21 @@ through a repository-relative path. Its current retention is indefinite by
 user decision. The owner is the `automation` account. Package roots are
 owner-private mode `0700`, and package files are mode `0600`.
 
+The package is collected and reconciled, but not finalized. The current
+owner-approved integrity summary is:
+
+| Property | Value |
+| --- | --- |
+| Files | 352 regular files: 349 unchanged payload/evidence files and three private control files |
+| Size | 3,221,567 total regular-file bytes; 3,069,299 payload bytes |
+| Ownership and access | Owner-owned; directories mode `0700`; files mode `0600`; no POSIX ACLs |
+| Checksum catalog SHA-256 | `ccd04fdc2095d9bc3e26077e0bd9b48b291776bbfbba77f663abb0f799cde0d3` |
+| Private manifest SHA-256 | `950cbbc7a70e839c2cd17b9fb2ed1432b92bd4c8b7480cc7a2c9b4731d24c315` |
+| Verification state | All 349 payload files match the frozen sources and checksum catalog |
+
+These are package-level fingerprints approved for repository documentation.
+Individual evidence hashes and raw private identifiers remain private.
+
 ## Evidence boundary
 
 This collection proves that the controlled collection and data-preparation
