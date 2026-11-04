@@ -38,6 +38,14 @@ The planner owns atomic publication: write and `fsync` a temporary file, then
 rename it to the committed plan name. The dispatcher does not consume
 temporary names.
 
+Issue #112's focused
+[`read-demand-v1-narrow-mvp` publisher](experiments/datagen-to-warmer-mvp.md)
+implements that boundary for controlled synthetic integration. It verifies
+snapshot/package/target-map identities, validates the completed schema-v2
+READ plan before publication, and commits owner-only provenance and digest
+indexes before making the plan visible. Its documented Dispatcher invocation
+uses `--no-real-reads --once`; it does not authorize a live read.
+
 ## Schema-v2 plan contract
 
 Plans reject missing or extra fields. The top-level keys are:
