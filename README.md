@@ -26,6 +26,12 @@ feature store and TargetMap integration. Its five-minute demand forecast is
 separate from the execution window: with fresh targets, the default warming
 plan expires after two minutes, or sooner if a target becomes stale earlier.
 
+The experimental [READ replay controller](docs/controller/read-replay-runtime.md)
+connects bounded canonical READ memory, model scoring, the planner, Dispatcher
+dry-run results, feedback and health. `pcache-controller replay-read` accepts
+synthetic fixtures and invents execution handles; real reads cannot be enabled.
+Live collection, TargetMap integration and durable restart recovery remain gated.
+
 The narrow datagen-to-Dispatcher path has passed focused tests, Ruff, and one
 controlled offline `skipped/dry_run` integration on `nas-vm`; it issued zero
 bytes and did not start the Warmer. The separately approved one-READ

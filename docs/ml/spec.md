@@ -757,6 +757,13 @@ parity test uses fixtures where they are zero (§13).
 
 ### 8.3 Tick loop
 
+The lifecycle sequence below describes generic ingestion. The experimental
+[READ replay runtime](../controller/read-replay-runtime.md) consumes canonical
+READ rows directly, without `HandleTracker`, and preserves the READ contract's
+`known_at <= t` visibility boundary. Its coverage checkpoints also carry
+availability and observed-through times. It does not change generic `< t`
+watermark behavior or establish a live Controller.
+
 - **Cadence:** every `serving_policy.tick_s` of the active package (60;
   replay uses the replay clock), at `t = clock.now()`:
   1. drain the ingest queue through cleaning;

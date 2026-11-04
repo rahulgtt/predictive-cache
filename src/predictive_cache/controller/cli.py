@@ -1,4 +1,4 @@
-"""Ingestion-only Controller commands; model/store integration is deferred."""
+"""Controller ingestion, synthetic READ replay and frozen Pass-2 commands."""
 
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ def _summary(ingestor, updates):
 
 @click.group()
 def main():
-    """Receive/replay events only. No model inference, planning or FeatureStore."""
+    """Ingest events, replay synthetic READ inference, or publish frozen plans."""
 
 
 @main.command()
@@ -286,6 +286,21 @@ def run_pass2(
             sort_keys=True,
         )
     )
+
+
+@main.command("replay-read")
+@click.option("--config", "config_path", required=True, type=click.Path(path_type=Path))
+def replay_read(config_path):
+    """Exercise synthetic READ features, prediction and Dispatcher dry-run."""
+    from predictive_cache.controller.read_replay import ReplayInputError, run_read_replay
+
+    try:
+        result = run_read_replay(config_path)
+    except ReplayInputError:
+        raise click.ClickException(
+            "READ replay failed; check fixture inputs and private run artifacts"
+        ) from None
+    click.echo(json.dumps(result, sort_keys=True, allow_nan=False))
 
 
 if __name__ == "__main__":
