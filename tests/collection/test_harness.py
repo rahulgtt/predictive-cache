@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +27,8 @@ from predictive_cache.collection.cli import (
     _approved_executable,
     _artifact_rows,
     _cleanup_root,
+    _external_file_evidence,
+    _historical_root,
     _manifest_profile,
     _open_verified_fd,
     _validate_clean_artifact_contract,
@@ -75,6 +78,19 @@ from predictive_cache.collection.models import (
     ExecutionResult,
     FixtureCatalog,
     FixtureEntry,
+    HistoricalCleanupCompletionRecord,
+    HistoricalCompatibilityApproval,
+    HistoricalDeletionApproval,
+    HistoricalDeletionTarget,
+    HistoricalEvidenceReference,
+    HistoricalExecutionProvenance,
+    HistoricalFinalizationAttestation,
+    HistoricalFrozenRootDeclaration,
+    HistoricalIntegrationProvenance,
+    HistoricalProviderEvidence,
+    HistoricalRunEvidence,
+    HistoricalValidationAttempt,
+    HistoricalVerificationProvenance,
     JsonlEvidence,
     LiveCleanManifest,
     LiveCleanReport,
@@ -91,8 +107,10 @@ from predictive_cache.collection.models import (
     StopRules,
 )
 from predictive_cache.datagen.io import config_hash
+from predictive_cache.prep.clean.pipeline import run_clean
 from predictive_cache.prep.clean.report import render_summary
 from predictive_cache.prep.config import CleanConfig
+from predictive_cache.sources.chimera.importer import import_dataset
 
 START = datetime(2026, 11, 4, tzinfo=UTC)
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
@@ -1832,7 +1850,7 @@ def _finalization_fixture(tmp_path: Path, monkeypatch):
     write_jsonl(bounded_harness / "offered.jsonl", [bounded_operation])
     bounded_execution = ExecutionResult(
         operation_id=bounded_operation.operation_id,
-        completed_at_utc=START + timedelta(minutes=15),
+        completed_at_utc=START + timedelta(seconds=30),
         status="ok",
         bytes_read=4096,
         latency_ms=10,
@@ -1892,7 +1910,7 @@ def _finalization_fixture(tmp_path: Path, monkeypatch):
     bounded_raw_path.write_bytes(bounded_raw_line + b"\n")
     bounded_raw_path.chmod(0o600)
     bounded_raw_hash = sha256(bounded_raw_path)
-    bounded_durable_at = START + timedelta(minutes=16)
+    bounded_durable_at = START + timedelta(seconds=60)
     bounded_durable = CollectorDurableEvent(
         run_id="bounded-validation",
         event_id=bounded_event_id,
@@ -3271,6 +3289,970 @@ def _finalize_args(
     for kind, path in roots.items():
         arguments.extend(["--cleanup-root", f"{kind}={path}"])
     return arguments
+
+
+def _historical_finalization_fixture(tmp_path, monkeypatch):
+    (
+        live_run,
+        _report,
+        live_clean,
+        _generic_control,
+        _bounded_attestation,
+        generic_roots,
+        _output,
+    ) = _finalization_fixture(tmp_path / "generic", monkeypatch)
+    (live_run / "provider-invocation.json").unlink()
+    (live_run / ".approved-tools/checkpoint-provider").unlink()
+    (live_run / ".approved-tools/provider-package.zip").unlink()
+    (live_run / ".approved-tools").rmdir()
+    history = tmp_path / "historical"
+    history.mkdir(mode=0o700)
+
+    def private_root(name):
+        root = history / name
+        root.mkdir(mode=0o700)
+        return root
+
+    validation_four = private_root("validation-four")
+    shutil.copytree(
+        generic_roots["bounded_harness_evidence"],
+        validation_four,
+        dirs_exist_ok=True,
+    )
+    shutil.copyfile(
+        validation_four / "candidate-manifest.json",
+        validation_four / "manifest.json",
+    )
+    (validation_four / "manifest.json").chmod(0o600)
+    (validation_four / "approved-collection-permit.json").write_text(
+        '{"status":"approved"}\n'
+    )
+    (validation_four / "approved-collection-permit.json").chmod(0o600)
+    bounded_manifest = CollectionManifest.model_validate_json(
+        (validation_four / "manifest.json").read_text()
+    )
+    attempt_ids = []
+    roots = {}
+    logs = []
+    for attempt in range(1, 5):
+        run_role = f"validation_{attempt}_run"
+        input_role = f"validation_{attempt}_input"
+        if attempt == 4:
+            run_root = validation_four
+            run_id = bounded_manifest.run_id
+        else:
+            run_root = private_root(run_role)
+            run_id = f"historical-validation-{attempt}"
+            manifest_value = bounded_manifest.model_copy(
+                update={
+                    "run_id": run_id,
+                    "run_ref": hashlib.sha256(run_id.encode()).hexdigest()[:32],
+                }
+            )
+            atomic_write_model(run_root / "manifest.json", manifest_value)
+        input_root = private_root(input_role)
+        log = input_root / "validation.log"
+        log.write_text(f"attempt {attempt}\n")
+        log.chmod(0o600)
+        attempt_ids.append(run_id)
+        logs.append(log)
+        roots[run_role] = run_root
+        roots[input_role] = input_root
+
+    live_input = private_root("live-input")
+    shutil.copyfile(live_run / "manifest.json", live_input / "manifest.json")
+    (live_input / "manifest.json").chmod(0o600)
+    (live_input / "live.log").write_text("collection passed\n")
+    (live_input / "live.log").chmod(0o600)
+    (live_run / "approved-collection-permit.json").write_text(
+        '{"status":"approved"}\n'
+    )
+    (live_run / "approved-collection-permit.json").chmod(0o600)
+
+    shared_provider = private_root("shared-provider")
+    provider_source = generic_roots["bounded_provider_evidence"]
+    provider_files = {
+        "cluster2-provider-package.json": "provider-package.json",
+        "cluster2-collection-provider.py": "provider.py",
+        "cluster2-jsonl-collection.py": "collector.py",
+        "cluster2-jsonl-validation.py": "validator.py",
+        "cluster2-bounded-validation-runbook.md": "runbook.md",
+    }
+    for destination, source in provider_files.items():
+        shutil.copyfile(provider_source / source, shared_provider / destination)
+        (shared_provider / destination).chmod(0o600)
+    importer_constants = {
+        "APPROVED_PROVIDER_PACKAGE_SHA256": sha256(
+            shared_provider / "cluster2-provider-package.json"
+        ),
+        "APPROVED_PROVIDER_SHA256": sha256(
+            shared_provider / "cluster2-collection-provider.py"
+        ),
+        "APPROVED_COLLECTOR_SHA256": sha256(
+            shared_provider / "cluster2-jsonl-collection.py"
+        ),
+        "APPROVED_VALIDATOR_SHA256": sha256(
+            shared_provider / "cluster2-jsonl-validation.py"
+        ),
+        "APPROVED_VALIDATION_RUNBOOK_SHA256": sha256(
+            shared_provider / "cluster2-bounded-validation-runbook.md"
+        ),
+    }
+    for name, value in importer_constants.items():
+        monkeypatch.setattr(
+            f"predictive_cache.sources.chimera.importer.{name}",
+            value,
+        )
+    executions = read_models(
+        validation_four / "execution.jsonl",
+        ExecutionResult,
+    )
+    import_dataset(
+        event_sources_path=validation_four / "collector-file-manifest.json",
+        observed_path=validation_four / "observed.jsonl",
+        run_manifest_path=validation_four / "manifest.json",
+        offered_ledger_path=validation_four / "offered.jsonl",
+        fixture_catalog_path=validation_four / "fixture-catalog.json",
+        checkpoints_path=validation_four / "checkpoints.jsonl",
+        validation_permit_path=validation_four / "adapter-validation-permit.json",
+        validation_permit_reference_time=max(
+            row.completed_at_utc for row in executions
+        ),
+        out_dir=validation_four / "imported",
+        format="jsonl",
+    )
+    run_clean(
+        validation_four / "imported",
+        CleanConfig(),
+        validation_four / "cleaned",
+        format="jsonl",
+    )
+    live_adapter = history / "live-adapter"
+    live_clean_dataset = history / "live-clean"
+    import_dataset(
+        event_sources_path=live_run / "collector-file-manifest.json",
+        observed_path=live_run / "observed.jsonl",
+        run_manifest_path=live_run / "manifest.json",
+        offered_ledger_path=live_run / "offered.jsonl",
+        fixture_catalog_path=live_run / "fixture-catalog.json",
+        checkpoints_path=live_run / "checkpoints.jsonl",
+        out_dir=live_adapter,
+        format="jsonl",
+    )
+    run_clean(
+        live_adapter,
+        CleanConfig(),
+        live_clean_dataset,
+        format="jsonl",
+    )
+
+    roots.update(
+        {
+            "live_run": live_run,
+            "live_input": live_input,
+            "shared_provider": shared_provider,
+            "live_adapter_dataset": live_adapter,
+            "live_clean_dataset": live_clean_dataset,
+        }
+    )
+    for root in roots.values():
+        root.chmod(0o700)
+        for directory in (path for path in root.rglob("*") if path.is_dir()):
+            directory.chmod(0o700)
+        for file in (path for path in root.rglob("*") if path.is_file()):
+            file.chmod(0o600)
+
+    external = private_root("external")
+    executed_archive = external / "executed-source.tar.gz"
+    verification_archive = external / "verification-source.tar.gz"
+    verification_repo = tmp_path / "verification-repo"
+    verification_repo.mkdir(mode=0o700)
+    subprocess.run(["git", "init", "-q", verification_repo], check=True)
+    subprocess.run(
+        ["git", "-C", verification_repo, "config", "user.name", "test"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            verification_repo,
+            "config",
+            "user.email",
+            "test@example.invalid",
+        ],
+        check=True,
+    )
+    (verification_repo / "source.txt").write_text("verification source\n")
+    subprocess.run(
+        ["git", "-C", verification_repo, "add", "source.txt"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", verification_repo, "commit", "-qm", "verification"],
+        check=True,
+    )
+    verification_commit = subprocess.check_output(
+        ["git", "-C", verification_repo, "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    verification_tree = subprocess.check_output(
+        ["git", "-C", verification_repo, "rev-parse", "HEAD^{tree}"],
+        text=True,
+    ).strip()
+    adapter_wrapper = external / "adapter-wrapper"
+    cleaner_wrapper = external / "cleaner-wrapper"
+    executed_archive.write_text("executed source\n")
+    with verification_archive.open("wb") as stream:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                verification_repo,
+                "archive",
+                "--format=tar.gz",
+                "--prefix=verification/",
+                verification_commit,
+            ],
+            check=True,
+            stdout=stream,
+        )
+    shutil.copyfile(
+        generic_roots["bounded_harness_evidence"] / "adapter-wrapper",
+        adapter_wrapper,
+    )
+    shutil.copyfile(
+        generic_roots["bounded_harness_evidence"] / "cleaner-wrapper",
+        cleaner_wrapper,
+    )
+    for file in external.iterdir():
+        file.chmod(0o600)
+
+    historical_roots = {
+        role: _historical_root(role, path) for role, path in roots.items()
+    }
+    frozen_declaration = external / "frozen-root-declaration.json"
+    atomic_write_model(
+        frozen_declaration,
+        HistoricalFrozenRootDeclaration(
+            run_id="controlled-demo",
+            run_manifest_sha256=sha256(live_run / "manifest.json"),
+            roots=tuple(historical_roots.values()),
+        ),
+    )
+    constants = {
+        "HISTORICAL_RUN_ID": "controlled-demo",
+        "HISTORICAL_RUN_MANIFEST_SHA256": sha256(live_run / "manifest.json"),
+        "HISTORICAL_ROOT_DECLARATION_SHA256": sha256(frozen_declaration),
+        "HISTORICAL_EXECUTED_COMMIT": "1" * 40,
+        "HISTORICAL_EXECUTED_TREE": "2" * 40,
+        "HISTORICAL_EXECUTED_ARCHIVE_SHA256": sha256(executed_archive),
+        "HISTORICAL_INTEGRATION_COMMIT": "3" * 40,
+        "HISTORICAL_INTEGRATION_TREE": "4" * 40,
+        "HISTORICAL_LIVE_PERMIT_SHA256": sha256(
+            live_run / "approved-collection-permit.json"
+        ),
+        "HISTORICAL_RECONCILIATION_SHA256": sha256(
+            live_run / "reconciliation.json"
+        ),
+        "HISTORICAL_BOUNDED_MANIFEST_SHA256": sha256(
+            validation_four / "manifest.json"
+        ),
+        "HISTORICAL_BOUNDED_COLLECTION_PERMIT_SHA256": sha256(
+            validation_four / "approved-collection-permit.json"
+        ),
+        "HISTORICAL_BOUNDED_PERMIT_SHA256": sha256(
+            validation_four / "adapter-validation-permit.json"
+        ),
+        "HISTORICAL_BOUNDED_IMPORTED_MANIFEST_SHA256": sha256(
+            validation_four / "imported/manifest.json"
+        ),
+        "HISTORICAL_BOUNDED_IMPORTED_REPORT_SHA256": sha256(
+            validation_four / "imported/report/import.json"
+        ),
+        "HISTORICAL_BOUNDED_CLEANED_MANIFEST_SHA256": sha256(
+            validation_four / "cleaned/manifest.json"
+        ),
+        "HISTORICAL_BOUNDED_CLEANED_REPORT_SHA256": sha256(
+            validation_four / "cleaned/report/quality.json"
+        ),
+        "HISTORICAL_REPLAY_IMPORT_REPORT_SHA256": sha256(
+            roots["live_adapter_dataset"] / "report/import.json"
+        ),
+        "HISTORICAL_REPLAY_QUALITY_REPORT_SHA256": sha256(
+            roots["live_clean_dataset"] / "report/quality.json"
+        ),
+        "HISTORICAL_TOTAL_FILES": sum(
+            len(root.files) for root in historical_roots.values()
+        ),
+        "HISTORICAL_VALIDATION_ATTEMPTS": (
+            (
+                attempt_ids[0],
+                "failed",
+                "offered_count_mismatch",
+                sha256(logs[0]),
+            ),
+            (
+                attempt_ids[1],
+                "failed",
+                "tag_mismatch",
+                sha256(logs[1]),
+            ),
+            (
+                attempt_ids[2],
+                "failed",
+                "per_chunk_baseline_reset",
+                sha256(logs[2]),
+            ),
+            (attempt_ids[3], "passed", "passed", sha256(logs[3])),
+        ),
+        "HISTORICAL_LEGACY_MODE_COUNTS": {
+            "live_adapter_dataset": (0, 0),
+            "live_clean_dataset": (0, 0),
+        },
+    }
+    for name, value in constants.items():
+        monkeypatch.setattr(f"predictive_cache.collection.cli.{name}", value)
+
+    def reference(role, path):
+        return HistoricalEvidenceReference(
+            role=role,
+            path=path,
+            sha256=sha256(roots[role] / path),
+        )
+
+    bounded_evidence = HistoricalRunEvidence(
+        manifest=reference("validation_4_run", "manifest.json"),
+        collection_permit=reference(
+            "validation_4_run",
+            "approved-collection-permit.json",
+        ),
+        fixture_catalog=reference("validation_4_run", "fixture-catalog.json"),
+        offered_ledger=reference("validation_4_run", "offered.jsonl"),
+        execution_ledger=reference("validation_4_run", "execution.jsonl"),
+        observed=reference("validation_4_run", "observed.jsonl"),
+        source_manifest=reference(
+            "validation_4_run",
+            "collector-file-manifest.json",
+        ),
+        durable_sidecar=reference(
+            "validation_4_run",
+            "durable-events.jsonl",
+        ),
+        checkpoints=reference("validation_4_run", "checkpoints.jsonl"),
+        pre_read_health=reference(
+            "validation_4_run",
+            "pre-read-health.jsonl",
+        ),
+        validation_permit=reference(
+            "validation_4_run",
+            "adapter-validation-permit.json",
+        ),
+        imported_manifest=reference(
+            "validation_4_run",
+            "imported/manifest.json",
+        ),
+        imported_report=reference(
+            "validation_4_run",
+            "imported/report/import.json",
+        ),
+        cleaned_manifest=reference(
+            "validation_4_run",
+            "cleaned/manifest.json",
+        ),
+        cleaned_report=reference(
+            "validation_4_run",
+            "cleaned/report/quality.json",
+        ),
+    )
+    live_evidence = HistoricalRunEvidence(
+        manifest=reference("live_run", "manifest.json"),
+        collection_permit=reference(
+            "live_run",
+            "approved-collection-permit.json",
+        ),
+        fixture_catalog=reference("live_run", "fixture-catalog.json"),
+        offered_ledger=reference("live_run", "offered.jsonl"),
+        execution_ledger=reference("live_run", "execution.jsonl"),
+        observed=reference("live_run", "observed.jsonl"),
+        source_manifest=reference(
+            "live_run",
+            "collector-file-manifest.json",
+        ),
+        durable_sidecar=reference("live_run", "durable-events.jsonl"),
+        checkpoints=reference("live_run", "checkpoints.jsonl"),
+        pre_read_health=reference("live_run", "pre-read-health.jsonl"),
+        reconciliation=reference("live_run", "reconciliation.json"),
+        imported_manifest=reference(
+            "live_adapter_dataset",
+            "manifest.json",
+        ),
+        imported_report=reference(
+            "live_adapter_dataset",
+            "report/import.json",
+        ),
+        cleaned_manifest=reference(
+            "live_clean_dataset",
+            "manifest.json",
+        ),
+        cleaned_report=reference(
+            "live_clean_dataset",
+            "report/quality.json",
+        ),
+    )
+    attempts = tuple(
+        HistoricalValidationAttempt(
+            attempt=index,
+            run_role=f"validation_{index}_run",
+            input_role=f"validation_{index}_input",
+            run_id=attempt_ids[index - 1],
+            outcome="passed" if index == 4 else "failed",
+            result_code=(
+                "passed"
+                if index == 4
+                else (
+                    "offered_count_mismatch",
+                    "tag_mismatch",
+                    "per_chunk_baseline_reset",
+                )[index - 1]
+            ),
+            log=reference(f"validation_{index}_input", "validation.log"),
+        )
+        for index in range(1, 5)
+    )
+    attestation_model = HistoricalFinalizationAttestation(
+        compatibility_scope="historical_pre_finalizer",
+        run_id="controlled-demo",
+        run_manifest_sha256=sha256(live_run / "manifest.json"),
+        frozen_root_declaration_sha256=sha256(frozen_declaration),
+        roots=tuple(historical_roots.values()),
+        attempts=attempts,
+        successful_bounded=bounded_evidence,
+        live=live_evidence,
+        provider=HistoricalProviderEvidence(
+            package=reference(
+                "shared_provider",
+                "cluster2-provider-package.json",
+            ),
+            provider=reference(
+                "shared_provider",
+                "cluster2-collection-provider.py",
+            ),
+            collector=reference(
+                "shared_provider",
+                "cluster2-jsonl-collection.py",
+            ),
+            validator=reference(
+                "shared_provider",
+                "cluster2-jsonl-validation.py",
+            ),
+            runbook=reference(
+                "shared_provider",
+                "cluster2-bounded-validation-runbook.md",
+            ),
+        ),
+        executed=HistoricalExecutionProvenance(
+            commit="1" * 40,
+            tree="2" * 40,
+            source_archive=_external_file_evidence(executed_archive),
+        ),
+        integration=HistoricalIntegrationProvenance(
+            commit="3" * 40,
+            tree="4" * 40,
+            executed=False,
+        ),
+        verification=HistoricalVerificationProvenance(
+            commit=verification_commit,
+            tree=verification_tree,
+            source_archive=_external_file_evidence(verification_archive),
+        ),
+        adapter_wrapper=_external_file_evidence(adapter_wrapper),
+        cleaner_wrapper=_external_file_evidence(cleaner_wrapper),
+        approval=HistoricalCompatibilityApproval(
+            status="approved",
+            approved_at=START + timedelta(days=1),
+            compatibility_scope="historical_pre_finalizer",
+            provider_execution_binding_status="legacy_not_recorded",
+            missing_controls=(
+                "provider_invocation_record",
+                "run_local_provider_snapshot",
+                "run_local_package_snapshot",
+            ),
+            statement=(
+                "Approve compatibility finalization of the frozen historical run "
+                "without fabricating controls that were not recorded at execution."
+            ),
+        ),
+    )
+    control = private_root("historical-control")
+    attestation = control / "historical-attestation.json"
+    atomic_write_model(attestation, attestation_model)
+    deletion_approval = control / "historical-deletion-approval.json"
+    atomic_write_model(
+        deletion_approval,
+        HistoricalDeletionApproval(
+            status="approved",
+            approved_at=START + timedelta(days=2),
+            run_id=attestation_model.run_id,
+            attestation_sha256=sha256(attestation),
+            verification_commit=verification_commit,
+            verification_tree=verification_tree,
+            merge_confirmed=True,
+            targets={
+                role: HistoricalDeletionTarget(
+                    canonical_path=root.canonical_path,
+                    device=root.device,
+                    inode=root.inode,
+                    action=root.retention_action,
+                )
+                for role, root in historical_roots.items()
+            },
+            statement=(
+                "Approve the exact historical cleanup targets and actions recorded "
+                "in this artifact after the compatibility verifier merged."
+            ),
+        ),
+    )
+    return {
+        "roots": roots,
+        "control": control,
+        "attestation": attestation,
+        "deletion_approval": deletion_approval,
+        "executed_archive": executed_archive,
+        "verification_archive": verification_archive,
+        "verification_repo": verification_repo,
+        "verification_commit": verification_commit,
+        "adapter_wrapper": adapter_wrapper,
+        "cleaner_wrapper": cleaner_wrapper,
+        "frozen_declaration": frozen_declaration,
+    }
+
+
+def _historical_finalize_args(fixture):
+    arguments = [
+        "finalize-historical",
+        "--attestation",
+        str(fixture["attestation"]),
+        "--finalization-root",
+        str(fixture["control"]),
+        "--executed-source-archive",
+        str(fixture["executed_archive"]),
+        "--verification-source-archive",
+        str(fixture["verification_archive"]),
+        "--frozen-root-declaration",
+        str(fixture["frozen_declaration"]),
+        "--deletion-approval",
+        str(fixture["deletion_approval"]),
+        "--verification-repository",
+        str(fixture["verification_repo"]),
+        "--merged-ref",
+        "HEAD",
+        "--adapter-wrapper",
+        str(fixture["adapter_wrapper"]),
+        "--cleaner-wrapper",
+        str(fixture["cleaner_wrapper"]),
+    ]
+    for role, path in fixture["roots"].items():
+        arguments.extend(["--evidence-root", f"{role}={path}"])
+    return arguments
+
+
+def _historical_attest_args(fixture, out):
+    arguments = [
+        "attest-historical",
+        "--finalization-root",
+        str(fixture["control"]),
+        "--out",
+        str(out),
+        "--executed-source-archive",
+        str(fixture["executed_archive"]),
+        "--verification-source-archive",
+        str(fixture["verification_archive"]),
+        "--verification-repository",
+        str(fixture["verification_repo"]),
+        "--verification-commit",
+        fixture["verification_commit"],
+        "--frozen-root-declaration",
+        str(fixture["frozen_declaration"]),
+        "--adapter-wrapper",
+        str(fixture["adapter_wrapper"]),
+        "--cleaner-wrapper",
+        str(fixture["cleaner_wrapper"]),
+        "--approve-missing-controls",
+    ]
+    for role, path in fixture["roots"].items():
+        arguments.extend(["--evidence-root", f"{role}={path}"])
+    return arguments
+
+
+def test_attest_historical_derives_only_existing_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    fixture["attestation"].unlink()
+    result = CliRunner().invoke(
+        main,
+        _historical_attest_args(fixture, fixture["attestation"]),
+    )
+    assert result.exit_code == 0, result.output
+    attestation = HistoricalFinalizationAttestation.model_validate_json(
+        fixture["attestation"].read_text()
+    )
+    assert attestation.approval.provider_execution_binding_status == (
+        "legacy_not_recorded"
+    )
+    assert len(attestation.roots) == 13
+
+
+def test_attest_historical_rejects_copied_genesis_root(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    fixture["attestation"].unlink()
+    copied = tmp_path / "copied-genesis"
+    shutil.copytree(fixture["roots"]["live_input"], copied)
+    copied.chmod(0o700)
+    arguments = _historical_attest_args(fixture, fixture["attestation"])
+    original = f"live_input={fixture['roots']['live_input']}"
+    arguments[arguments.index(original)] = f"live_input={copied}"
+    result = CliRunner().invoke(main, arguments)
+    assert result.exit_code != 0
+    assert "runtime roots differ from frozen historical declaration" in result.output
+
+
+def test_attest_historical_rejects_invented_verifier_archive(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    fixture["attestation"].unlink()
+    fixture["verification_archive"].write_text("invented verifier\n")
+    result = CliRunner().invoke(
+        main,
+        _historical_attest_args(fixture, fixture["attestation"]),
+    )
+    assert result.exit_code != 0
+    assert "verification source archive" in result.output
+
+
+def test_attest_historical_rejects_root_change_during_replay(
+    tmp_path,
+    monkeypatch,
+):
+    from predictive_cache.collection import cli as collection_cli
+
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    fixture["attestation"].unlink()
+    original = collection_cli._validate_historical_attestation
+
+    def validate_then_change(*args, **kwargs):
+        original(*args, **kwargs)
+        (fixture["roots"]["live_input"] / "live.log").write_text(
+            "changed during attestation\n"
+        )
+
+    monkeypatch.setattr(
+        collection_cli,
+        "_validate_historical_attestation",
+        validate_then_change,
+    )
+    result = CliRunner().invoke(
+        main,
+        _historical_attest_args(fixture, fixture["attestation"]),
+    )
+    assert result.exit_code != 0
+    assert "roots changed during attestation" in result.output
+
+
+def test_finalize_historical_rejects_invented_verifier_attestation(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    raw = json.loads(fixture["attestation"].read_text())
+    raw["verification"]["commit"] = "7" * 40
+    raw["verification"]["tree"] = "8" * 40
+    fixture["attestation"].unlink()
+    fixture["attestation"].write_text(json.dumps(raw) + "\n")
+    fixture["attestation"].chmod(0o600)
+    result = CliRunner().invoke(main, _historical_finalize_args(fixture))
+    assert result.exit_code != 0
+    assert "verification Git provenance" in result.output
+
+
+def test_finalize_historical_requires_exact_deletion_approval(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    raw = json.loads(fixture["deletion_approval"].read_text())
+    raw["targets"]["live_input"]["canonical_path"] = "/copied/root"
+    fixture["deletion_approval"].unlink()
+    fixture["deletion_approval"].write_text(json.dumps(raw) + "\n")
+    fixture["deletion_approval"].chmod(0o600)
+    result = CliRunner().invoke(main, _historical_finalize_args(fixture))
+    assert result.exit_code != 0
+    assert "does not match exact targets" in result.output
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "message"),
+    [
+        ("attestation", "historical attestation changed"),
+        ("deletion_approval", "historical deletion approval changed"),
+        (
+            "frozen_declaration",
+            "frozen historical root declaration changed",
+        ),
+        (
+            "verification_archive",
+            "historical verification source archive changed",
+        ),
+        (
+            "evidence_root",
+            "historical evidence roots changed",
+        ),
+    ],
+)
+def test_finalize_historical_rejects_authorization_swap_during_replay(
+    tmp_path,
+    monkeypatch,
+    artifact_name,
+    message,
+):
+    from predictive_cache.collection import cli as collection_cli
+
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    original = collection_cli._validate_historical_attestation
+
+    def validate_then_replace(*args, **kwargs):
+        original(*args, **kwargs)
+        if artifact_name == "evidence_root":
+            path = fixture["roots"]["live_input"] / "live.log"
+            path.write_text("changed during replay\n")
+        else:
+            path = fixture[artifact_name]
+            path.unlink()
+            path.write_text('{"replacement":true}\n')
+            path.chmod(0o600)
+
+    monkeypatch.setattr(
+        collection_cli,
+        "_validate_historical_attestation",
+        validate_then_replace,
+    )
+    result = CliRunner().invoke(main, _historical_finalize_args(fixture))
+    assert result.exit_code != 0
+    assert message in result.output
+
+
+def test_finalize_historical_preserves_actual_topology(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    result = CliRunner().invoke(main, _historical_finalize_args(fixture))
+    assert result.exit_code == 0, result.output
+    schedule = json.loads(
+        (fixture["control"] / "historical-cleanup-schedule.json").read_text()
+    )
+    assert schedule["root_actions"]["shared_provider"] == "retain"
+    assert sum(
+        action == "delete" for action in schedule["root_actions"].values()
+    ) == 12
+    inventory = json.loads(
+        (fixture["control"] / "historical-deletion-inventory.json").read_text()
+    )
+    assert len(inventory["roots"]) == 13
+    assert sum(len(root["files"]) for root in inventory["roots"]) == sum(
+        len(root.files)
+        for root in HistoricalFinalizationAttestation.model_validate_json(
+            fixture["attestation"].read_text()
+        ).roots
+    )
+
+
+def test_historical_root_accepts_confined_legacy_modes_but_rejects_open_root(
+    tmp_path,
+):
+    root = tmp_path / "legacy"
+    root.mkdir(mode=0o700)
+    nested = root / "nested"
+    nested.mkdir(mode=0o755)
+    artifact = nested / "events.jsonl"
+    artifact.write_text("{}\n")
+    artifact.chmod(0o644)
+    evidence = _historical_root("live_adapter_dataset", root)
+    assert evidence.directories["nested"].mode == 0o755
+    assert evidence.files["nested/events.jsonl"].mode == 0o644
+    root.chmod(0o755)
+    with pytest.raises(click.ClickException, match="owner-only"):
+        _historical_root("live_adapter_dataset", root)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("executed_is_verifier", "deletion approval"),
+        ("external_hash", "external evidence differs"),
+        ("missing_root", "thirteen historical roots"),
+        ("duplicate_root", "distinct and non-nested"),
+        ("modified_manifest", "runtime roots differ"),
+    ],
+)
+def test_finalize_historical_rejects_substituted_evidence(
+    tmp_path,
+    monkeypatch,
+    mutation,
+    message,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    arguments = _historical_finalize_args(fixture)
+    if mutation == "executed_is_verifier":
+        raw = json.loads(fixture["attestation"].read_text())
+        raw["executed"]["commit"] = raw["verification"]["commit"]
+        fixture["attestation"].unlink()
+        fixture["attestation"].write_text(json.dumps(raw) + "\n")
+        fixture["attestation"].chmod(0o600)
+    elif mutation == "external_hash":
+        fixture["executed_archive"].write_text("changed\n")
+    elif mutation == "missing_root":
+        arguments = arguments[:-2]
+    elif mutation == "duplicate_root":
+        duplicate = (
+            f"live_clean_dataset={fixture['roots']['live_adapter_dataset']}"
+        )
+        index = arguments.index(
+            f"live_clean_dataset={fixture['roots']['live_clean_dataset']}"
+        )
+        arguments[index] = duplicate
+    else:
+        manifest = fixture["roots"]["live_run"] / "manifest.json"
+        manifest.write_text(manifest.read_text() + "\n")
+    result = CliRunner().invoke(main, arguments)
+    assert result.exit_code != 0
+    assert message in result.output
+
+
+def test_finalize_historical_rejects_invented_provider_controls(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    invented = fixture["roots"]["live_run"] / "provider-invocation.json"
+    invented.write_text('{"invented":true}\n')
+    invented.chmod(0o600)
+    raw = json.loads(fixture["attestation"].read_text())
+    raw["roots"] = [
+        _historical_root(role, path).model_dump(mode="json")
+        for role, path in fixture["roots"].items()
+    ]
+    fixture["attestation"].unlink()
+    fixture["attestation"].write_text(json.dumps(raw) + "\n")
+    fixture["attestation"].chmod(0o600)
+    monkeypatch.setattr(
+        "predictive_cache.collection.cli.HISTORICAL_TOTAL_FILES",
+        sum(len(root["files"]) for root in raw["roots"]),
+    )
+    result = CliRunner().invoke(main, _historical_finalize_args(fixture))
+    assert result.exit_code != 0
+    assert "runtime roots differ" in result.output
+
+
+def test_finalize_historical_rejects_copied_root(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    copied = tmp_path / "copied-live-input"
+    shutil.copytree(fixture["roots"]["live_input"], copied)
+    copied.chmod(0o700)
+    arguments = _historical_finalize_args(fixture)
+    original = f"live_input={fixture['roots']['live_input']}"
+    arguments[arguments.index(original)] = f"live_input={copied}"
+    result = CliRunner().invoke(main, arguments)
+    assert result.exit_code != 0
+    assert "runtime roots differ" in result.output
+
+
+def test_historical_completion_rejects_late_deadline(tmp_path, monkeypatch):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    result = CliRunner().invoke(main, _historical_finalize_args(fixture))
+    assert result.exit_code == 0, result.output
+    schedule_path = fixture["control"] / "historical-cleanup-schedule.json"
+    schedule = json.loads(schedule_path.read_text())
+    with pytest.raises(ValidationError, match="must not exceed"):
+        HistoricalCleanupCompletionRecord(
+            run_id=schedule["run_id"],
+            delete_by=schedule["delete_by"],
+            completed_at=(
+                datetime.fromisoformat(schedule["delete_by"]) + timedelta(seconds=1)
+            ),
+            cleanup_owner=schedule["cleanup_owner"],
+            evidence="late",
+            schedule_sha256=sha256(schedule_path),
+            attestation_sha256=schedule["attestation_sha256"],
+            deletion_approval_sha256=schedule[
+                "deletion_approval_sha256"
+            ],
+            deletion_inventory_sha256=schedule["deletion_inventory_sha256"],
+            root_dispositions={
+                role: (
+                    "retained_verified"
+                    if action == "retain"
+                    else "deleted"
+                )
+                for role, action in schedule["root_actions"].items()
+            },
+        )
+
+
+def test_complete_cleanup_historical_binds_all_roles(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _historical_finalization_fixture(tmp_path, monkeypatch)
+    result = CliRunner().invoke(main, _historical_finalize_args(fixture))
+    assert result.exit_code == 0, result.output
+    schedule_path = fixture["control"] / "historical-cleanup-schedule.json"
+    schedule = json.loads(schedule_path.read_text())
+    completion = HistoricalCleanupCompletionRecord(
+        run_id=schedule["run_id"],
+        delete_by=schedule["delete_by"],
+        completed_at=schedule["finalized_at"],
+        cleanup_owner=schedule["cleanup_owner"],
+        evidence="targeted deletion verified",
+        schedule_sha256=sha256(schedule_path),
+        attestation_sha256=schedule["attestation_sha256"],
+        deletion_approval_sha256=schedule["deletion_approval_sha256"],
+        deletion_inventory_sha256=schedule["deletion_inventory_sha256"],
+        root_dispositions={
+            role: (
+                "retained_verified"
+                if action == "retain"
+                else "deleted"
+            )
+            for role, action in schedule["root_actions"].items()
+        },
+    )
+    completion_path = fixture["control"] / "completion-input.json"
+    atomic_write_model(completion_path, completion)
+    out = fixture["control"] / "completion.json"
+    complete = CliRunner().invoke(
+        main,
+        [
+            "complete-cleanup-historical",
+            "--schedule",
+            str(schedule_path),
+            "--completion",
+            str(completion_path),
+            "--out",
+            str(out),
+        ],
+    )
+    assert complete.exit_code == 0, complete.output
 
 
 def test_finalize_requires_verified_outputs_and_reconciliation(tmp_path, monkeypatch):

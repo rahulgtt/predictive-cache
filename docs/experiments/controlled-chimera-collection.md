@@ -397,3 +397,41 @@ Evidence directories must be mode `0700`; files are written mode `0600`.
 Store output only in owner-approved private storage. The retention owner must
 perform the manifest's cleanup action after the retention deadline. Never
 commit real manifests, catalogs, paths, events, or raw collection output.
+
+### Historical pre-finalizer compatibility
+
+`finalize-historical` is a separate, versioned path for the one approved
+collection that predates run-local provider invocation records and tool
+snapshots. It never accepts a current run and does not weaken `finalize`.
+
+The historical attestation records thirteen physical roots exactly once:
+four validation run/input pairs, live run/input, shared provider evidence, and
+the read-only adapter and cleaner replay roots. Semantic references may point
+inside a physical root, so the successful validation's nested import and clean
+outputs are not relabeled as separate roots. The shared provider root is
+inventoried but retained; the other twelve roots are proposed deletion targets
+until the user supplies a separate post-merge approval artifact binding every
+canonical path, device/inode and action.
+
+Executed provenance remains distinct from later verification provenance. The
+attestation binds the original commit, tree and stored source archive; the
+integration merge is explicitly non-executed; and the later compatibility
+verifier records its own commit, tree and source archive. Missing historical
+`provider-invocation.json` and `.approved-tools` artifacts are recorded as
+`legacy_not_recorded`, never synthesized.
+
+Every physical root must be owner-owned mode `0700`, symlink-free and
+nonaliasing. Historical replay outputs may retain their recorded descendant
+directory/file modes because the `0700` root prevents traversal; those modes
+are inventoried exactly and any drift fails closed. An accessible top-level
+root is always rejected.
+
+The command re-runs the current importer and cleaner in temporary control-root
+directories and compares reports and tabular outputs to immutable historical
+artifacts. `finalize-historical` independently proves that the attested
+verifier commit is the supplied merged Git ref and that the source archive
+materializes exactly that tree. Only then, and only with the separate exact
+deletion approval, may it generate the inventory and seven-day schedule.
+Cleanup uses the separate `complete-cleanup-historical` contract, which
+requires deletion of all twelve collection roots and verification that shared
+provider evidence remains retained.

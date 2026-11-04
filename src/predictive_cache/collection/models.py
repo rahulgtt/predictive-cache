@@ -200,6 +200,276 @@ class CleanupEvidenceReference(StrictModel):
     _path = field_validator("path")(_safe_relative)
 
 
+HistoricalRootRole = Literal[
+    "validation_1_run",
+    "validation_1_input",
+    "validation_2_run",
+    "validation_2_input",
+    "validation_3_run",
+    "validation_3_input",
+    "validation_4_run",
+    "validation_4_input",
+    "live_run",
+    "live_input",
+    "shared_provider",
+    "live_adapter_dataset",
+    "live_clean_dataset",
+]
+
+
+class HistoricalDirectoryEvidence(StrictModel):
+    mode: int = Field(ge=0, le=0o777)
+
+
+class HistoricalFileEvidence(CleanupFileEvidence):
+    size_bytes: int = Field(ge=0)
+
+
+class HistoricalRootEvidence(StrictModel):
+    root_id: SafeId
+    role: HistoricalRootRole
+    canonical_path: str = Field(min_length=1)
+    path_sha256: Sha256
+    owner_uid: int = Field(ge=0)
+    mode: Literal[0o700]
+    device: int = Field(ge=0)
+    inode: int = Field(gt=0)
+    root_manifest_sha256: Sha256
+    retention_action: Literal["delete", "retain"]
+    directories: dict[str, HistoricalDirectoryEvidence]
+    files: dict[str, HistoricalFileEvidence]
+
+    @field_validator("directories", "files")
+    @classmethod
+    def safe_entries(cls, value):
+        for path in value:
+            _safe_relative(path)
+        return value
+
+    @model_validator(mode="after")
+    def nonempty_root(self):
+        if not self.files:
+            raise ValueError("historical root must contain evidence files")
+        if self.role == "shared_provider" and self.retention_action != "retain":
+            raise ValueError("shared provider evidence must be retained")
+        if self.role != "shared_provider" and self.retention_action != "delete":
+            raise ValueError("historical collection evidence must be deleted")
+        return self
+
+
+class HistoricalEvidenceReference(StrictModel):
+    role: HistoricalRootRole
+    path: str
+    sha256: Sha256
+
+    _path = field_validator("path")(_safe_relative)
+
+
+class HistoricalExternalFileEvidence(StrictModel):
+    canonical_path: str = Field(min_length=1)
+    sha256: Sha256
+    owner_uid: int = Field(ge=0)
+    mode: int = Field(ge=0, le=0o777)
+    device: int = Field(ge=0)
+    inode: int = Field(gt=0)
+    size_bytes: int = Field(ge=0)
+
+
+class HistoricalValidationAttempt(StrictModel):
+    attempt: Literal[1, 2, 3, 4]
+    run_role: HistoricalRootRole
+    input_role: HistoricalRootRole
+    run_id: SafeId
+    outcome: Literal["failed", "passed"]
+    result_code: Literal[
+        "offered_count_mismatch",
+        "tag_mismatch",
+        "per_chunk_baseline_reset",
+        "passed",
+    ]
+    log: HistoricalEvidenceReference
+
+    @model_validator(mode="after")
+    def exact_attempt_roles(self):
+        if self.run_role != f"validation_{self.attempt}_run":
+            raise ValueError("historical validation run role is inconsistent")
+        if self.input_role != f"validation_{self.attempt}_input":
+            raise ValueError("historical validation input role is inconsistent")
+        if (self.outcome == "passed") != (self.result_code == "passed"):
+            raise ValueError("historical validation outcome is inconsistent")
+        return self
+
+
+class HistoricalExecutionProvenance(StrictModel):
+    commit: GitObjectId
+    tree: GitObjectId
+    source_archive: HistoricalExternalFileEvidence
+
+
+class HistoricalIntegrationProvenance(StrictModel):
+    commit: GitObjectId
+    tree: GitObjectId
+    executed: Literal[False]
+
+
+class HistoricalVerificationProvenance(StrictModel):
+    commit: GitObjectId
+    tree: GitObjectId
+    source_archive: HistoricalExternalFileEvidence
+
+
+class HistoricalCompatibilityApproval(StrictModel):
+    approval_version: Literal[1] = 1
+    status: Literal["approved"]
+    approved_at: datetime
+    compatibility_scope: Literal["historical_pre_finalizer"]
+    provider_execution_binding_status: Literal["legacy_not_recorded"]
+    missing_controls: tuple[
+        Literal[
+            "provider_invocation_record",
+            "run_local_provider_snapshot",
+            "run_local_package_snapshot",
+        ],
+        ...,
+    ]
+    statement: Literal[
+        "Approve compatibility finalization of the frozen historical run "
+        "without fabricating controls that were not recorded at execution."
+    ]
+
+    _approved_utc = field_validator("approved_at")(_utc)
+
+    @field_validator("missing_controls")
+    @classmethod
+    def exact_missing_controls(cls, value):
+        expected = {
+            "provider_invocation_record",
+            "run_local_provider_snapshot",
+            "run_local_package_snapshot",
+        }
+        if set(value) != expected or len(value) != len(expected):
+            raise ValueError("historical approval must acknowledge exact missing controls")
+        return value
+
+
+class HistoricalRunEvidence(StrictModel):
+    manifest: HistoricalEvidenceReference
+    collection_permit: HistoricalEvidenceReference
+    fixture_catalog: HistoricalEvidenceReference
+    offered_ledger: HistoricalEvidenceReference
+    execution_ledger: HistoricalEvidenceReference
+    observed: HistoricalEvidenceReference
+    source_manifest: HistoricalEvidenceReference
+    durable_sidecar: HistoricalEvidenceReference
+    checkpoints: HistoricalEvidenceReference
+    pre_read_health: HistoricalEvidenceReference
+    reconciliation: HistoricalEvidenceReference | None = None
+    validation_permit: HistoricalEvidenceReference | None = None
+    imported_manifest: HistoricalEvidenceReference
+    imported_report: HistoricalEvidenceReference
+    cleaned_manifest: HistoricalEvidenceReference
+    cleaned_report: HistoricalEvidenceReference
+
+
+class HistoricalProviderEvidence(StrictModel):
+    package: HistoricalEvidenceReference
+    provider: HistoricalEvidenceReference
+    collector: HistoricalEvidenceReference
+    validator: HistoricalEvidenceReference
+    runbook: HistoricalEvidenceReference
+
+
+class HistoricalFinalizationAttestation(StrictModel):
+    historical_finalization_attestation_version: Literal[1] = 1
+    compatibility_scope: Literal["historical_pre_finalizer"]
+    run_id: SafeId
+    run_manifest_sha256: Sha256
+    frozen_root_declaration_sha256: Sha256
+    roots: tuple[HistoricalRootEvidence, ...]
+    attempts: tuple[HistoricalValidationAttempt, ...]
+    successful_bounded: HistoricalRunEvidence
+    live: HistoricalRunEvidence
+    provider: HistoricalProviderEvidence
+    executed: HistoricalExecutionProvenance
+    integration: HistoricalIntegrationProvenance
+    verification: HistoricalVerificationProvenance
+    adapter_wrapper: HistoricalExternalFileEvidence
+    cleaner_wrapper: HistoricalExternalFileEvidence
+    approval: HistoricalCompatibilityApproval
+
+    @model_validator(mode="after")
+    def exact_historical_topology(self):
+        expected_roles = set(HistoricalRootRole.__args__)
+        roles = [root.role for root in self.roots]
+        if set(roles) != expected_roles or len(roles) != len(expected_roles):
+            raise ValueError("historical attestation must contain the exact root roles")
+        if tuple(item.attempt for item in self.attempts) != (1, 2, 3, 4):
+            raise ValueError("historical validation attempts must be ordered 1 through 4")
+        if tuple(item.outcome for item in self.attempts) != (
+            "failed",
+            "failed",
+            "failed",
+            "passed",
+        ):
+            raise ValueError("historical validation outcomes are inconsistent")
+        return self
+
+
+class HistoricalFrozenRootDeclaration(StrictModel):
+    historical_frozen_root_declaration_version: Literal[1] = 1
+    run_id: SafeId
+    run_manifest_sha256: Sha256
+    roots: tuple[HistoricalRootEvidence, ...]
+
+    @model_validator(mode="after")
+    def exact_declared_topology(self):
+        expected_roles = set(HistoricalRootRole.__args__)
+        roles = [root.role for root in self.roots]
+        if set(roles) != expected_roles or len(roles) != len(expected_roles):
+            raise ValueError("frozen declaration must contain exact root roles")
+        return self
+
+
+class HistoricalDeletionTarget(StrictModel):
+    canonical_path: str = Field(min_length=1)
+    device: int = Field(ge=0)
+    inode: int = Field(gt=0)
+    action: Literal["delete", "retain"]
+
+
+class HistoricalDeletionApproval(StrictModel):
+    historical_deletion_approval_version: Literal[1] = 1
+    status: Literal["approved"]
+    approved_at: datetime
+    run_id: SafeId
+    attestation_sha256: Sha256
+    verification_commit: GitObjectId
+    verification_tree: GitObjectId
+    merge_confirmed: Literal[True]
+    targets: dict[HistoricalRootRole, HistoricalDeletionTarget]
+    statement: Literal[
+        "Approve the exact historical cleanup targets and actions recorded "
+        "in this artifact after the compatibility verifier merged."
+    ]
+
+    _approved_utc = field_validator("approved_at")(_utc)
+
+    @model_validator(mode="after")
+    def exact_targets(self):
+        expected = set(HistoricalRootRole.__args__)
+        if set(self.targets) != expected:
+            raise ValueError("historical deletion approval must bind every root role")
+        if self.targets["shared_provider"].action != "retain":
+            raise ValueError("historical deletion approval must retain provider evidence")
+        if any(
+            target.action != "delete"
+            for role, target in self.targets.items()
+            if role != "shared_provider"
+        ):
+            raise ValueError("historical deletion approval must delete collection roots")
+        return self
+
+
 class BoundedValidationAttestation(StrictModel):
     bounded_validation_manifest_version: Literal[1] = 1
     validation_run_id: SafeId
@@ -851,6 +1121,75 @@ class CleanupCompletionRecord(StrictModel):
     def completed_on_time(self):
         if self.completed_at > self.delete_by:
             raise ValueError("cleanup completion must not exceed delete_by")
+        return self
+
+
+class HistoricalCleanupScheduleRecord(StrictModel):
+    historical_cleanup_schedule_version: Literal[1] = 1
+    run_id: SafeId
+    finalized_at: datetime
+    delete_by: datetime
+    cleanup_owner: str = Field(min_length=1)
+    attestation_sha256: Sha256
+    deletion_approval_sha256: Sha256
+    deletion_inventory_sha256: Sha256
+    root_actions: dict[HistoricalRootRole, Literal["delete", "retain"]]
+
+    _finalized_utc = field_validator("finalized_at")(_utc)
+    _delete_utc = field_validator("delete_by")(_utc)
+
+    @model_validator(mode="after")
+    def exact_historical_schedule(self):
+        if self.delete_by != self.finalized_at + timedelta(days=7):
+            raise ValueError("delete_by must equal finalized_at plus seven days")
+        expected = set(HistoricalRootRole.__args__)
+        if set(self.root_actions) != expected:
+            raise ValueError("historical schedule must account for every root role")
+        if self.root_actions["shared_provider"] != "retain":
+            raise ValueError("historical schedule must retain shared provider evidence")
+        if any(
+            action != "delete"
+            for role, action in self.root_actions.items()
+            if role != "shared_provider"
+        ):
+            raise ValueError("historical collection roots must be scheduled for deletion")
+        return self
+
+
+class HistoricalCleanupCompletionRecord(StrictModel):
+    historical_cleanup_completion_version: Literal[1] = 1
+    run_id: SafeId
+    delete_by: datetime
+    completed_at: datetime
+    cleanup_owner: str = Field(min_length=1)
+    evidence: str = Field(min_length=1)
+    schedule_sha256: Sha256
+    attestation_sha256: Sha256
+    deletion_approval_sha256: Sha256
+    deletion_inventory_sha256: Sha256
+    root_dispositions: dict[
+        HistoricalRootRole,
+        Literal["deleted", "retained_verified"],
+    ]
+
+    _delete_utc = field_validator("delete_by")(_utc)
+    _completed_utc = field_validator("completed_at")(_utc)
+
+    @model_validator(mode="after")
+    def exact_historical_completion(self):
+        expected = set(HistoricalRootRole.__args__)
+        if set(self.root_dispositions) != expected:
+            raise ValueError("historical completion must account for every root role")
+        if self.root_dispositions["shared_provider"] != "retained_verified":
+            raise ValueError("historical completion must verify retained provider evidence")
+        if any(
+            disposition != "deleted"
+            for role, disposition in self.root_dispositions.items()
+            if role != "shared_provider"
+        ):
+            raise ValueError("historical deletion roots must be deleted")
+        if self.completed_at > self.delete_by:
+            raise ValueError("historical cleanup completion must not exceed delete_by")
         return self
 
 
