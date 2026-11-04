@@ -1039,3 +1039,51 @@ def test_cli_passes_validation_permit_explicitly(tmp_path: Path, monkeypatch):
     result = CliRunner().invoke(main, arguments)
     assert result.exit_code == 0, result.output
     assert captured["validation_permit_path"] == permit
+
+
+@pytest.mark.parametrize("format", ["jsonl", "parquet"])
+def test_imported_read_events_replay_without_becoming_demand(tmp_path: Path, format: str):
+    from predictive_cache.controller.ingest import Ingestor, instant
+    from predictive_cache.controller.sources import ReplayClock, ReplaySource
+    from predictive_cache.prep.config import CleanConfig
+
+    paths = _fixture(tmp_path / "source")
+    normalized = tmp_path / "normalized"
+    manifest = _import(paths, normalized, format=format)
+    assert manifest.data_kind == "synthetic"
+    assert manifest.counts.events == 5
+    updates = []
+    core = Ingestor(
+        CleanConfig(read_mode="ranges"),
+        updates.append,
+        allowed_volumes=[VOLUME_ID],
+        queue_max=3,
+    )
+    clock = ReplayClock(END + timedelta(hours=2), speed=0)
+    source = ReplaySource(normalized, clock, batch_size=2)
+    replayed = 0
+
+    def offer(batch):
+        nonlocal replayed
+        assert all(row["operation"] == "read" for row in batch)
+        assert all(row["handle_id"] is None for row in batch)
+        assert all(row["origin"] == "synthetic" for row in batch)
+        assert core.offer(batch, replay=True) == (len(batch), 0)
+        replayed += len(batch)
+        core.drain(instant(batch[-1]["ingest_time"]))
+
+    try:
+        assert source.emit_ready(offer) == 5
+        assert source.completed
+        core.drain(clock.now())
+    finally:
+        source.stop()
+
+    stats = core.stats()
+    assert replayed == stats["accepted"] == stats["processed"] == 5
+    assert stats["excluded_by_reason"] == {"origin_synthetic": 5}
+    assert stats["dropped"] == stats["queue_depth"] == 0
+    assert stats["kept_events"] == stats["updates_emitted"] == stats["tracker_size"] == 0
+    assert stats["consumer_errors"] == stats["dedupe_capacity_evictions"] == 0
+    assert stats["tracker_failed"] is False
+    assert updates == []

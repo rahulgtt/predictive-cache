@@ -23,6 +23,7 @@ pcache-datagen = "predictive_cache.datagen.cli:main"
 pcache-chimera-import = "predictive_cache.sources.chimera.cli:main"
 pcache-collect = "predictive_cache.collection.cli:main"
 pcache-prep = "predictive_cache.prep.cli:main"
+pcache-controller = "predictive_cache.controller.cli:main"
 pcache-dispatcher = "predictive_cache.dispatcher.cli:main"
 pcache-model = "predictive_cache.ml.cli:main"
 pcache-train = "predictive_cache.ml.train_cli:main"
@@ -45,6 +46,7 @@ allow-direct-references = true
 [tool.pytest.ini_options]
 testpaths = [
     "tests/collection",
+    "tests/controller",
     "tests/datagen",
     "tests/dispatcher",
     "tests/ml",

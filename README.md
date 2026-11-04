@@ -7,13 +7,17 @@ users wait for it to arrive from cloud storage.
 > generation and cleaning, the controlled collection harness, Chimera v2
 > importer, strict current-run finalizer, explicit pre-finalizer historical
 > compatibility path, offline plan-file dispatcher, and experimental
-> standalone manual NFS range reader are implemented. The Controller,
+> standalone manual NFS range reader are implemented. The complete Controller,
 > automated live Warmer
 > integration, representative data collection and real-workload performance
 > claims remain gated work. Generated records model fictional activity and
 > never read personal files. Diagrams and examples below describe the intended
 > system; they do not establish that the required telemetry or cache controls
 > already work.
+
+An experimental [event collector](docs/controller/collector.md) supports
+normalized-v1 HTTP ingestion and replay. Live READ-only feature semantics and
+FeatureStore integration remain dependent on #104 and #30.
 
 ## Run the datagen foundation
 
