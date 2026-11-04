@@ -5,9 +5,17 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from predictive_cache.prep.clean.handles import HandleTracker
+from predictive_cache.prep.clean.pipeline import (
+    _admit_controlled_synthetic,
+    _v3_runtime_lineage,
+)
 from predictive_cache.prep.clean.rules import classify_event
 from predictive_cache.prep.config import CleanConfig
 from predictive_cache.prep.coverage import Coverage, build_coverage
+from predictive_cache.semantics.read_demand import (
+    SEMANTIC_VIEW_ID,
+    SEMANTIC_VIEW_SHA256,
+)
 
 NOW = datetime(2026, 1, 5, 12, tzinfo=UTC)
 
@@ -67,6 +75,78 @@ def test_each_exclusion_rule_and_first_match():
     )
     assert classify(event(event_time=NOW + timedelta(hours=2))) == "time_invalid"
     assert classify(event()) is None
+
+
+def test_v3_controlled_lineage_does_not_admit_synthetic_demand():
+    runtime = {
+        "semantic_view_id": SEMANTIC_VIEW_ID,
+        "semantic_view_sha256": SEMANTIC_VIEW_SHA256,
+        "source_evidence_mode": "controlled_demand",
+        "execution_plan_sha256": "1" * 64,
+        "workload_config_sha256": "2" * 64,
+        "truth_binding_sha256": "3" * 64,
+        "workload_truth_sha256": "4" * 64,
+        "workload_permit_sha256": "5" * 64,
+        "workload_evidence_sha256": "c" * 64,
+        "operation_indexes_json": "[3,43,50]",
+        "intent_ids_json": '["' + '6' * 64 + '","' + '7' * 64 + '","' + '8' * 64 + '"]',
+        "operation_ids_json": '["' + '9' * 64 + '","' + 'a' * 64 + '","' + 'b' * 64 + '"]',
+    }
+    lineage = _v3_runtime_lineage(runtime)
+    admitted = _admit_controlled_synthetic(
+        runtime,
+        SEMANTIC_VIEW_ID,
+        lineage,
+    )
+    row = event(
+        operation="read",
+        origin="synthetic",
+        offset=0,
+        bytes_requested=10,
+        bytes_read=10,
+    )
+    source = {
+        key: value
+        for key, value in row.items()
+        if key not in {"effective_time", "known_at"}
+    }
+
+    assert lineage == {
+        key: runtime[key]
+        for key in runtime
+        if key
+        not in {
+            "semantic_view_id",
+            "semantic_view_sha256",
+            "source_evidence_mode",
+        }
+    }
+    assert admitted is False
+    assert (
+        classify_event(
+            source,
+            source["ingest_time"],
+            CleanConfig(),
+            semantic_view=SEMANTIC_VIEW_ID,
+            admit_controlled_synthetic=admitted,
+        )
+        == "origin_synthetic"
+    )
+
+
+def test_offline_v3_runtime_without_permit_keeps_existing_fixture_behavior():
+    runtime = {
+        "semantic_view_id": SEMANTIC_VIEW_ID,
+        "semantic_view_sha256": SEMANTIC_VIEW_SHA256,
+        "source_evidence_mode": "offline_simulated_fixture",
+        "execution_plan_sha256": "1" * 64,
+    }
+
+    assert _v3_runtime_lineage(runtime) == {}
+    assert (
+        _admit_controlled_synthetic(runtime, SEMANTIC_VIEW_ID, {})
+        is False
+    )
 
 
 def test_handle_tracker_grace_timeout_and_late_read():

@@ -22,6 +22,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from predictive_cache.datagen.config import Popularity
 from predictive_cache.datagen.pipeline import component_rng
+from predictive_cache.semantics.read_demand import (
+    SEMANTIC_VIEW_ID,
+    SEMANTIC_VIEW_SHA256,
+)
 
 from .io import (
     atomic_write_bytes,
@@ -42,6 +46,9 @@ from .models import (
     ObservedEvent,
     OfferedOperation,
     WorkloadCollectionManifest,
+    WorkloadCollectionPermit,
+    WorkloadPermitProfile,
+    WorkloadValidationRole,
 )
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -76,6 +83,15 @@ def _model_sha256(value: BaseModel) -> str:
     return hashlib.sha256(
         canonical_json(value.model_dump(mode="json")).encode("utf-8")
     ).hexdigest()
+
+
+def canonical_model_file_sha256(value: BaseModel) -> str:
+    """Hash the exact canonical bytes written by atomic_write_model."""
+
+    payload = (
+        canonical_json(value.model_dump(mode="json")) + "\n"
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 class WorkloadConfig(StrictFrozenModel):
@@ -462,6 +478,420 @@ def execution_plan_sha256(plan: WorkloadExecutionPlan) -> str:
 
 def workload_truth_sha256(truth: WorkloadTruth) -> str:
     return _model_sha256(truth)
+
+
+def workload_truth_binding_sha256(binding: WorkloadTruthBinding) -> str:
+    return _model_sha256(binding)
+
+
+def workload_manifest_sha256(manifest: WorkloadCollectionManifest) -> str:
+    return _model_sha256(manifest)
+
+
+def bind_workload_truth(
+    plan: WorkloadExecutionPlan,
+    truth: WorkloadTruth,
+) -> WorkloadTruthBinding:
+    """Create the canonical, separate plan/truth/semantic binding."""
+
+    validate_plan_truth(plan, truth)
+    if plan.semantic_view_id is None or plan.semantic_view_sha256 is None:
+        raise ValueError("workload truth binding requires an explicit semantic view")
+    return WorkloadTruthBinding(
+        execution_plan_sha256=execution_plan_sha256(plan),
+        workload_truth_sha256=workload_truth_sha256(truth),
+        semantic_view_id=plan.semantic_view_id,
+        semantic_view_sha256=plan.semantic_view_sha256,
+    )
+
+
+def _bounded_validation_selection(
+    plan: WorkloadExecutionPlan,
+    truth: WorkloadTruth,
+) -> tuple[int, int, int]:
+    """Choose the first relation-complete ordinary/repeat/sequential triple."""
+
+    validate_plan_truth(plan, truth)
+    truth_by_id = {item.intent_id: item for item in truth.intent_truth}
+    candidates: list[tuple[int, int, int]] = []
+    for ordinary_index, ordinary in enumerate(plan.intents):
+        ordinary_truth = truth_by_id[ordinary.intent_id]
+        if not (
+            ordinary_truth.fixture_occurrence_index == 0
+            and ordinary_truth.coaccess_group_id is None
+            and ordinary_truth.schedule_phase == "steady"
+        ):
+            continue
+        for repeated_index in range(ordinary_index + 1, len(plan.intents)):
+            repeated = plan.intents[repeated_index]
+            repeated_truth = truth_by_id[repeated.intent_id]
+            if (
+                repeated.fixture_id,
+                repeated.offset,
+                repeated.count,
+            ) != (
+                ordinary.fixture_id,
+                ordinary.offset,
+                ordinary.count,
+            ):
+                continue
+            for sequential_index in range(repeated_index + 1, len(plan.intents)):
+                sequential = plan.intents[sequential_index]
+                sequential_truth = truth_by_id[sequential.intent_id]
+                if (
+                    sequential.fixture_id == repeated.fixture_id
+                    and sequential_truth.fixture_occurrence_index
+                    == repeated_truth.fixture_occurrence_index + 1
+                    and sequential_truth.sequential_offset_index
+                    == (
+                        repeated_truth.sequential_offset_index + 1
+                    )
+                    % len(plan.range_offsets)
+                ):
+                    candidates.append(
+                        (ordinary_index, repeated_index, sequential_index)
+                    )
+                    break
+            if candidates and candidates[-1][0] == ordinary_index:
+                break
+    if not candidates:
+        raise ValueError(
+            "workload plan lacks a relation-complete ordinary/repeat/sequential triple"
+        )
+    return min(candidates)
+
+
+def _bounded_validation_schedule(
+    config: WorkloadConfig,
+) -> tuple[int, int, int]:
+    repeat_delay_ms = (
+        (
+            config.untagged_correlation_window_s
+            + config.operation_schedule_tolerance_s
+        )
+        * 1000
+        + config.min_offer_gap_ms
+    )
+    values = (
+        0,
+        repeat_delay_ms,
+        repeat_delay_ms + config.min_offer_gap_ms,
+    )
+    _validate_half_open_cap(
+        list(values),
+        config.short_window_ms,
+        config.short_window_max_offers,
+    )
+    _validate_half_open_cap(
+        list(values),
+        config.long_window_ms,
+        config.long_window_max_offers,
+    )
+    return values
+
+
+def select_workload_permit_operations(
+    run_id: str,
+    plan: WorkloadExecutionPlan,
+    truth: WorkloadTruth,
+    *,
+    profile: WorkloadPermitProfile,
+    config: WorkloadConfig,
+    validation_operations: int | None = None,
+) -> tuple[
+    tuple[int, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[WorkloadValidationRole, ...],
+    tuple[int, ...],
+    tuple[int, ...],
+]:
+    """Select relation-complete bounded operations or the complete plan."""
+
+    if profile == "bounded_validation":
+        if (
+            type(validation_operations) is not int
+            or not 1 <= validation_operations <= 3
+        ):
+            raise ValueError(
+                "bounded validation requires validation_operations in 1..3"
+            )
+        indexes = _bounded_validation_selection(
+            plan,
+            truth,
+        )[:validation_operations]
+        roles: tuple[WorkloadValidationRole, ...] = (
+            "ordinary",
+            "repeated_range",
+            "sequential_range",
+        )[:validation_operations]
+        execution_relative_ms = _bounded_validation_schedule(
+            config,
+        )[:validation_operations]
+    elif profile == "full_collection":
+        if validation_operations is not None:
+            raise ValueError(
+                "full collection does not accept a validation operation count"
+            )
+        indexes = tuple(range(len(plan.intents)))
+        roles = tuple("ordinary" for _ in indexes)
+        execution_relative_ms = tuple(
+            intent.relative_ms for intent in plan.intents
+        )
+    else:
+        raise ValueError(f"unsupported workload permit profile: {profile!r}")
+
+    plan_hash = execution_plan_sha256(plan)
+    return (
+        indexes,
+        tuple(plan.intents[index].intent_id for index in indexes),
+        tuple(
+            run_bound_operation_id(
+                run_id,
+                plan_hash,
+                plan.intents[index].intent_id,
+            )
+            for index in indexes
+        ),
+        roles,
+        tuple(plan.intents[index].relative_ms for index in indexes),
+        execution_relative_ms,
+    )
+
+
+def build_workload_collection_permit(
+    manifest: WorkloadCollectionManifest,
+    config: WorkloadConfig,
+    plan: WorkloadExecutionPlan,
+    truth: WorkloadTruth,
+    truth_binding: WorkloadTruthBinding,
+    catalog: FixtureCatalog,
+    *,
+    permit_id: str,
+    profile: WorkloadPermitProfile,
+    expires_at: datetime,
+    validated_code_head_sha256: str,
+    validated_merge_commit_sha256: str,
+    validated_tree_sha256: str,
+    provider_package_sha256: str,
+    provider_sha256: str,
+    collector_sha256: str,
+    validator_sha256: str,
+    runbook_sha256: str,
+    adapter_wrapper_sha256: str,
+    cleaner_wrapper_sha256: str,
+    interpreter_path: str,
+    interpreter_sha256: str,
+    execution_start_time: datetime,
+    validation_operations: int | None = None,
+    bounded_validation_attestation_sha256: str | None = None,
+) -> WorkloadCollectionPermit:
+    """Build and immediately cross-check a manifest-v3 workload permit."""
+
+    (
+        indexes,
+        intent_ids,
+        operation_ids,
+        roles,
+        original_relative_ms,
+        execution_relative_ms,
+    ) = (
+        select_workload_permit_operations(
+            manifest.run_id,
+            plan,
+            truth,
+            profile=profile,
+            config=config,
+            validation_operations=validation_operations,
+        )
+    )
+    permit = WorkloadCollectionPermit(
+        permit_id=permit_id,
+        profile=profile,
+        run_id=manifest.run_id,
+        manifest_sha256=workload_manifest_sha256(manifest),
+        manifest_file_sha256=canonical_model_file_sha256(manifest),
+        workload_config_sha256=workload_config_sha256(config),
+        workload_config_file_sha256=canonical_model_file_sha256(config),
+        execution_plan_sha256=execution_plan_sha256(plan),
+        execution_plan_file_sha256=canonical_model_file_sha256(plan),
+        workload_truth_sha256=workload_truth_sha256(truth),
+        workload_truth_file_sha256=canonical_model_file_sha256(truth),
+        truth_binding_sha256=workload_truth_binding_sha256(truth_binding),
+        truth_binding_file_sha256=canonical_model_file_sha256(truth_binding),
+        fixture_catalog_sha256=fixture_catalog_sha256(catalog),
+        fixture_catalog_file_sha256=canonical_model_file_sha256(catalog),
+        semantic_view_sha256=SEMANTIC_VIEW_SHA256,
+        validated_code_head_sha256=validated_code_head_sha256,
+        validated_merge_commit_sha256=validated_merge_commit_sha256,
+        validated_tree_sha256=validated_tree_sha256,
+        provider_package_sha256=provider_package_sha256,
+        provider_sha256=provider_sha256,
+        collector_sha256=collector_sha256,
+        validator_sha256=validator_sha256,
+        runbook_sha256=runbook_sha256,
+        adapter_wrapper_sha256=adapter_wrapper_sha256,
+        cleaner_wrapper_sha256=cleaner_wrapper_sha256,
+        interpreter_path=interpreter_path,
+        interpreter_sha256=interpreter_sha256,
+        bounded_validation_attestation_sha256=(
+            bounded_validation_attestation_sha256
+        ),
+        operation_indexes=indexes,
+        intent_ids=intent_ids,
+        operation_ids=operation_ids,
+        roles=roles,
+        original_relative_ms=original_relative_ms,
+        execution_start_time=execution_start_time,
+        execution_relative_ms=execution_relative_ms,
+        schedule_tolerance_s=manifest.operation_schedule_tolerance_s,
+        expires_at=expires_at,
+    )
+    validate_workload_collection_permit(
+        permit,
+        manifest,
+        config,
+        plan,
+        truth,
+        truth_binding,
+        catalog,
+    )
+    return permit
+
+
+def validate_workload_collection_permit(
+    permit: WorkloadCollectionPermit,
+    manifest: WorkloadCollectionManifest,
+    config: WorkloadConfig,
+    plan: WorkloadExecutionPlan,
+    truth: WorkloadTruth,
+    truth_binding: WorkloadTruthBinding,
+    catalog: FixtureCatalog,
+) -> None:
+    """Cross-check every canonical object and selected operation in a v3 permit."""
+
+    validate_plan_truth(plan, truth)
+    config_hash = workload_config_sha256(config)
+    plan_hash = execution_plan_sha256(plan)
+    truth_hash = workload_truth_sha256(truth)
+    binding_hash = workload_truth_binding_sha256(truth_binding)
+    catalog_hash = fixture_catalog_sha256(catalog)
+    if (
+        permit.status != "approved"
+        or permit.expires_at.tzinfo is None
+        or permit.expires_at.utcoffset() != timedelta(0)
+        or permit.run_id != manifest.run_id
+        or permit.manifest_sha256 != workload_manifest_sha256(manifest)
+        or permit.manifest_file_sha256
+        != canonical_model_file_sha256(manifest)
+        or permit.workload_config_sha256 != config_hash
+        or permit.workload_config_file_sha256
+        != canonical_model_file_sha256(config)
+        or permit.execution_plan_sha256 != plan_hash
+        or permit.execution_plan_file_sha256
+        != canonical_model_file_sha256(plan)
+        or permit.workload_truth_sha256 != truth_hash
+        or permit.workload_truth_file_sha256
+        != canonical_model_file_sha256(truth)
+        or permit.truth_binding_sha256 != binding_hash
+        or permit.truth_binding_file_sha256
+        != canonical_model_file_sha256(truth_binding)
+        or permit.fixture_catalog_sha256 != catalog_hash
+        or permit.fixture_catalog_file_sha256
+        != canonical_model_file_sha256(catalog)
+        or permit.semantic_view_sha256 != SEMANTIC_VIEW_SHA256
+    ):
+        raise ValueError("workload permit canonical binding mismatch")
+    if (
+        manifest.execution_config_sha256 != config_hash
+        or manifest.execution_plan_sha256 != plan_hash
+        or manifest.fixture_catalog_sha256 != catalog_hash
+        or manifest.semantic_view_id != SEMANTIC_VIEW_ID
+        or manifest.semantic_view_sha256 != SEMANTIC_VIEW_SHA256
+        or manifest.semantic_view_id != plan.semantic_view_id
+        or manifest.semantic_view_sha256 != plan.semantic_view_sha256
+        or manifest.planned_operation_count != len(plan.intents)
+        or manifest.seed != config.seed
+        or manifest.end_time - manifest.start_time
+        != timedelta(milliseconds=config.duration_ms)
+        or manifest.checkpoint_interval_s != config.checkpoint_interval_s
+        or manifest.operation_schedule_tolerance_s
+        != config.operation_schedule_tolerance_s
+        or manifest.range_bytes != (config.range_bytes,)
+        or manifest.range_offsets != config.range_offsets
+        or manifest.untagged_correlation_window_s
+        != config.untagged_correlation_window_s
+        or plan.workload_config_sha256 != config_hash
+        or plan.fixture_catalog_sha256 != catalog_hash
+        or plan.seed != config.seed
+        or plan.duration_ms != config.duration_ms
+        or plan.planned_operation_count != resolved_operation_count(config)
+        or plan.range_bytes != config.range_bytes
+        or plan.range_offsets != config.range_offsets
+        or plan.min_offer_gap_ms != config.min_offer_gap_ms
+        or plan.short_window_ms != config.short_window_ms
+        or plan.short_window_max_offers != config.short_window_max_offers
+        or plan.long_window_ms != config.long_window_ms
+        or plan.long_window_max_offers != config.long_window_max_offers
+        or plan.untagged_correlation_window_s
+        != config.untagged_correlation_window_s
+        or plan.operation_schedule_tolerance_s
+        != config.operation_schedule_tolerance_s
+        or plan.simulated_durability_margin_ms
+        != config.simulated_durability_margin_ms
+    ):
+        raise ValueError("workload manifest does not match config, plan, and catalog")
+    if (
+        truth_binding.execution_plan_sha256 != plan_hash
+        or truth_binding.workload_truth_sha256 != truth_hash
+        or truth_binding.semantic_view_id != manifest.semantic_view_id
+        or truth_binding.semantic_view_sha256 != SEMANTIC_VIEW_SHA256
+    ):
+        raise ValueError("workload truth binding mismatch")
+
+    expected = select_workload_permit_operations(
+        manifest.run_id,
+        plan,
+        truth,
+        profile=permit.profile,
+        config=config,
+        validation_operations=(
+            len(permit.operation_indexes)
+            if permit.profile == "bounded_validation"
+            else None
+        ),
+    )
+    actual = (
+        permit.operation_indexes,
+        permit.intent_ids,
+        permit.operation_ids,
+        permit.roles,
+        permit.original_relative_ms,
+        permit.execution_relative_ms,
+    )
+    if actual != expected:
+        raise ValueError("workload permit selected operation binding mismatch")
+    expected_start = (
+        permit.execution_start_time
+        if permit.profile == "bounded_validation"
+        else manifest.start_time
+    )
+    if (
+        permit.execution_start_time != expected_start
+        or permit.schedule_tolerance_s
+        != manifest.operation_schedule_tolerance_s
+        or permit.execution_start_time < manifest.start_time
+        or permit.execution_start_time
+        + timedelta(milliseconds=permit.execution_relative_ms[-1])
+        + timedelta(seconds=permit.schedule_tolerance_s)
+        >= manifest.end_time
+        or permit.execution_start_time >= permit.expires_at
+        or permit.execution_start_time
+        + timedelta(milliseconds=permit.execution_relative_ms[-1])
+        + timedelta(seconds=permit.schedule_tolerance_s)
+        >= permit.expires_at
+    ):
+        raise ValueError("workload permit execution schedule mismatch")
 
 
 def run_bound_operation_id(

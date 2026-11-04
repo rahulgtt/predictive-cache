@@ -1,4 +1,4 @@
-"""Command-line entry point for controlled Chimera v2 imports."""
+"""Command-line entry point for controlled Chimera imports."""
 
 from __future__ import annotations
 
@@ -25,6 +25,23 @@ from .importer import import_dataset
 )
 @click.option("--checkpoints", "checkpoints_path", type=click.Path(path_type=Path), required=True)
 @click.option("--execution-plan", "execution_plan_path", type=click.Path(path_type=Path))
+@click.option("--workload-config", "workload_config_path", type=click.Path(path_type=Path))
+@click.option(
+    "--truth-binding",
+    "--workload-truth-binding",
+    "truth_binding_path",
+    type=click.Path(path_type=Path),
+)
+@click.option(
+    "--workload-permit",
+    "workload_permit_path",
+    type=click.Path(path_type=Path),
+)
+@click.option(
+    "--workload-evidence",
+    "workload_evidence_path",
+    type=click.Path(path_type=Path),
+)
 @click.option(
     "--validation-permit",
     "validation_permit_path",
@@ -40,6 +57,10 @@ def main(
     fixture_catalog_path: Path,
     checkpoints_path: Path,
     execution_plan_path: Path | None,
+    workload_config_path: Path | None,
+    truth_binding_path: Path | None,
+    workload_permit_path: Path | None,
+    workload_evidence_path: Path | None,
     validation_permit_path: Path | None,
     out_dir: Path,
     format_: str,
@@ -54,6 +75,10 @@ def main(
             fixture_catalog_path=fixture_catalog_path,
             checkpoints_path=checkpoints_path,
             execution_plan_path=execution_plan_path,
+            workload_config_path=workload_config_path,
+            truth_binding_path=truth_binding_path,
+            workload_permit_path=workload_permit_path,
+            workload_evidence_path=workload_evidence_path,
             validation_permit_path=validation_permit_path,
             out_dir=out_dir,
             format=format_,

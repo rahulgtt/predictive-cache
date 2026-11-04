@@ -1,10 +1,11 @@
 # Datagen-driven controlled READ workload
 
 This capability prepares a deterministic, planted-pattern workload for a
-future controlled NFSv4.1 READ collection. The default candidate is three
+controlled NFSv4.1 READ collection. The default candidate is three
 hours; datagen deterministically selects the exact successful 4 KiB READ count
-and variable schedule over the owner-approved 60-fixture catalog. It is
-**offline-only** until the live-read gates below are completed.
+and variable schedule over the owner-approved 60-fixture catalog. Live
+execution remains impossible without an immutable approved plan-bound permit
+and every authorization gate below.
 
 The workload uses the shared `read-demand-v1` semantic contract from
 `contracts/read-demand-v1.json`. It emits READ intent only. Synthetic actor,
@@ -132,6 +133,72 @@ The simulated source is explicitly `offline_simulated_fixture`. It is not the
 live provider and cannot satisfy a permit, attestation, reconciliation,
 finalization or live-read gate.
 
+## Plan-bound live profile
+
+Manifest v3 uses a separate permit and never translates to manifest v2. The
+permit binds the exact canonical bytes and semantic hashes for:
+
+- run manifest, workload config, execution plan, workload truth, truth binding,
+  fixture catalog and `read-demand-v1`;
+- validated code head, merged commit and result tree;
+- provider package/script, collector, validator, runbook, adapter wrapper,
+  cleaner wrapper and interpreter;
+- selected plan indexes, intent IDs, run-bound operation IDs, original
+  plan-relative timestamps and the authorized execution schedule.
+
+The sole truth-reading permit verifier deterministically chooses the first
+relation-complete ordinary/repeated/sequential triple. For the seed-42
+contract fixture this is indexes `3`, `43` and `50`: an ordinary first
+occurrence, a later identical fixture/range, and the next occurrence of that
+fixture at the next frozen offset. This does **not** prove a complete planted
+three-file co-access triplet; that remains offline truth/parity and full-run
+evidence.
+
+One- and two-operation permits are wiring-only prefixes of that triple. Only
+the exact three-operation relation-complete result can produce the bounded PASS
+attestation required before a full collection. The default bounded execution
+schedule is separately bound at relative offsets `0`, `170000` and `190000`
+milliseconds. It preserves concurrency one, rolling rate caps and an
+identical-range gap greater than the 120-second correlation window plus
+30-second tolerance without waiting for the original 53-minute plan span.
+Evidence records both original and bounded timestamps; bounded validation does
+not claim full-schedule fidelity.
+
+The harness checks proposed **actual** offer time against every prior actual
+offer before the provider probe, offered-ledger append or READ. A late
+operation never compresses the following gap or creates a catch-up burst;
+minimum-gap or rolling-cap failure stops before I/O. The importer repeats the
+same actual-cadence validation.
+
+A full-collection permit contains the exact SHA-256 of the successful
+three-role bounded attestation. Before provider setup or the first full-run
+checkpoint/READ, the entrypoint validates that attestation's plan, truth
+binding, catalog, semantic, code/tree and complete provider-stack lineage plus
+its completion/expiry window. Missing, short, failed, stale or foreign bounded
+evidence cannot start the three-hour run.
+
+The provider receives the exact permit path on every v3 action. Its required
+interface is:
+
+```text
+checkpoint RUN_DIR --permit-path PERMIT_PATH --scheduled-at UTC
+probe RUN_DIR --permit-path PERMIT_PATH --operation-id ID
+post-read RUN_DIR --permit-path PERMIT_PATH --operation-id ID
+```
+
+The real bounded adapter wrapper is still invoked with exactly two arguments:
+`RUN_DIR PERMIT_PATH`. It must explicitly forward the permit and execution
+plan, workload config, truth binding and harness-owned
+`workload-evidence.jsonl` to `pcache-chimera-import`; permit auto-discovery is
+forbidden.
+
+V3-only harness evidence binds each plan index/intent/operation/permit and both
+schedules to the provider sidecar, immutable raw chunk/line hashes and
+canonical observed-row hash. Import, cleaning, reconciliation, provider
+declaration, bounded attestation and finalization retain the same plan and
+permit lineage. Workload truth is never an importer input or an observed
+lifecycle/session fact.
+
 ## Live-read readiness checklist
 
 The following gates are cumulative. None is satisfied merely by the offline
@@ -142,7 +209,7 @@ workflow.
       provider and catalog observations are not reused as current health.
 - [ ] The exact owner-private 60-fixture catalog and all manifest input hashes
       are approved for the new run.
-- [ ] Manifest v3 receives a complete plan-bound live evidence chain:
+- [x] Manifest v3 has a complete plan-bound live evidence chain:
       permit, provider declaration, reconciliation, bounded attestation,
       finalization and cleanup/retention handling.
 - [ ] Provider, adapter and cleaner compatibility is reviewed against repeated
@@ -176,6 +243,7 @@ workflow.
   production metadata source and rename/replacement semantics remain open.
 - Empty-tag matching is controlled inference bounded by range, time and order;
   it does not authenticate origin.
-- V3 mount, bounded-validation, checkpoint/reconcile, attestation and
-  finalization commands intentionally reject this offline-only profile until
-  the complete evidence chain is implemented and reviewed.
+- Repository tests and offline fixtures do not authorize a permit, mount,
+  bounded READ, or full collection. The provider package and owner-private
+  catalog must be regenerated/reviewed for the approved run; historical v2
+  artifacts remain immutable compatibility evidence only.
